@@ -19,7 +19,7 @@
 
   <g>
     <text x="28" y="92" font-family="'Instrument Serif', Georgia, serif" font-size="44" fill="#e8e8ed" letter-spacing="-0.5">Luce DFlash</text>
-    <text x="28" y="118" font-family="'Inter', ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#8888a0">First open-source DFlash speculative decoding on consumer GPUs.</text>
+    <text x="28" y="118" font-family="'Inter', ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#8888a0">First GGUF port of DFlash speculative decoding.</text>
   </g>
 
   <g stroke="#222222" stroke-width="1">
