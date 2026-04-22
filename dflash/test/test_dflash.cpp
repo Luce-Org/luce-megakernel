@@ -885,6 +885,7 @@ int main(int argc, char ** argv) {
     }
 
     StepGraph sg;
+    bool daemon_first_iter = true;
 
     while (true) {
         std::string prompt_file_str;
@@ -895,12 +896,26 @@ int main(int argc, char ** argv) {
             if (std::sscanf(line.c_str(), "%1023s %d", ppath, &n_gen) != 2) continue;
             prompt_file_str = ppath;
             prompt_path = prompt_file_str.c_str();
+
+            // Rebuild cache + step graph between requests so KV / SSM / conv /
+            // target_feat ring start fresh. Weights stay resident.
+            if (!daemon_first_iter) {
+                step_graph_free(sg);
+                sg = StepGraph{};
+                free_target_cache(cache);
+                if (!create_target_cache(w, max_ctx, max_verify_tokens, backend, cache)) {
+                    std::fprintf(stderr, "cache realloc: %s\n", dflash27b_last_error());
+                    stream_emit(-1);
+                    continue;
+                }
+            }
+            daemon_first_iter = false;
         }
 
         auto prompt = read_int32_file(prompt_path);
-        if (prompt.empty()) { 
-            std::fprintf(stderr, "empty prompt\n"); 
-            if (daemon_mode) { stream_emit(-1); continue; } else return 1; 
+        if (prompt.empty()) {
+            std::fprintf(stderr, "empty prompt\n");
+            if (daemon_mode) { stream_emit(-1); continue; } else return 1;
         }
         std::printf("[prompt] %zu tokens\n", prompt.size());
 

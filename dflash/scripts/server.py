@@ -134,37 +134,36 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                     cmd_line = f"{prompt_bin} {gen_len}\n"
                     daemon_proc.stdin.write(cmd_line.encode("utf-8"))
                     daemon_proc.stdin.flush()
-                    # opening role delta
-                head = {
-                    "id": completion_id, "object": "chat.completion.chunk",
-                    "created": created, "model": MODEL_NAME,
-                    "choices": [{"index": 0,
-                                  "delta": {"role": "assistant"},
-                                  "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(head)}\n\n"
-                try:
-                    for tok_id in _token_stream(r_pipe, req.max_tokens):
-                        chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created, "model": MODEL_NAME,
-                            "choices": [{"index": 0,
-                                          "delta": {"content": tokenizer.decode([tok_id])},
-                                          "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                finally:
-                    try: prompt_bin.unlink()
-                    except Exception: pass
-                tail = {
-                    "id": completion_id, "object": "chat.completion.chunk",
-                    "created": created, "model": MODEL_NAME,
-                    "choices": [{"index": 0, "delta": {},
-                                  "finish_reason": "stop"}],
-                }
-                yield f"data: {json.dumps(tail)}\n\n"
-                yield "data: [DONE]\n\n"
+                    head = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": MODEL_NAME,
+                        "choices": [{"index": 0,
+                                      "delta": {"role": "assistant"},
+                                      "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(head)}\n\n"
+                    try:
+                        for tok_id in _token_stream(r_pipe, gen_len):
+                            chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created, "model": MODEL_NAME,
+                                "choices": [{"index": 0,
+                                              "delta": {"content": tokenizer.decode([tok_id])},
+                                              "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                    finally:
+                        try: prompt_bin.unlink()
+                        except Exception: pass
+                    tail = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": MODEL_NAME,
+                        "choices": [{"index": 0, "delta": {},
+                                      "finish_reason": "stop"}],
+                    }
+                    yield f"data: {json.dumps(tail)}\n\n"
+                    yield "data: [DONE]\n\n"
 
             return StreamingResponse(sse(), media_type="text/event-stream")
 
