@@ -108,22 +108,27 @@ class ChatRequest(BaseModel):
 #   ...
 #   </function>
 #   </tool_call>
-TOOL_CALL_RE = re.compile(
-    r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>",
-    re.DOTALL,
+# Parsers ported from vLLM (Apache-2.0) for behavioral parity with
+# `--reasoning-parser qwen3` and `--tool-call-parser qwen3_coder`:
+#   vllm/reasoning/qwen3_reasoning_parser.py
+#   vllm/tool_parsers/qwen3coder_tool_parser.py
+# Core algorithms reproduced without vLLM runtime dependencies.
+
+TOOL_CALL_COMPLETE_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+TOOL_CALL_FUNCTION_RE = re.compile(
+    r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL,
 )
-PARAM_RE = re.compile(
-    r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>",
+# vLLM's improved parameter regex: tolerates unclosed </parameter> by using
+# next <parameter= or </function> or end-of-string as a terminator.
+TOOL_CALL_PARAMETER_RE = re.compile(
+    r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
     re.DOTALL,
 )
 TOOL_OPEN_TAG = "<tool_call>"
 
 # Qwen3.6 chat template wraps the model's CoT inside <think>...</think>.
-# Default is to emit `<think>\n` automatically as a generation prefix, which
-# means the closing `</think>` may appear in the output without a matching
-# opener — handle both cases.
-THINK_PAIR_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-THINK_HEADLESS_RE = re.compile(r"^(.*?)</think>", re.DOTALL)
+# The template typically prefills `<think>\n` into the prompt (headless mode)
+# so only `</think>` appears in generated output; older templates emit both.
 THINK_OPEN_TAG = "<think>"
 THINK_CLOSE_TAG = "</think>"
 
@@ -147,57 +152,138 @@ def first_stop_match(text: str, stops: list[str]) -> int:
     return best
 
 
-def parse_reasoning(text: str) -> tuple[str, str | None]:
-    """Strip <think>...</think> (or headless ...</think>) from `text` and
-    return (cleaned_text, reasoning_content). Returns (text, None) if no
-    thinking block found.
+def parse_reasoning(text: str, thinking_enabled: bool = True) -> tuple[str, str | None]:
+    """Port of vLLM's Qwen3ReasoningParser.extract_reasoning.
+
+    Handles the three Qwen3.x thinking flavors:
+      1. Paired:   `<think>...</think>` both in generated output.
+      2. Headless: template prefilled `<think>\\n` into the prompt, model
+         only emits `...</think>...`.
+      3. Disabled: user passed `chat_template_kwargs: {enable_thinking: false}`.
+         Template still emits `<think>\\n\\n</think>\\n\\n` but into the prompt;
+         the model output is pure content and contains no tags.
+
+    If the output was truncated mid-thinking (no `</think>` seen and
+    `thinking_enabled=True`), returns `("", full_output_as_reasoning)` —
+    matching vLLM's convention.
+
+    Returns (cleaned_content, reasoning_content).
     """
-    # Pair form first.
-    m = THINK_PAIR_RE.search(text)
-    if m:
-        reasoning = m.group(1).strip()
-        cleaned = (text[:m.start()] + text[m.end():]).strip()
-        return cleaned, reasoning if reasoning else None
-    # Headless form (template prefilled <think>\n at prompt end).
-    m = THINK_HEADLESS_RE.search(text)
-    if m and THINK_CLOSE_TAG in text:
-        reasoning = m.group(1).strip()
-        cleaned = text[m.end():].strip()
-        return cleaned, reasoning if reasoning else None
-    return text, None
+    # Strip <think> if the model emitted it itself (older templates).
+    parts = text.partition(THINK_OPEN_TAG)
+    rest = parts[2] if parts[1] else parts[0]
+    if THINK_CLOSE_TAG not in rest:
+        if thinking_enabled:
+            # No close tag — assume truncated; everything is reasoning.
+            return "", (rest.strip() or None)
+        else:
+            # Thinking disabled — output is pure content.
+            return rest.strip(), None
+    reasoning, _, content = rest.partition(THINK_CLOSE_TAG)
+    return content.strip(), (reasoning.strip() or None)
 
 
-def parse_tool_calls(text: str) -> tuple[str, list[dict]]:
-    """Strip <tool_call>...</tool_call> blocks out of `text` and return them
-    as OpenAI-style tool_call dicts. Returns (cleaned_text, tool_calls).
+def _find_tool_properties(tools, function_name):
+    """Helper matching vLLM's `find_tool_properties`: returns the parameters
+    dict for a given function name, or {} if not found.
+    Accepts pydantic ToolDef instances or plain dicts.
+    """
+    for t in tools or []:
+        fn = t.function if hasattr(t, "function") else t.get("function", {})
+        if hasattr(fn, "model_dump"):
+            fn = fn.model_dump()
+        if fn.get("name") == function_name:
+            params = fn.get("parameters", {})
+            if isinstance(params, dict):
+                return params.get("properties", {})
+    return {}
+
+
+def _convert_param_value(param_value: str, param_name: str, param_config: dict,
+                         func_name: str):
+    """Port of vLLM's _convert_param_value. Coerces stringified XML values
+    to their JSON-schema type (int/float/bool/object/array/string)."""
+    import ast
+    if param_value.lower() == "null":
+        return None
+    if param_name not in param_config:
+        return param_value
+    cfg = param_config[param_name]
+    if isinstance(cfg, dict) and "type" in cfg:
+        ptype = str(cfg["type"]).strip().lower()
+    elif isinstance(cfg, dict) and "anyOf" in cfg:
+        ptype = "object"
+    else:
+        ptype = "string"
+    if ptype in ("string", "str", "text", "varchar", "char", "enum"):
+        return param_value
+    if any(ptype.startswith(p) for p in ("int", "uint", "long", "short", "unsigned")):
+        try: return int(param_value)
+        except (ValueError, TypeError): return param_value
+    if ptype.startswith("num") or ptype.startswith("float"):
+        try:
+            f = float(param_value)
+            return f if f - int(f) != 0 else int(f)
+        except (ValueError, TypeError):
+            return param_value
+    if ptype in ("boolean", "bool", "binary"):
+        return param_value.lower() == "true"
+    # object / array / dict / list
+    if (ptype in ("object", "array", "arr")
+            or ptype.startswith("dict") or ptype.startswith("list")):
+        try: return json.loads(param_value)
+        except (json.JSONDecodeError, TypeError, ValueError): pass
+    try: return ast.literal_eval(param_value)
+    except (ValueError, SyntaxError, TypeError): return param_value
+
+
+def parse_tool_calls(text: str, tools=None) -> tuple[str, list[dict]]:
+    """Port of Qwen3CoderToolParser._parse_xml_function_call (non-streaming).
+
+    Handles Qwen3.x's `<tool_call><function=NAME>...<parameter=KEY>VAL
+    </parameter>...</function></tool_call>` XML. Uses vLLM's improved
+    parameter regex that tolerates unclosed </parameter> tags. When `tools`
+    is provided, each parameter value is coerced to its JSON-schema type.
+
+    Returns (cleaned_content, tool_calls_list).
     """
     tool_calls: list[dict] = []
-
-    def repl(m):
-        name = m.group(1).strip()
-        body = m.group(2)
+    cleaned_parts: list[str] = []
+    cursor = 0
+    for m in TOOL_CALL_COMPLETE_RE.finditer(text):
+        cleaned_parts.append(text[cursor:m.start()])
+        cursor = m.end()
+        body = m.group(1)
+        fn_match = TOOL_CALL_FUNCTION_RE.search(body)
+        if not fn_match:
+            continue
+        fn_text = fn_match.group(1) or fn_match.group(2) or ""
+        end_idx = fn_text.find(">")
+        if end_idx == -1:
+            continue
+        function_name = fn_text[:end_idx].strip()
+        params_region = fn_text[end_idx + 1:]
+        param_config = _find_tool_properties(tools, function_name)
         args: dict = {}
-        for pm in PARAM_RE.finditer(body):
-            k = pm.group(1).strip()
-            v = pm.group(2)
-            # Qwen sometimes emits JSON-like values, sometimes plain strings.
-            # Try JSON first; fall back to raw string.
-            try:
-                args[k] = json.loads(v)
-            except (json.JSONDecodeError, ValueError):
-                args[k] = v
+        for match_text in TOOL_CALL_PARAMETER_RE.findall(params_region):
+            eq_idx = match_text.find(">")
+            if eq_idx == -1:
+                continue
+            k = match_text[:eq_idx].strip()
+            v = match_text[eq_idx + 1:]
+            if v.startswith("\n"): v = v[1:]
+            if v.endswith("\n"): v = v[:-1]
+            args[k] = _convert_param_value(v, k, param_config, function_name)
         tool_calls.append({
             "id": "call_" + uuid.uuid4().hex[:24],
             "type": "function",
             "function": {
-                "name": name,
+                "name": function_name,
                 "arguments": json.dumps(args, ensure_ascii=False),
             },
         })
-        return ""
-
-    cleaned = TOOL_CALL_RE.sub(repl, text).strip()
-    return cleaned, tool_calls
+    cleaned_parts.append(text[cursor:])
+    return "".join(cleaned_parts).strip(), tool_calls
 
 
 # ─── app ───────────────────────────────────────────────────────────
@@ -333,12 +419,13 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
             i = first_stop_match(text, stops)
             if i != -1:
                 text = text[:i]
-        # If the template prefilled <think> as a generation prefix, prepend it
-        # so parse_reasoning sees the matched pair.
-        if started_in_thinking and not text.lstrip().startswith(THINK_OPEN_TAG):
-            text = THINK_OPEN_TAG + "\n" + text
-        cleaned, tool_calls = parse_tool_calls(text)
-        cleaned, reasoning = parse_reasoning(cleaned)
+        # Respect enable_thinking from chat_template_kwargs when deciding how
+        # to treat a `</think>`-less response (see parse_reasoning docstring).
+        thinking_enabled = True
+        if req.chat_template_kwargs:
+            thinking_enabled = req.chat_template_kwargs.get("enable_thinking", True)
+        cleaned, tool_calls = parse_tool_calls(text, tools=req.tools)
+        cleaned, reasoning = parse_reasoning(cleaned, thinking_enabled=thinking_enabled)
 
         msg: dict = {"role": "assistant"}
         finish_reason = "stop"
@@ -501,7 +588,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
 
                     finish_reason = "stop"
                     if mode == "tool_buffer":
-                        cleaned_after, tool_calls = parse_tool_calls(tool_buffer)
+                        cleaned_after, tool_calls = parse_tool_calls(tool_buffer, tools=req.tools)
                         if tool_calls:
                             if cleaned_after:
                                 out = emit_delta(cleaned_after, "content")
