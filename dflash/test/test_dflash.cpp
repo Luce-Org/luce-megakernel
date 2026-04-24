@@ -835,6 +835,7 @@ int main(int argc, char ** argv) {
     float ddtree_temp   = 1.0f;   // softmax temperature for top-K extract
     bool  ddtree_chain_seed = true;  // pre-seed full chain (vs paper's pure best-first)
     bool  profile_scaling = false;  // microbench: time target forward at varying N
+    bool  test_window_mode = false;
     int   stream_fd     = -1;     // write each committed token to this fd (int32 LE) as they land
     bool  daemon_mode   = false;
     for (int i = 3; i < argc; i++) {
@@ -853,7 +854,8 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--ddtree-no-chain-seed") == 0) {
             ddtree_chain_seed = false;
         }
-        else if (std::strcmp(argv[i], "--profile-scaling") == 0) {
+        else if (std::strcmp(argv[i], "--test-window") == 0)      { test_window_mode = true; }
+    else if (std::strcmp(argv[i], "--profile-scaling") == 0) {
             profile_scaling = true;
         }
         else if (std::strncmp(argv[i], "--stream-fd=", 12) == 0) {
@@ -864,7 +866,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (!daemon_mode && (!prompt_path || !out_path)) {
+    if (!daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
         std::fprintf(stderr, "Missing positional arguments for non-daemon mode.\n");
         return 2;
     }
@@ -981,6 +983,204 @@ int main(int argc, char ** argv) {
         free_target_weights(w);
         ggml_backend_free(backend);
         return 0;
+    }
+
+    // ── Sliding-window regression tests ──────────────────────────────────
+    if (test_window_mode) {
+        int n_pass = 0, n_fail = 0;
+        auto check = [&](bool cond, const char * msg) {
+            if (cond) { n_pass++; std::printf("  PASS  %s\n", msg); }
+            else      { n_fail++; std::fprintf(stderr, "  FAIL  %s\n", msg); }
+        };
+
+        // ── Test 1: build_causal_mask unit tests (CPU, no GPU needed) ──
+        std::printf("[test-window] === Test 1: build_causal_mask ===\n");
+        {
+            std::vector<uint16_t> buf;
+            // 1a: standard causal mask, no window: 4 queries at positions 2-5, 6 KV
+            build_causal_mask(buf, /*kv_len=*/6, /*n_tokens=*/4, /*kv_start=*/2);
+            const int pad = align_up(6, g_kq_stride_pad);
+            // q=0 at pos 2: attend k=[0..2], 3 zeros
+            // q=3 at pos 5: attend k=[0..5], 6 zeros
+            check(buf[0 * pad + 0] == F16_ZERO, "1a: q=0,k=0 attendable");
+            check(buf[0 * pad + 2] == F16_ZERO, "1a: q=0,k=2 attendable");
+            check(buf[0 * pad + 3] == F16_NEG_INF, "1a: q=0,k=3 masked");
+            check(buf[3 * pad + 5] == F16_ZERO, "1a: q=3,k=5 attendable");
+            check(buf[3 * pad + 5] == F16_ZERO, "1a: q=3,k=5 attendable (diagonal)");
+        }
+        {
+            std::vector<uint16_t> buf;
+            // 1b: windowed mask: kv_start=10, n_tokens=3, win_start=8, win_len=5
+            // Queries at positions 10,11,12. KV entries [8,9,10,11,12].
+            build_causal_mask(buf, /*kv_len=*/5, /*n_tokens=*/3, /*kv_start=*/10, /*win_start=*/8);
+            const int pad = align_up(5, g_kq_stride_pad);
+            // q=0 (pos 10): attend k=[8..10] → indices [0..2]
+            check(buf[0 * pad + 0] == F16_ZERO, "1b: q=0,k_abs=8 attendable");
+            check(buf[0 * pad + 2] == F16_ZERO, "1b: q=0,k_abs=10 attendable");
+            check(buf[0 * pad + 3] == F16_NEG_INF, "1b: q=0,k_abs=11 masked (future)");
+            // q=2 (pos 12): attend k=[8..12] → indices [0..4]
+            check(buf[2 * pad + 4] == F16_ZERO, "1b: q=2,k_abs=12 attendable");
+        }
+        {
+            std::vector<uint16_t> buf;
+            // 1c: large window > kv_start (window inactive): kv_start=100, win_start=0
+            build_causal_mask(buf, /*kv_len=*/106, /*n_tokens=*/6, /*kv_start=*/100, /*win_start=*/0);
+            const int pad = align_up(106, g_kq_stride_pad);
+            // q=0 (pos 100): attend k=[0..100]
+            check(buf[0 * pad + 0] == F16_ZERO, "1c: q=0,k=0 attendable (no window)");
+            check(buf[0 * pad + 100] == F16_ZERO, "1c: q=0,k=100 attendable");
+            check(buf[0 * pad + 101] == F16_NEG_INF, "1c: q=0,k=101 masked");
+            // q=5 (pos 105): attend k=[0..105]
+            check(buf[5 * pad + 105] == F16_ZERO, "1c: q=5,k=105 attendable");
+        }
+
+        // ── Tests 2 & 3: GPU regression tests ───────────────────────────
+        const int hidden_t = DFLASH27B_TARGET_HIDDEN;
+        const int vocab_t  = DFLASH27B_TARGET_VOCAB;
+        auto do_prefill = [&](StepGraph & psg, int n_tokens) -> int32_t {
+            const int pf_ub = 384;
+            int32_t lt = -1;
+            int committed_p = 0;
+            std::vector<float> pf_emb;
+            std::vector<int32_t> pf_pos;
+            std::vector<uint16_t> pf_mask;
+            std::vector<float> pf_logits;
+            for (int start = 0; start < n_tokens; start += pf_ub) {
+                const int nt = std::min(pf_ub, n_tokens - start);
+                const int kv_len_p = start + nt;
+                const bool with_m = (g_kq_stride_pad > KQ_MASK_PAD) || (nt > 1);
+                if (!build_target_step(psg, w, cache, backend,
+                                        start, nt, with_m, true)) {
+                    std::fprintf(stderr, "prefill build @%d\n", start); return -1;
+                }
+                pf_emb.assign((size_t)hidden_t * nt, 0.0f);
+                std::vector<int32_t> tokens(nt, 220);
+                if (!w.embedder.embed(tokens.data(), nt, pf_emb.data())) return -1;
+                ggml_backend_tensor_set(psg.inp_embed, pf_emb.data(), 0,
+                                        sizeof(float) * pf_emb.size());
+                pf_pos.assign((size_t)4 * nt, 0);
+                for (int i = 0; i < nt; i++) {
+                    const int p = start + i;
+                    pf_pos[0 * nt + i] = p;
+                    pf_pos[1 * nt + i] = p;
+                    pf_pos[2 * nt + i] = p;
+                    pf_pos[3 * nt + i] = 0;
+                }
+                ggml_backend_tensor_set(psg.positions, pf_pos.data(), 0,
+                                        sizeof(int32_t) * pf_pos.size());
+                if (with_m) {
+                    build_causal_mask(pf_mask, kv_len_p, nt, start);
+                    ggml_backend_tensor_set(psg.attn_mask, pf_mask.data(), 0,
+                                            sizeof(uint16_t) * pf_mask.size());
+                }
+                auto st = ggml_backend_graph_compute(backend, psg.gf);
+                if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "prefill fail @%d\n", start); return -1; }
+                pf_logits.assign(vocab_t, 0.0f);
+                ggml_backend_tensor_get(psg.logits, pf_logits.data(),
+                                        (size_t)(nt - 1) * vocab_t * sizeof(float),
+                                        sizeof(float) * vocab_t);
+                lt = argmax_f32(pf_logits.data(), vocab_t);
+                committed_p = start + nt;
+            }
+            return lt;
+        };
+
+        auto decode_one = [&](StepGraph & dsg, int kv_start, int32_t tok,
+                               int32_t pos, int fa_w, float * logits_out) -> bool {
+            if (!build_target_step(dsg, w, cache, backend,
+                                    kv_start, 1, false, true, false, fa_w)) {
+                std::fprintf(stderr, "decode build failed\n"); return false;
+            }
+            float emb_buf[5120];
+            if (!w.embedder.embed(&tok, 1, emb_buf)) return false;
+            ggml_backend_tensor_set(dsg.inp_embed, emb_buf, 0, sizeof(float) * hidden_t);
+            int32_t pos4[4] = {pos, pos, pos, 0};
+            ggml_backend_tensor_set(dsg.positions, pos4, 0, sizeof(int32_t) * 4);
+            auto st = ggml_backend_graph_compute(backend, dsg.gf);
+            if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "decode compute failed\n"); return false; }
+            ggml_backend_tensor_get(dsg.logits, logits_out, 0, sizeof(float) * vocab_t);
+            return true;
+        };
+
+        auto cosine_sim = [](const float * a, const float * b, int n) -> double {
+            double dot = 0, na = 0, nb = 0;
+            for (int i = 0; i < n; i++) { dot += (double)a[i]*b[i]; na += (double)a[i]*a[i]; nb += (double)b[i]*b[i]; }
+            return (na < 1e-30 || nb < 1e-30) ? 0.0 : dot / (std::sqrt(na) * std::sqrt(nb));
+        };
+
+        // ── Test 2: Short context identity (window inactive) ────────────
+        std::printf("[test-window] === Test 2: short-ctx identity (512 tokens) ===\n");
+        {
+            StepGraph psg2;
+            int32_t lt2 = do_prefill(psg2, 512);
+            check(lt2 >= 0, "prefill 512 tokens succeeded");
+
+            // Need rollback tensors for snapshot/restore
+            step_graph_free(psg2);
+            psg2 = StepGraph{};
+            migrate_prefill_cache(w, max_ctx, max_verify_tokens, backend, cache);
+
+            snapshot_ssm_state(cache);
+            std::vector<float> logits_full(vocab_t), logits_win(vocab_t);
+            bool ok = decode_one(psg2, 512, lt2, 512, 0, logits_full.data());
+            check(ok, "decode full-attention succeeded");
+            restore_ssm_state(cache);
+            ok = decode_one(psg2, 512, lt2, 512, 2048, logits_win.data());
+            check(ok, "decode window=2048 succeeded");
+
+            int tok_full = argmax_f32(logits_full.data(), vocab_t);
+            int tok_win  = argmax_f32(logits_win.data(), vocab_t);
+            check(tok_full == tok_win, "short-ctx: argmax matches");
+            double cs = cosine_sim(logits_full.data(), logits_win.data(), vocab_t);
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "short-ctx: cosine_sim=%.8f (expect >0.9999)", cs);
+            check(cs > 0.9999, msg);
+
+            step_graph_free(psg2);
+        }
+
+        // Reset cache for next test
+        free_target_cache(cache);
+        if (!create_target_cache(w, max_ctx, max_verify_tokens, backend, cache, true)) {
+            std::fprintf(stderr, "cache realloc failed\n"); return 1;
+        }
+
+        // ── Test 3: Long context argmax match ───────────────────────────
+        std::printf("[test-window] === Test 3: long-ctx quality (4096 tokens) ===\n");
+        {
+            StepGraph psg3;
+            int32_t lt3 = do_prefill(psg3, 4096);
+            check(lt3 >= 0, "prefill 4096 tokens succeeded");
+
+            step_graph_free(psg3);
+            psg3 = StepGraph{};
+            migrate_prefill_cache(w, max_ctx, max_verify_tokens, backend, cache);
+
+            snapshot_ssm_state(cache);
+            std::vector<float> logits_full(vocab_t), logits_win(vocab_t);
+            bool ok = decode_one(psg3, 4096, lt3, 4096, 0, logits_full.data());
+            check(ok, "decode full-attention succeeded");
+            restore_ssm_state(cache);
+            ok = decode_one(psg3, 4096, lt3, 4096, 1024, logits_win.data());
+            check(ok, "decode window=1024 succeeded");
+
+            int tok_full = argmax_f32(logits_full.data(), vocab_t);
+            int tok_win  = argmax_f32(logits_win.data(), vocab_t);
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "long-ctx: argmax full=%d win=%d match", tok_full, tok_win);
+            check(tok_full == tok_win, msg);
+            double cs = cosine_sim(logits_full.data(), logits_win.data(), vocab_t);
+            std::snprintf(msg, sizeof(msg), "long-ctx: cosine_sim=%.6f (expect >0.90)", cs);
+            check(cs > 0.90, msg);
+
+            step_graph_free(psg3);
+        }
+
+        std::printf("[test-window] === Results: %d passed, %d failed ===\n", n_pass, n_fail);
+        free_target_cache(cache);
+        free_target_weights(w);
+        ggml_backend_free(backend);
+        return n_fail > 0 ? 1 : 0;
     }
 
     const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;
