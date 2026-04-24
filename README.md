@@ -69,7 +69,7 @@ python final_bench.py
 - **129.5 tok/s mean** on the HumanEval 10-prompt bench
 - **3.43× faster than autoregressive** (+15% over chain speculative decoding)
 - **2.8× faster than SGLang AWQ** on the same hardware
-- **128K context in 24 GB** (134.78 tok/s at ctx=131072)
+- **Up to 256K context in 24 GB** via TurboQuant TQ3_0 KV cache (128K Q4_0 bench: 134.78 tok/s at ctx=131072)
 
 ```bash
 # 1. clone with submodules (pulls the pinned Luce-Org/llama.cpp@luce-dflash fork)
