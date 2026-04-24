@@ -446,19 +446,19 @@ def main():
                          "can slow attention 20×+ until issue #10 is fixed)")
     ap.add_argument("--kv-f16", action="store_true",
                     help="Force F16 KV cache. When --max-ctx > 6144 the server "
-                         "auto-enables Q4 KV to fit; pass --kv-f16 to opt out.")
+                         "auto-enables TQ3_0 KV to fit; pass --kv-f16 to opt out.")
     ap.add_argument("--tokenizer", type=str, default=None,
                     help="HuggingFace tokenizer repo ID (default: auto-detect "
                          "from target GGUF basename; falls back to Qwen/Qwen3.5-27B)")
     ap.add_argument("--daemon", action="store_true", help="Run with persistent model daemon (now default)")
     args = ap.parse_args()
 
-    # Auto-enable Q4 KV cache when the requested context exceeds what F16 fits.
+    # Auto-enable TQ3_0 KV cache when the requested context exceeds what F16 fits.
     # Clients like Claude Code routinely send 10k+ token system prompts, so
     # 6144 is too tight for real-world use. setdefault so an explicit user
-    # DFLASH27B_KV_Q4=0 still wins.
+    # DFLASH27B_KV_TQ3=0 still wins.
     if args.max_ctx > 6144 and not args.kv_f16:
-        os.environ.setdefault("DFLASH27B_KV_Q4", "1")
+        os.environ.setdefault("DFLASH27B_KV_TQ3", "1")
 
     if not args.bin.is_file():
         raise SystemExit(f"binary not found at {args.bin}")

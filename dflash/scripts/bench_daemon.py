@@ -11,7 +11,7 @@ Compare `decode` against bench_he.py to verify the C++ decode path is as
 fast under the daemon as under a one-shot test_dflash invocation.
 
 Start the server first (same config the published numbers use):
-    DFLASH27B_KV_Q4=1 python3 scripts/server_tools.py \\
+    DFLASH27B_KV_TQ3=1 python3 scripts/server_tools.py \\
         --budget 22 --max-ctx 16384 --port 8000
 
 Then:

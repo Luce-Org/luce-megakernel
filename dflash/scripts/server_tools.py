@@ -806,15 +806,15 @@ def main():
                          "attention 20×+ until issue #10 is fixed)")
     ap.add_argument("--kv-f16", action="store_true",
                     help="Force F16 KV cache. When --max-ctx > 6144 the server "
-                         "auto-enables Q4 KV to fit; pass --kv-f16 to opt out.")
+                         "auto-enables TQ3_0 KV to fit; pass --kv-f16 to opt out.")
     ap.add_argument("--tokenizer", default="Qwen/Qwen3.5-27B",
                     help="HF tokenizer id; Qwen3.6 shares this tokenizer.")
     args = ap.parse_args()
 
-    # Auto-enable Q4 KV cache when the requested context exceeds what F16 fits.
-    # setdefault so an explicit user DFLASH27B_KV_Q4=0 still wins.
+    # Auto-enable TQ3_0 KV cache when the requested context exceeds what F16 fits.
+    # setdefault so an explicit user DFLASH27B_KV_TQ3=0 still wins.
     if args.max_ctx > 6144 and not args.kv_f16:
-        os.environ.setdefault("DFLASH27B_KV_Q4", "1")
+        os.environ.setdefault("DFLASH27B_KV_TQ3", "1")
 
     if not args.bin.is_file():
         raise SystemExit(f"binary not found at {args.bin}")

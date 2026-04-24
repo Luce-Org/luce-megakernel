@@ -106,7 +106,7 @@ What we ported and tuned:
 - C++/CUDA decode engine on top of ggml (no libllama, no Python runtime, Q4_K_M target path).
 - Three custom CUDA kernels for tree-aware SSM state rollback: `ggml_ssm_conv_tree`, `ggml_gated_delta_net_tree`, `ggml_gated_delta_net_tree_persist`.
 - DDTree budget swept for RTX 3090 + Q4_K_M target: **budget=22** is the sweet spot.
-- Q4_0 KV cache + sliding `target_feat` ring to fit 128K context in 24 GB with ~3% AL hit.
+- TQ3_0 KV cache (TurboQuant 3.5 bpv, default) + sliding `target_feat` ring to fit up to 256K context in 24 GB (Q4_0 available as legacy, tops out near 128K).
 
 [Full writeup →](dflash/README.md) · [Benchmarks →](dflash/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash27b)
 

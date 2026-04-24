@@ -57,7 +57,7 @@ Qwen3.5-27B Q4_K_M, concurrency=1, n_gen=256, 10 prompts/dataset:
 
 AR = autoregressive (`test_generate`). DFlash+DDTree = tree verify at budget=22 with fast rollback (`test_dflash`). AL = Acceptance Length, average committed tokens per draft/verify step. Reproduce via `python3 scripts/bench_llm.py`.
 
-**128K context on 24 GB** via Q4_0 KV cache + sliding `target_feat` ring (4096 slots): ~3% AL hit vs F16 KV, 8× memory saving.
+**Up to 256K context on 24 GB** via TQ3_0 KV cache (3.5 bpv, default; Q4_0 legacy path tops out near 128K) + sliding `target_feat` ring (4096 slots). TQ3 = ~9.7× memory saving vs F16; Q4_0 = 8×.
 
 | Prompt length | KV     | Prefill time | Decode tok/s |
 |:-------------:|:------:|:------------:|:------------:|
@@ -70,7 +70,7 @@ Prefill numbers assume `--max-ctx` sized to the prompt (auto-fit in `run.py` / `
 
 HE 10-prompt bench mean in 128K mode (ctx=131072, ddtree-budget=16): **134.78 tok/s** at AL 8.33.
 
-Set `DFLASH27B_KV_Q4=1` to enable. Full sweep in [RESULTS.md](RESULTS.md).
+Set `DFLASH27B_KV_TQ3=1` (TQ3_0, 3.5 bpv, default) or `DFLASH27B_KV_Q4=1` (Q4_0, 4.5 bpv, legacy) to enable. Full sweep in [RESULTS.md](RESULTS.md).
 
 ## Qwen3.6-27B target (experimental)
 
@@ -133,7 +133,7 @@ python3 scripts/bench_he.py --n-gen 256 --ddtree-budget 22   # minimal HE bench
 
 **128K context mode:**
 ```bash
-DFLASH27B_KV_Q4=1 DFLASH27B_PREFILL_UBATCH=16 \
+DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
   build/test_dflash models/Qwen3.5-27B-Q4_K_M.gguf \
   models/draft/model.safetensors /tmp/long_prompt.bin 64 /tmp/out.bin \
   --fast-rollback --ddtree --ddtree-budget=16 --max-ctx=N   # N = align_up(prompt + n_gen + 64, 256); up to 131072
@@ -193,7 +193,6 @@ Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
 
 - **Temperature / top-k sampling** in the verify path
 - **Q5_K_M / Q6_K target** support
-- **TurboQuant KV cache** — K=Q8_0 for attention accuracy, V=TQ (`turbo3`) for denser long-context at Q4-ish memory cost
 - **Full llama.cpp integration**: new arch, `llama-speculative-dflash.cpp`, `llama-cli` / `llama-server` wiring
 
 ## Citation
