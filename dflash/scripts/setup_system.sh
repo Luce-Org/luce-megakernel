@@ -42,21 +42,32 @@ apt-get install -y build-essential cmake git git-lfs
 git lfs install --system 2>/dev/null || git lfs install
 ok "Build tools installed."
 
-# ── huggingface-cli (pipx, installed for $SUDO_USER not root) ────────────────
+# ── uv (Python toolchain — installed for $SUDO_USER, not root) ───────────────
 
 REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(getent passwd "${REAL_USER}" | cut -d: -f6)
 
-apt-get install -y pipx
+apt-get install -y curl
 
-if sudo -u "${REAL_USER}" pipx list 2>/dev/null | grep -q huggingface_hub; then
+if sudo -u "${REAL_USER}" bash -c 'command -v uv &>/dev/null'; then
+    ok "uv already installed for ${REAL_USER}."
+else
+    info "Installing uv for ${REAL_USER}..."
+    sudo -u "${REAL_USER}" bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+    ok "uv installed."
+fi
+
+UV="${REAL_HOME}/.local/bin/uv"
+
+# ── hf CLI (via uv tool install) ─────────────────────────────────────────────
+
+if sudo -u "${REAL_USER}" "${UV}" tool list 2>/dev/null | grep -q huggingface_hub; then
     ok "hf already installed for ${REAL_USER}."
 else
     info "Installing hf (huggingface_hub[cli]) for ${REAL_USER}..."
-    sudo -u "${REAL_USER}" pipx install "huggingface_hub[cli]"
+    sudo -u "${REAL_USER}" "${UV}" tool install "huggingface_hub[cli]"
     ok "hf installed."
 fi
-
-sudo -u "${REAL_USER}" pipx ensurepath --quiet 2>/dev/null || true
 
 # ── CUDA Toolkit ─────────────────────────────────────────────────────────────
 
@@ -112,5 +123,6 @@ fi
 
 info "All system dependencies installed. Next steps:"
 printf '    git submodule update --init --recursive\n'
+printf '    uv sync                          # install Python deps\n'
 printf '    cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release\n'
 printf '    cmake --build build --target test_dflash -j\n'

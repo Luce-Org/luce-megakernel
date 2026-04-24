@@ -1,0 +1,19 @@
+[project]
+name = "dflash"
+version = "0.1.0"
+description = "Python scripts for dflash inference, benchmarking, and serving"
+requires-python = ">=3.10"
+dependencies = [
+    "transformers",
+    "numpy",
+    "gguf",
+    "fastapi",
+    "uvicorn[standard]",
+    "jinja2",
+    "pytest",
+    "httpx",
+]
+
+[project.optional-dependencies]
+# Only needed for gen_oracle.py (PyTorch reference implementation)
+oracle = ["torch"]

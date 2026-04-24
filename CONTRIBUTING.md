@@ -35,12 +35,14 @@ The script is idempotent and configures `nvcc` on PATH for both bash and zsh. Fo
 | Git | 2.x |
 | git-lfs | any |
 | CUDA Toolkit | 12.0+ |
+| uv | any |
 | hf (huggingface_hub) | any |
 
 After setup:
 
 ```bash
 git submodule update --init --recursive
+uv sync                    # install Python deps (from dflash/pyproject.toml)
 cmake -B dflash/build -S dflash -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
 cmake --build dflash/build --target test_dflash -j
 ```

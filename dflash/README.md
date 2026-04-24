@@ -123,9 +123,8 @@ python3 scripts/run.py --prompt "def fibonacci(n):"
 python3 examples/chat.py
 
 # OpenAI-compatible HTTP server (drop-in for Open WebUI / LM Studio / Cline)
-python3 -m venv .venv
-.venv/bin/pip install fastapi uvicorn transformers jinja2
-.venv/bin/python scripts/server.py --port 8000 --daemon
+uv sync
+uv run scripts/server.py --port 8000 --daemon
 
 # Reproduce paper numbers
 python3 scripts/bench_llm.py                                 # HE + GSM8K + Math500
