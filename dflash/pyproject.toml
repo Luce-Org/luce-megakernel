@@ -12,6 +12,7 @@ dependencies = [
     "jinja2",
     "pytest",
     "httpx",
+    "datasets",
 ]
 
 [project.optional-dependencies]
