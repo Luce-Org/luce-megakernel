@@ -181,7 +181,6 @@ Research proof-of-concept, not production.
 - **Batch size 1**, single-user local inference target (Ollama / LM Studio use case)
 - **One model pair**: Qwen3.5-27B Q4_K_M target + z-lab DFlash BF16 draft. Does not generalize without rewriting the graph builders.
 - **Greedy only**: `temperature`/`top_p` on the OpenAI server accepted but ignored. Rejection sampling in the verify path is a weekend-sized addition.
-- **Model reload per turn**: chat + server respawn `test_dflash` per request (~10 s first-token latency, streaming after). A persistent daemon is the next usability win.
 - **CUDA sm_86+** only. No Metal, ROCm, multi-GPU.
 - **Q4_K_M target** costs ~30 points of per-position accept vs the paper's BF16. Q5_K_M / Q6_K would recover most of it, if they fit.
 
