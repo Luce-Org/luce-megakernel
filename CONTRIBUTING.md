@@ -35,7 +35,7 @@ The script is idempotent and configures `nvcc` on PATH for both bash and zsh. Fo
 | Git | 2.x |
 | git-lfs | any |
 | CUDA Toolkit | 12.0+ |
-| huggingface-cli | any |
+| hf (huggingface_hub) | any |
 
 After setup:
 

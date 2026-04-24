@@ -77,7 +77,7 @@ Set `DFLASH27B_KV_Q4=1` to enable. Full sweep in [RESULTS.md](RESULTS.md).
 Qwen3.6-27B ships the same `qwen35` architecture string and identical layer/head dims as 3.5, so `test_dflash` loads it with no code change:
 
 ```bash
-huggingface-cli download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
+hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
 DFLASH_TARGET=models/Qwen3.6-27B-Q4_K_M.gguf python3 scripts/bench_he.py --n-gen 128
 ```
 
@@ -113,8 +113,8 @@ cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target test_dflash -j
 
 # Fetch models: ~16 GB target + 3.46 GB draft
-huggingface-cli download unsloth/Qwen3.5-27B-GGUF Qwen3.5-27B-Q4_K_M.gguf --local-dir models/
-huggingface-cli download z-lab/Qwen3.5-27B-DFlash model.safetensors --local-dir models/draft/
+hf download unsloth/Qwen3.5-27B-GGUF Qwen3.5-27B-Q4_K_M.gguf --local-dir models/
+hf download z-lab/Qwen3.5-27B-DFlash model.safetensors --local-dir models/draft/
 
 # Streaming one-shot generate
 python3 scripts/run.py --prompt "def fibonacci(n):"
