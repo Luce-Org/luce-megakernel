@@ -75,9 +75,9 @@ python final_bench.py
 # 1. clone with submodules (pulls the pinned Luce-Org/llama.cpp@luce-dflash fork)
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
 
-# 2. build the C++/CUDA decoder (~3 min on sm_86, CUDA 12+, CMake 3.18+)
-# CMake auto-selects archs: sm_86 always, +sm_120 (Blackwell consumer, RTX 50xx) if CUDA >= 12.8,
-# +sm_121 (GB10 / DGX Spark / Jetson Thor) if CUDA >= 12.9. Override only to pin a single arch.
+# 2. build the C++/CUDA decoder (CUDA 12+, CMake 3.18+)
+# Default compiles for 75/80/86/89 (+120 on CUDA 12.8+, +121 on CUDA 12.9+) so the binary runs on every supported card.
+# 3090-only users can add -DCMAKE_CUDA_ARCHITECTURES=86 to skip the other archs and build faster (~3 min).
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target test_dflash -j
 
@@ -138,7 +138,7 @@ cmake --build build --target test_dflash -j
 
 **What will NOT auto-port:**
 - **DDTree `budget=22`** tuned for 3090 + Q4_K_M + 24 GB. On cards with more VRAM (5090 32 GB, GB10 128 GB unified), re-sweep, larger tree = more verify throughput until memory bandwidth saturates. `scripts/bench_llm.py` has the sweep hooks.
-- **Q4_0 KV cache + sliding `target_feat` ring** was shaped by 24 GB. On GB10 / 5090 you can keep full-precision KV or push context further.
+- **TQ3_0 KV cache + sliding `target_feat` ring** was shaped by 24 GB (fits up to 256K context on a 3090). On GB10 (128 GB unified) / 5090 (32 GB) you can push context further or skip quantization entirely and keep F16 KV.
 - **Perf numbers** (207 tok/s demo, 129.5 HumanEval, 2.8× vs SGLang AWQ) are RTX 3090 @ stock. Blackwell/Ada not yet swept, PRs with `RESULTS.md` entries welcome.
 
 [Full writeup →](dflash/README.md) · [Benchmarks →](dflash/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash27b)
