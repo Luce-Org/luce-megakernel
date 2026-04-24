@@ -76,7 +76,9 @@ python final_bench.py
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
 
 # 2. build the C++/CUDA decoder (~3 min on sm_86, CUDA 12+, CMake 3.18+)
-cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
+# CMake auto-selects archs: sm_86 always, +sm_120 (Blackwell consumer, RTX 50xx) if CUDA >= 12.8,
+# +sm_121 (GB10 / DGX Spark / Jetson Thor) if CUDA >= 12.9. Override only to pin a single arch.
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target test_dflash -j
 
 # 3. fetch weights: ~16 GB Q4_K_M target + 3.46 GB bf16 draft
@@ -108,6 +110,37 @@ What we ported and tuned:
 - DDTree budget swept for RTX 3090 + Q4_K_M target: **budget=22** is the sweet spot.
 - TQ3_0 KV cache (TurboQuant 3.5 bpv, default) + sliding `target_feat` ring to fit up to 256K context in 24 GB (Q4_0 available as legacy, tops out near 128K).
 
+### Running on other GPUs (4090, 5090, GB10 / DGX Spark)
+
+Supported out of the box; the build just needs the right CUDA toolkit. `dflash/CMakeLists.txt` already auto-adds Blackwell archs when your nvcc is new enough, so the main quickstart above works as-is on newer cards.
+
+| GPU | Arch | Min CUDA | Status |
+|-----|:----:|:--------:|--------|
+| RTX 3090 Ampere | `sm_86` | 12.0 | **reference, all numbers above** |
+| RTX 4090 Ada | `sm_89` | 12.0 | should work, unverified, pass `-DCMAKE_CUDA_ARCHITECTURES=89` |
+| RTX 5090 Blackwell consumer | `sm_120` | 12.8 | supported, auto-added by CMake |
+| GB10 / DGX Spark, Jetson Thor | `sm_121` | 12.9 | supported, auto-added by CMake |
+
+Verify your target:
+```bash
+python -c "import torch; p=torch.cuda.get_device_properties(0); print(p.name, 'sm_%d%d'%(p.major,p.minor), p.multi_processor_count,'SMs', round(p.total_memory/1e9,1),'GB')"
+nvcc --version
+```
+
+**DGX Spark (GB10) quick start:**
+```bash
+# CUDA 12.9+ required for sm_121
+nvcc --version  # must show >= 12.9
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds sm_121
+cmake --build build --target test_dflash -j
+```
+
+**What will NOT auto-port:**
+- **DDTree `budget=22`** tuned for 3090 + Q4_K_M + 24 GB. On cards with more VRAM (5090 32 GB, GB10 128 GB unified), re-sweep, larger tree = more verify throughput until memory bandwidth saturates. `scripts/bench_llm.py` has the sweep hooks.
+- **Q4_0 KV cache + sliding `target_feat` ring** was shaped by 24 GB. On GB10 / 5090 you can keep full-precision KV or push context further.
+- **Perf numbers** (207 tok/s demo, 129.5 HumanEval, 2.8× vs SGLang AWQ) are RTX 3090 @ stock. Blackwell/Ada not yet swept, PRs with `RESULTS.md` entries welcome.
+
 [Full writeup →](dflash/README.md) · [Benchmarks →](dflash/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash27b)
 
 > **Qwen3.6-27B (experimental):** same `qwen35` architecture, so the 3.6 Q4_K_M GGUF loads as a drop-in target. With the 3.5-trained draft, throughput lands around ~74 tok/s on HumanEval (vs 129.5 on 3.5). Details in [dflash/README.md](dflash/README.md#qwen36-27b-target-experimental).
@@ -126,10 +159,18 @@ AI-assisted development flips that calculus. Rewrites that took a quarter now fi
 
 ## Requirements
 
-Built and benchmarked on NVIDIA RTX 3090 (2020); portable to other Ampere+ (sm_86+) NVIDIA GPUs with minor tuning. CUDA 12+, PyTorch 2.0+.
-dflash needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops).
+All experiments in this repo are built, tuned, and benchmarked on NVIDIA RTX 3090 (2020), the reference target. Supported GPU families:
 
-**Optional, find your GPU's sweet spot:** `sudo nvidia-smi -pl 220` (megakernel hits best tok/J at 220 W).
+- **Ampere** (sm_86, RTX 3090 / A-series): reference, CUDA 12+.
+- **Ada** (sm_89, RTX 40xx): should work, unverified, CUDA 12+.
+- **Blackwell consumer** (sm_120, RTX 50xx incl. 5090): supported, CUDA 12.8+.
+- **GB10 / DGX Spark, Jetson Thor** (sm_121): supported, CUDA 12.9+.
+
+PyTorch 2.0+. `dflash/` needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops); multi-arch build is automatic (see [Running on other GPUs](#running-on-other-gpus-4090-5090-gb10--dgx-spark)).
+
+**Megakernel porting note.** Tighter than dflash: `megakernel/setup.py` pins `-arch=sm_86 -DNUM_BLOCKS=82` (3090 SM count). To run on a different card, edit both defines and `pip install -e . --force-reinstall --no-deps`. Grid is persistent, one block per SM, so `NUM_BLOCKS` must match exactly. Suggested starting points: 4090 `sm_89` + `128`, 5090 `sm_120` + `170`, GB10 `sm_121` + run `torch.cuda.get_device_properties(0).multi_processor_count` to read SM count.
+
+**Optional, find your GPU's sweet spot:** `sudo nvidia-smi -pl 220` (megakernel hits best tok/J at 220 W on 3090; re-sweep for other cards).
 
 ---
 
