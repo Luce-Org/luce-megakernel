@@ -1,5 +1,23 @@
 """Final benchmark: pp520 tg128 — Our megakernel vs PyTorch naive.
-Both properly warmed. Saves completions for verification."""
+Both properly warmed. Saves completions for verification.
+
+Supports --backend {auto,bf16,nvfp4}. Default is auto: Blackwell (sm_12+)
+dispatches to final_bench_nvfp4.py; everything else runs the bf16 path
+below unchanged from upstream.
+"""
+import argparse as _argparse, os as _os, sys as _sys
+import torch as _torch
+
+_p = _argparse.ArgumentParser(add_help=False)
+_p.add_argument("--backend", default="auto", choices=("auto", "bf16", "nvfp4"))
+_a, _rest = _p.parse_known_args()
+_backend = _a.backend
+if _backend == "auto":
+    _backend = "nvfp4" if (_torch.cuda.is_available() and _torch.cuda.get_device_capability()[0] >= 12) else "bf16"
+if _backend == "nvfp4":
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    _os.execv(_sys.executable, [_sys.executable, _os.path.join(_here, "final_bench_nvfp4.py"), *_rest])
+
 import time, torch
 from model import Decoder, HIDDEN_SIZE, INTERMEDIATE_SIZE, FA_QPROJ_SIZE, FA_Q_SIZE, FA_KV_SIZE
 from model import DN_CONV_CHANNELS, DN_V_SIZE, DN_NUM_HEADS, MAX_SEQ_LEN
