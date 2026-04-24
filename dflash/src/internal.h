@@ -183,6 +183,8 @@ struct TargetCache {
     int max_ctx  = 0;         // max tokens in the KV cache
     int cur_pos  = 0;         // number of tokens already committed
 
+    ggml_type kv_k_type = GGML_TYPE_Q8_0;
+
     // Full-attention KV cache: one K and one V per full-attention layer.
     // Layout: [head_dim, max_ctx, n_head_kv] f16, contiguous per layer.
     std::vector<ggml_tensor *> attn_k;   // size = n_full_attn_layers (16)

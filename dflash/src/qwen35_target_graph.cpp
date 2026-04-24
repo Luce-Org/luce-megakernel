@@ -110,6 +110,7 @@ bool create_target_cache(const TargetWeights & w,
     // Env overrides (checked in order; last wins):
     //   DFLASH27B_KV_F16=1  → f16 (regression baseline)
     //   DFLASH27B_KV_Q4=1   → Q4_0 (8× vs f16, required for 128K on 24 GB, ~3% AL hit)
+    //   DFLASH27B_KV_TQ3=1  → TQ3_0 (3.5 bpv, near-lossless, enables 128K on 24 GB)
     //
     // Default: Q8_0 — best quality/memory tradeoff at short context.
     ggml_type kv_k_type = GGML_TYPE_Q8_0;
@@ -120,15 +121,22 @@ bool create_target_cache(const TargetWeights & w,
     if (const char * s = std::getenv("DFLASH27B_KV_Q4")) {
         if (std::atoi(s) != 0) { kv_k_type = GGML_TYPE_Q4_0; kv_v_type = GGML_TYPE_Q4_0; }
     }
+    if (const char * s = std::getenv("DFLASH27B_KV_TQ3")) {
+        if (std::atoi(s) != 0) { kv_k_type = GGML_TYPE_TQ3_0; kv_v_type = GGML_TYPE_TQ3_0; }
+    }
+    out.kv_k_type = kv_k_type;
+    const int max_ctx_alloc = (kv_k_type == GGML_TYPE_TQ3_0)
+        ? ((max_ctx + 255) / 256) * 256
+        : max_ctx;
     int fa_idx = 0, dn_idx = 0;
     for (int il = 0; il < w.n_layer; il++) {
         const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
         if (is_attn) {
-            // [head_dim, max_ctx, n_head_kv]
+            // [head_dim, max_ctx_alloc, n_head_kv]
             ggml_tensor * K = ggml_new_tensor_3d(out.ctx, kv_k_type,
-                                                 q35::HEAD_DIM, max_ctx, q35::N_HEAD_KV);
+                                                 q35::HEAD_DIM, max_ctx_alloc, q35::N_HEAD_KV);
             ggml_tensor * V = ggml_new_tensor_3d(out.ctx, kv_v_type,
-                                                 q35::HEAD_DIM, max_ctx, q35::N_HEAD_KV);
+                                                 q35::HEAD_DIM, max_ctx_alloc, q35::N_HEAD_KV);
             char name[64];
             std::snprintf(name, sizeof(name), "cache_k_%d", il);
             ggml_set_name(K, name);
@@ -282,14 +290,15 @@ static ggml_tensor * build_full_attn_block(
     ggml_context * ctx,
     ggml_cgraph * gf,
     const TargetLayer & L,
-    ggml_tensor * cur,              // [hidden, n_tokens]
-    ggml_tensor * positions,        // [n_tokens] i32
+    ggml_tensor * cur,
+    ggml_tensor * positions,
     const int * rope_sections,
-    ggml_tensor * cache_k,          // [head_dim, max_ctx, n_head_kv]
-    ggml_tensor * cache_v,          // [head_dim, max_ctx, n_head_kv]
-    ggml_tensor * attn_mask,        // [kv_len, n_tokens] f32 or nullptr
+    ggml_tensor * cache_k,
+    ggml_tensor * cache_v,
+    ggml_tensor * attn_mask,
     int kv_start,
-    int n_tokens
+    int n_tokens,
+    ggml_type kv_k_type
 ) {
     // ── Q projection (packed Q || gate), shape [2*q_dim, n_tokens]
     ggml_tensor * QG = ggml_mul_mat(ctx, L.wq, cur);
@@ -369,12 +378,19 @@ static ggml_tensor * build_full_attn_block(
     // FATTN_KQ_STRIDE=256 (see fattn.cu:get_best_fattn_kernel). Round up
     // for TBQ cache types; the caller's attn_mask is built with the same
     // padded length so positions beyond the real kv_len get -inf.
-    const int fattn_stride  = 1;
+    const int fattn_stride  = (kv_k_type == GGML_TYPE_TQ3_0) ? 256 : 1;
     const int kv_len_padded = ((kv_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
 
     // Q needs to be [head_dim, n_tokens, n_head] for flash_attn_ext
     ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);   // [head_dim, n_tokens, n_head]
     Qfa = ggml_cont(ctx, Qfa);
+
+    // For TQ3_0 KV cache, K/V are stored in FWHT-rotated space.
+    // Rotate Q to match before computing KQ dot product.
+    const bool needs_rotation = (kv_k_type == GGML_TYPE_TQ3_0);
+    if (needs_rotation) {
+        Qfa = ggml_turbo_wht(ctx, Qfa, 0);
+    }
 
     // K and V from cache: a view into the first kv_len_padded slots. For
     // non-TBQ paths kv_len_padded == kv_len so this is identical to the
@@ -394,6 +410,13 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
                                              kq_scale, 0.0f, 0.0f);
     // attn: [head_dim, n_head, n_tokens] (permuted)
+
+    // Un-rotate the FA output from FWHT-rotated V space.
+    if (needs_rotation) {
+        attn = ggml_cont(ctx, attn);
+        attn = ggml_turbo_wht(ctx, attn, 1);
+    }
+
     attn = ggml_reshape_2d(ctx, attn, q35::Q_DIM, n_tokens);
 
     // ── Apply the sigmoid gate from the packed Q
@@ -709,7 +732,8 @@ QwenGraphOutputs build_qwen35_graph(
         if (is_attn) {
             cur = build_full_attn_block(ctx, gf, L, cur, in.positions, w.rope_sections,
                                         cache.attn_k[fa_idx], cache.attn_v[fa_idx],
-                                        in.attn_mask, in.kv_start, n_tokens);
+                                        in.attn_mask, in.kv_start, n_tokens,
+                                        cache.kv_k_type);
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;

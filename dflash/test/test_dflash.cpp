@@ -721,6 +721,9 @@ int main(int argc, char ** argv) {
     if (const char * s = std::getenv("DFLASH27B_KV_TBQ")) {
         if (std::atoi(s) != 0) g_kq_stride_pad = 256;
     }
+    if (const char * s = std::getenv("DFLASH27B_KV_TQ3")) {
+        if (std::atoi(s) != 0) g_kq_stride_pad = 256;
+    }
     const char * target_path = argv[1];
     const char * draft_path  = argv[2];
     const char * prompt_path = (argc >= 6 && argv[3][0] != '-') ? argv[3] : nullptr;
