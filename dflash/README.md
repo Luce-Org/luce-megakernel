@@ -191,7 +191,6 @@ Correctness: `test_vs_oracle` validates the draft graph at cos sim 0.999812 vs t
 Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
 
 - **Temperature / top-k sampling** in the verify path
-- **Q5_K_M / Q6_K target** support
 - **Full llama.cpp integration**: new arch, `llama-speculative-dflash.cpp`, `llama-cli` / `llama-server` wiring
 
 ## Citation
