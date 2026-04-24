@@ -124,5 +124,5 @@ fi
 info "All system dependencies installed. Next steps:"
 printf '    git submodule update --init --recursive\n'
 printf '    uv sync                          # install Python deps\n'
-printf '    cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release\n'
+printf '    cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=native -DCMAKE_BUILD_TYPE=Release\n'
 printf '    cmake --build build --target test_dflash -j\n'

@@ -43,7 +43,7 @@ After setup:
 ```bash
 git submodule update --init --recursive
 uv sync                    # install Python deps (from dflash/pyproject.toml)
-cmake -B dflash/build -S dflash -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
+cmake -B dflash/build -S dflash -DCMAKE_CUDA_ARCHITECTURES=native -DCMAKE_BUILD_TYPE=Release
 cmake --build dflash/build --target test_dflash -j
 ```
 
