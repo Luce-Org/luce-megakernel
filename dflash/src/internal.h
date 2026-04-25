@@ -49,9 +49,21 @@ struct TargetLayer {
     ggml_tensor * attn_norm      = nullptr;  // [hidden]
     ggml_tensor * attn_post_norm = nullptr;  // [hidden]  (post-block norm before FFN)
     ggml_tensor * ffn_norm       = nullptr;  // [hidden]
+
+    // Dense FFN (non-null for qwen35 dense target)
     ggml_tensor * w_gate         = nullptr;  // [hidden, intermediate]
     ggml_tensor * w_up           = nullptr;  // [hidden, intermediate]
     ggml_tensor * w_down         = nullptr;  // [intermediate, hidden]
+
+    // MoE FFN (non-null for qwen35moe target)
+    ggml_tensor * ffn_gate_inp       = nullptr;  // [n_embd, n_expert] — router
+    ggml_tensor * ffn_up_exps        = nullptr;  // [expert_ff, n_embd, n_expert]
+    ggml_tensor * ffn_gate_exps      = nullptr;  // [expert_ff, n_embd, n_expert]
+    ggml_tensor * ffn_down_exps      = nullptr;  // [n_embd, expert_ff, n_expert]
+    ggml_tensor * ffn_up_shexp       = nullptr;  // [shared_ff, n_embd] — shared expert
+    ggml_tensor * ffn_gate_shexp     = nullptr;  // [shared_ff, n_embd]
+    ggml_tensor * ffn_down_shexp     = nullptr;  // [n_embd, shared_ff]
+    ggml_tensor * ffn_gate_inp_shexp = nullptr;  // [n_embd] — shared expert gate
 
     // Full-attention block (non-null for layers where (il+1) % 4 == 0)
     ggml_tensor * wq             = nullptr;  // [hidden, q_dim]
@@ -127,6 +139,13 @@ struct TargetWeights {
     int ssm_d_state             = 128;
     int ssm_dt_rank             = 48;
     int ssm_n_group             = 16;
+
+    // MoE-specific (zero for dense models)
+    int n_expert                = 0;
+    int n_expert_used           = 0;
+    int expert_ff_dim           = 0;
+    int shared_ff_dim           = 0;
+    float expert_weights_scale  = 1.0f;
 };
 
 // Load a Q4_K_M target model from a GGUF file on disk.
