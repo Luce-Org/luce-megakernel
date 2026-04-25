@@ -536,7 +536,7 @@ static bool build_target_step(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
@@ -602,7 +602,7 @@ static bool build_target_step_tree(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
@@ -664,9 +664,9 @@ static bool build_draft_step(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;
-    const int fc_in  = DFLASH27B_DRAFT_N_TARGET_LAYERS * hidden;
+    const int hidden = tw.n_embd;
+    const int q_len  = dw.hparams.block_size;
+    const int fc_in  = dw.hparams.n_target_layers * hidden;
 
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, q_len, 1);
     ggml_set_name(sg.inp_embed, "inp_embed");
@@ -829,10 +829,10 @@ int main(int argc, char ** argv) {
     // Profile mode intentionally keeps the intermediate cache tiny (no capture)
     // so we can go up to n_tokens=128 without OOM.
     const int max_verify_tokens = profile_scaling
-        ? DFLASH27B_DRAFT_BLOCK_SIZE
+        ? dw.hparams.block_size
         : (ddtree_mode
-            ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
-            : DFLASH27B_DRAFT_BLOCK_SIZE);
+            ? std::max<int>(dw.hparams.block_size, ddtree_budget + 1)
+            : dw.hparams.block_size);
     TargetCache cache;
     if (!create_target_cache(w, max_ctx, max_verify_tokens, backend, cache)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
@@ -841,7 +841,7 @@ int main(int argc, char ** argv) {
 
     // ── Profile mode: microbench target forward at varying N ───────────
     if (profile_scaling) {
-        const int hidden_p = DFLASH27B_TARGET_HIDDEN;
+        const int hidden_p = w.n_embd;
         StepGraph psg;
         const int n_values[] = { 1, 4, 8, 12, 16, 20, 24, 32, 48, 64, 96, 128 };
         std::printf("[profile] target forward ms at varying N (kv_start=0, no capture)\n");
@@ -897,9 +897,9 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const int vocab  = DFLASH27B_TARGET_VOCAB;
+    const int q_len  = dw.hparams.block_size;
+    const int hidden = w.n_embd;
+    const int vocab  = (int)w.output->ne[1];
     const int mask_tok = DFLASH27B_DRAFT_MASK_TOKEN_ID;
 
     if (daemon_mode) {

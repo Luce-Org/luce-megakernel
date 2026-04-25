@@ -52,11 +52,6 @@ int main(int argc, char ** argv) {
     }
     const char * path = argv[1];
     const int ctx_len = (argc >= 3) ? std::atoi(argv[2]) : 64;
-    const int q_len   = DFLASH27B_DRAFT_BLOCK_SIZE;
-    const int hidden  = DFLASH27B_TARGET_HIDDEN;
-    const int fc_in   = DFLASH27B_DRAFT_N_TARGET_LAYERS * hidden;
-
-    std::printf("ctx_len=%d q_len=%d hidden=%d fc_in=%d\n", ctx_len, q_len_actual, hidden_actual, fc_in_actual);
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "ggml_backend_cuda_init failed\n"); return 1; }
@@ -71,6 +66,8 @@ int main(int argc, char ** argv) {
     const int hidden_actual = w.hparams.hidden;
     const int q_len_actual  = w.hparams.block_size;
     const int fc_in_actual  = w.hparams.n_target_layers * hidden_actual;
+
+    std::printf("ctx_len=%d q_len=%d hidden=%d fc_in=%d\n", ctx_len, q_len_actual, hidden_actual, fc_in_actual);
 
     // ── 2. Graph context (separate from weights context)
     const size_t mem_size = 256 * 1024 * 1024;  // 256 MB — plenty for nodes
