@@ -944,7 +944,7 @@ ggml_tensor * build_moe_ffn(
     shared_gate = ggml_sigmoid(ctx, shared_gate);
     shared_gate = ggml_reshape_2d(ctx, shared_gate, 1, n_tokens);
     sh_down = ggml_reshape_2d(ctx, sh_down, n_embd, n_tokens);
-    sh_down = ggml_mul(ctx, sh_down, ggml_repeat(ctx, shared_gate, sh_down));
+    sh_down = ggml_mul(ctx, sh_down, shared_gate);
 
     // 13. Combine routed + shared
     moe_out = ggml_add(ctx, moe_out, sh_down);

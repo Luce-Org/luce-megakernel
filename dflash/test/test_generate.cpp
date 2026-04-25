@@ -62,8 +62,7 @@ static bool build_step_graph(
     ggml_backend_t backend,
     int kv_start
 ) {
-    if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
-    if (sg.ctx)   { ggml_free(sg.ctx); sg.ctx = nullptr; }
+    if (sg.ctx) { ggml_free(sg.ctx); sg.ctx = nullptr; }
 
     ggml_init_params ip{};
     ip.mem_size   = 256 * 1024 * 1024;
@@ -73,7 +72,7 @@ static bool build_step_graph(
     if (!sg.ctx) return false;
 
     const int n_tokens = 1;
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
     ggml_set_input(sg.inp_embed);
@@ -84,7 +83,7 @@ static bool build_step_graph(
     QwenGraphInputs gi{};
     gi.inp_embed      = sg.inp_embed;
     gi.positions      = sg.positions;
-    gi.attn_mask      = nullptr;        // n_tokens==1, no mask needed
+    gi.attn_mask      = nullptr;
     gi.n_tokens       = n_tokens;
     gi.kv_start       = kv_start;
     gi.capture_layers = false;
@@ -95,8 +94,16 @@ static bool build_step_graph(
     ggml_build_forward_expand(sg.gf, go.logits);
     sg.logits = go.logits;
 
-    sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        ggml_gallocr_reserve(sg.alloc, sg.gf);
+    }
+    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) return false;
+
+    return true;
+}
+    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) return false;
+    return true;
 }
 
 static std::vector<int32_t> read_int32_file(const std::string & path) {
@@ -176,7 +183,7 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> all_tokens = prompt;
     all_tokens.reserve(prompt.size() + n_gen);
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     std::vector<float> embed_buf(hidden);
 
     StepGraph sg;
@@ -208,7 +215,7 @@ int main(int argc, char ** argv) {
         }
 
         // argmax on logits
-        const int vocab = DFLASH27B_TARGET_VOCAB;
+        const int vocab = (int)w.output->ne[1];
         std::vector<float> logits(vocab);
         ggml_backend_tensor_get(sg.logits, logits.data(), 0, sizeof(float) * vocab);
         int best = 0;
@@ -230,11 +237,35 @@ int main(int argc, char ** argv) {
     // ── Generation loop
     auto t_start = std::chrono::steady_clock::now();
     int gen_start_pos = (int)prompt.size();
+    double total_build = 0, total_compute = 0;
     for (int g = 0; g < n_gen; g++) {
         int32_t tok = next;
         all_tokens.push_back(tok);
         stream_emit(tok);
-        next = run_step(tok, gen_start_pos + g);
+
+        auto t0 = std::chrono::steady_clock::now();
+        if (!build_step_graph(sg, w, cache, backend, gen_start_pos + g)) {
+            std::fprintf(stderr, "build_step_graph failed at g=%d\n", g);
+            return 1;
+        }
+        if (!w.embedder.embed(&tok, 1, embed_buf.data())) return 1;
+        ggml_backend_tensor_set(sg.inp_embed, embed_buf.data(), 0, sizeof(float) * embed_buf.size());
+        int32_t p4[4] = { gen_start_pos + g, gen_start_pos + g, gen_start_pos + g, gen_start_pos + g };
+        ggml_backend_tensor_set(sg.positions, p4, 0, sizeof(int32_t) * 4);
+        auto t1 = std::chrono::steady_clock::now();
+
+        ggml_backend_graph_compute(backend, sg.gf);
+        auto t2 = std::chrono::steady_clock::now();
+
+        const int vocab = (int)w.output->ne[1];
+        std::vector<float> logits(vocab);
+        ggml_backend_tensor_get(sg.logits, logits.data(), 0, sizeof(float) * vocab);
+        int best = 0; float bv = logits[0];
+        for (int i = 1; i < vocab; i++) if (logits[i] > bv) { bv = logits[i]; best = i; }
+        next = best;
+
+        total_build += std::chrono::duration<double>(t1 - t0).count();
+        total_compute += std::chrono::duration<double>(t2 - t1).count();
     }
     auto t_end = std::chrono::steady_clock::now();
     double secs = std::chrono::duration<double>(t_end - t_start).count();
@@ -244,6 +275,8 @@ int main(int argc, char ** argv) {
     all_tokens.push_back(next);
 
     std::printf("[gen] %d new tokens in %.3f s  ->  %.2f tok/s\n", n_gen, secs, tps);
+    std::printf("[gen] build=%.3f s compute=%.3f s (%.1f%% compute)\n",
+        total_build, total_compute, 100.0 * total_compute / std::max(1e-12, total_build + total_compute));
     std::printf("[gen] tokens: ");
     for (int i = 0; i < n_gen; i++) std::printf("%d ", all_tokens[prompt.size() + i]);
     std::printf("\n");
