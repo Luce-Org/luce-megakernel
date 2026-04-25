@@ -321,4 +321,14 @@ QwenGraphOutputs build_qwen35_graph(
     TargetCache &          cache,
     const QwenGraphInputs & in);
 
+// MoE FFN forward pass (qwen35moe). Computes expert routing, per-expert
+// SwiGLU, shared expert with sigmoid gating, and returns the combined output.
+// Shape: [n_embd, n_tokens] f32.
+ggml_tensor * build_moe_ffn(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    ggml_tensor *         cur,
+    const TargetLayer &   L,
+    const TargetWeights & w);
+
 } // namespace dflash27b

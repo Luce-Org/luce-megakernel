@@ -827,4 +827,100 @@ QwenGraphOutputs build_qwen35_graph(
     return og;
 }
 
-} // namespace dflash27b
+} // namespace dflash27b (end of qwen35 target graph)
+
+// ─── MoE FFN (qwen35moe) ───────────────────────────────────────────
+// Lives here temporarily; will be extracted to qwen35moe_target_graph.cpp.
+
+namespace dflash27b {
+
+ggml_tensor * build_moe_ffn(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    ggml_tensor *         cur,
+    const TargetLayer &   L,
+    const TargetWeights & w) {
+
+    const int64_t n_embd       = cur->ne[0];
+    const int64_t n_tokens     = cur->ne[1];
+    const int64_t n_expert     = w.n_expert;
+    const int64_t n_expert_used = w.n_expert_used;
+
+    // 1. Router: gate_inp @ cur → [n_expert, n_tokens]
+    ggml_tensor * logits = ggml_mul_mat(ctx, L.ffn_gate_inp, cur);
+
+    // 2. Softmax gating
+    ggml_tensor * probs = ggml_soft_max(ctx, logits);
+
+    // 3. Top-k expert selection: [n_expert_used, n_tokens]
+    ggml_tensor * selected = ggml_argsort_top_k(ctx, probs, (int)n_expert_used);
+
+    // 4. Extract weights for selected experts
+    probs = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
+    ggml_tensor * weights = ggml_get_rows(ctx, probs, selected);
+
+    // 5. Normalize weights
+    weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+    ggml_tensor * weights_sum = ggml_sum_rows(ctx, weights);
+    weights_sum = ggml_clamp(ctx, weights_sum, 6.103515625e-5f, INFINITY);
+    weights = ggml_div(ctx, weights, weights_sum);
+    weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
+    ggml_build_forward_expand(gf, weights);
+
+    // 6. Reshape input for batched expert matmul
+    cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
+
+    // 7. Per-expert projections via ggml_mul_mat_id
+    // gate
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur, selected);
+    // up
+    ggml_tensor * up = ggml_mul_mat_id(ctx, L.ffn_up_exps, cur, selected);
+
+    // 8. SwiGLU: silu(gate) * up
+    ggml_tensor * gu = ggml_swiglu_split(ctx, gate, up);
+
+    // 9. Down projection
+    ggml_tensor * experts = ggml_mul_mat_id(ctx, L.ffn_down_exps, gu, selected);
+
+    // 10. Apply weights
+    experts = ggml_mul(ctx, experts, weights);
+    ggml_build_forward_expand(gf, experts);
+
+    // 11. Sum across selected experts
+    ggml_tensor * moe_out = nullptr;
+    for (int64_t i = 0; i < n_expert_used; i++) {
+        ggml_tensor * view = ggml_view_2d(ctx, experts, n_embd, n_tokens,
+            experts->nb[2], i * experts->nb[1]);
+        ggml_build_forward_expand(gf, view);
+        if (i == 0) {
+            moe_out = view;
+        } else {
+            moe_out = ggml_add(ctx, moe_out, view);
+            ggml_build_forward_expand(gf, moe_out);
+        }
+    }
+    if (n_expert_used == 1) {
+        moe_out = ggml_cont(ctx, moe_out);
+    }
+
+    // 12. Shared expert path
+    ggml_tensor * sh_gate = ggml_mul_mat(ctx, L.ffn_gate_shexp, cur);
+    ggml_tensor * sh_up   = ggml_mul_mat(ctx, L.ffn_up_shexp, cur);
+    sh_gate = ggml_silu(ctx, sh_gate);
+    ggml_tensor * sh_gu   = ggml_mul(ctx, sh_gate, sh_up);
+    ggml_tensor * sh_down = ggml_mul_mat(ctx, L.ffn_down_shexp, sh_gu);
+
+    // Shared expert gating (sigmoid)
+    ggml_tensor * shared_gate = ggml_mul_mat(ctx, L.ffn_gate_inp_shexp, cur);
+    shared_gate = ggml_sigmoid(ctx, shared_gate);
+    // Reshape for broadcast: shared_gate is [1, n_tokens], sh_down is [n_embd, n_tokens]
+    shared_gate = ggml_reshape_2d(ctx, shared_gate, 1, n_tokens);
+    sh_down = ggml_mul(ctx, sh_down, ggml_repeat(ctx, shared_gate, sh_down));
+
+    // 13. Combine routed + shared
+    moe_out = ggml_add(ctx, moe_out, sh_down);
+
+    return moe_out;
+}
+
+} // namespace dflash27b (moe ffn)
