@@ -108,7 +108,7 @@ Numbers will move once a Qwen3.6-matched DFlash draft lands; swap it in via `DFL
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
 cd lucebox-hub/dflash
 
-# Build (CUDA 12+, CMake 3.18+, sm_86-compatible GPU)
+# Build (CUDA 12+, CMake 3.18+, sm_86+ or sm_120)
 cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=native -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target test_dflash -j
 
@@ -139,7 +139,7 @@ DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
   --fast-rollback --ddtree --ddtree-budget=16 --max-ctx=N   # N = align_up(prompt + n_gen + 64, 256); up to 262144
 ```
 
-**Requirements:** NVIDIA sm_86+ GPU (3090, A10, A40, 4090), CUDA 12+, 24 GB VRAM, ~80 GB disk.
+**Requirements:** NVIDIA sm_86+ GPU (3090, A10, A40, 4090) or sm_120 (5090, GB10), CUDA 12+, 24 GB VRAM, ~80 GB disk.
 
 ## How it works
 
