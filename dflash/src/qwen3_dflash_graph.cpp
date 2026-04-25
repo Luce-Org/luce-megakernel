@@ -52,8 +52,8 @@ DraftGraphOutputs build_draft_graph(
 
     const float freq_scale = 1.0f / w.hparams.rope_factor;
     const float ext_factor = (w.hparams.rope_factor > 1.0f) ? 1.0f : 0.0f;
-    const float attn_factor = (w.hparams.rope_factor > 1.0f) ?
-        1.0f / (w.hparams.rope_factor * w.hparams.rope_factor) : 1.0f;
+    const float mscale = (w.hparams.rope_factor > 1.0f) ?
+        1.0f / (0.1f * std::log(w.hparams.rope_factor) + 1.0f) : 1.0f;
 
     // ── 1. Feature fusion: target_feat = rms_norm(fc @ target_hidden_cat, hidden_norm)
     //    fc:                [5*hidden, hidden]  (ggml: ne[0]=5*hidden, ne[1]=hidden)
@@ -105,12 +105,12 @@ DraftGraphOutputs build_draft_graph(
         Q = ggml_rope_ext(ctx, Q, in.positions_q, nullptr,
                           head_dim, GGML_ROPE_TYPE_NEOX, w.hparams.rope_orig_ctx,
                           rope_base, freq_scale,
-                          ext_factor, attn_factor,
+                          ext_factor, mscale,
                           w.hparams.rope_beta_fast, w.hparams.rope_beta_slow);
         K = ggml_rope_ext(ctx, K, in.positions_k, nullptr,
                           head_dim, GGML_ROPE_TYPE_NEOX, w.hparams.rope_orig_ctx,
                           rope_base, freq_scale,
-                          ext_factor, attn_factor,
+                          ext_factor, mscale,
                           w.hparams.rope_beta_fast, w.hparams.rope_beta_slow);
 
         // ── 2e. Permute into the layout flash_attn_ext wants
@@ -125,7 +125,7 @@ DraftGraphOutputs build_draft_graph(
         V = ggml_cont   (ctx, V);
 
         // ── 2f. Non-causal flash attention; GQA broadcast handled internally.
-        const float scale = attn_factor / std::sqrt((float)head_dim);
+        const float scale = 1.0f / std::sqrt((float)head_dim);
         ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, /*mask=*/nullptr,
                                                  scale, /*max_bias=*/0.0f,
                                                  /*logit_softcap=*/0.0f);
