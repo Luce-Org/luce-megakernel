@@ -18,6 +18,8 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
@@ -49,18 +51,17 @@ struct StepGraph {
     ggml_gallocr_t    alloc = nullptr;
     ggml_tensor *     inp_embed = nullptr;
     ggml_tensor *     positions = nullptr;
+    ggml_tensor *     attn_mask = nullptr;
     ggml_tensor *     logits    = nullptr;
+    ggml_tensor *     argmax_out = nullptr;
 };
 
-// Build a fresh single-token forward graph. We rebuild per step so that
-// `kv_start` updates drive the correct KV cache slot. The graph is cheap to
-// rebuild — all the weights + KV cache stay persistent.
-static bool build_step_graph(
+static bool build_reusable_graph(
     StepGraph & sg,
     const TargetWeights & w,
     TargetCache & cache,
     ggml_backend_t backend,
-    int kv_start
+    int max_ctx
 ) {
     if (sg.ctx) { ggml_free(sg.ctx); sg.ctx = nullptr; }
 
@@ -73,36 +74,38 @@ static bool build_step_graph(
 
     const int n_tokens = 1;
     const int hidden = w.n_embd;
+
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
+    sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, max_ctx, n_tokens);
     ggml_set_input(sg.inp_embed);
     ggml_set_input(sg.positions);
+    ggml_set_input(sg.attn_mask);
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 8192, false);
 
     QwenGraphInputs gi{};
     gi.inp_embed      = sg.inp_embed;
     gi.positions      = sg.positions;
-    gi.attn_mask      = nullptr;
+    gi.attn_mask      = sg.attn_mask;
     gi.n_tokens       = n_tokens;
-    gi.kv_start       = kv_start;
+    gi.kv_start       = max_ctx - 1;
     gi.capture_layers = false;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
-    ggml_set_output(go.logits);
-    ggml_build_forward_expand(sg.gf, go.logits);
+
+    sg.argmax_out = ggml_argmax(sg.ctx, go.logits);
+    ggml_set_output(sg.argmax_out);
+    ggml_build_forward_expand(sg.gf, sg.argmax_out);
     sg.logits = go.logits;
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        ggml_gallocr_reserve(sg.alloc, sg.gf);
     }
+    if (!ggml_gallocr_reserve(sg.alloc, sg.gf)) return false;
     if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) return false;
 
-    return true;
-}
-    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) return false;
     return true;
 }
 
@@ -121,6 +124,22 @@ static bool write_int32_file(const std::string & path, const std::vector<int32_t
     if (!f) return false;
     f.write((const char *)v.data(), v.size() * sizeof(int32_t));
     return (bool)f;
+}
+
+static void copy_kv_slot(
+    const std::vector<ggml_tensor *> & cache_tensors,
+    int src_slot, int dst_slot, int max_ctx, int n_heads
+) {
+    for (auto * ct : cache_tensors) {
+        const size_t pos_bytes = ct->nb[1];
+        const size_t head_stride = ct->nb[2];
+        const char * base = (const char *) ct->data;
+        cudaMemcpy2D(
+            (void *)(base + (size_t)dst_slot * pos_bytes), head_stride,
+            (const void *)(base + (size_t)src_slot * pos_bytes), head_stride,
+            pos_bytes, n_heads, cudaMemcpyDeviceToDevice
+        );
+    }
 }
 
 int main(int argc, char ** argv) {
@@ -151,7 +170,6 @@ int main(int argc, char ** argv) {
 #endif
     };
 
-    // ── Load model and cache
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
 
@@ -180,22 +198,25 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::vector<int32_t> all_tokens = prompt;
-    all_tokens.reserve(prompt.size() + n_gen);
-
-    const int hidden = w.n_embd;
-    std::vector<float> embed_buf(hidden);
+    const int n_full_attn = w.n_layer / w.full_attention_interval;
+    const int n_head_kv = w.n_head_kv;
 
     StepGraph sg;
+    if (!build_reusable_graph(sg, w, cache, backend, max_ctx)) {
+        std::fprintf(stderr, "build_reusable_graph failed\n");
+        return 1;
+    }
 
-    // ── Helper: run one step given current token + absolute position
-    auto run_step = [&](int32_t tok, int pos) -> int32_t {
-        if (!build_step_graph(sg, w, cache, backend, pos)) {
-            std::fprintf(stderr, "build_step_graph failed at pos=%d\n", pos);
-            std::exit(1);
-        }
+    std::vector<ggml_fp16_t> mask_buf(max_ctx);
+    std::vector<int32_t> all_tokens = prompt;
+    all_tokens.reserve(prompt.size() + n_gen);
+    const int hidden = w.n_embd;
+    std::vector<float> embed_buf(hidden);
+    int32_t argmax_result = 0;
 
-        // CPU embed
+    const int write_slot = max_ctx - 1;
+
+    auto run_step_reuse = [&](int32_t tok, int pos) -> int32_t {
         int32_t ids[1] = { tok };
         if (!w.embedder.embed(ids, 1, embed_buf.data())) {
             std::fprintf(stderr, "embed failed tok=%d\n", tok);
@@ -204,9 +225,15 @@ int main(int argc, char ** argv) {
         ggml_backend_tensor_set(sg.inp_embed, embed_buf.data(), 0,
                                 sizeof(float) * embed_buf.size());
 
-        // M-RoPE positions: 4 copies of pos
         int32_t p4[4] = { pos, pos, pos, pos };
         ggml_backend_tensor_set(sg.positions, p4, 0, sizeof(int32_t) * 4);
+
+        for (int i = 0; i < max_ctx; i++) {
+            bool attend = (i < pos) || (i == write_slot);
+            mask_buf[i] = ggml_fp32_to_fp16(attend ? 0.0f : -INFINITY);
+        }
+        ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                sizeof(ggml_fp16_t) * max_ctx);
 
         auto st = ggml_backend_graph_compute(backend, sg.gf);
         if (st != GGML_STATUS_SUCCESS) {
@@ -214,69 +241,62 @@ int main(int argc, char ** argv) {
             std::exit(1);
         }
 
-        // argmax on logits
-        const int vocab = (int)w.output->ne[1];
-        std::vector<float> logits(vocab);
-        ggml_backend_tensor_get(sg.logits, logits.data(), 0, sizeof(float) * vocab);
-        int best = 0;
-        float bv = logits[0];
-        for (int i = 1; i < vocab; i++) {
-            if (logits[i] > bv) { bv = logits[i]; best = i; }
-        }
-        return best;
+        ggml_backend_tensor_get(sg.argmax_out, &argmax_result, 0, sizeof(int32_t));
+
+        copy_kv_slot(cache.attn_k, write_slot, pos, max_ctx, n_head_kv);
+        copy_kv_slot(cache.attn_v, write_slot, pos, max_ctx, n_head_kv);
+
+        return argmax_result;
     };
 
     // ── Prefill: feed prompt tokens one at a time (decode-only mode).
-    //    We throw away the logits for all prompt tokens except the last one.
     int next = -1;
     for (int i = 0; i < (int)prompt.size(); i++) {
-        next = run_step(prompt[i], i);
+        next = run_step_reuse(prompt[i], i);
     }
     std::printf("[prefill] last-token argmax=%d\n", next);
 
-    // ── Generation loop
+    // ── Generation loop (CUDA graph captures on first step)
     auto t_start = std::chrono::steady_clock::now();
+    double total_compute = 0;
     int gen_start_pos = (int)prompt.size();
-    double total_build = 0, total_compute = 0;
     for (int g = 0; g < n_gen; g++) {
         int32_t tok = next;
         all_tokens.push_back(tok);
         stream_emit(tok);
 
         auto t0 = std::chrono::steady_clock::now();
-        if (!build_step_graph(sg, w, cache, backend, gen_start_pos + g)) {
-            std::fprintf(stderr, "build_step_graph failed at g=%d\n", g);
-            return 1;
-        }
+
         if (!w.embedder.embed(&tok, 1, embed_buf.data())) return 1;
         ggml_backend_tensor_set(sg.inp_embed, embed_buf.data(), 0, sizeof(float) * embed_buf.size());
         int32_t p4[4] = { gen_start_pos + g, gen_start_pos + g, gen_start_pos + g, gen_start_pos + g };
         ggml_backend_tensor_set(sg.positions, p4, 0, sizeof(int32_t) * 4);
-        auto t1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < max_ctx; i++) {
+            bool attend = (i < gen_start_pos + g) || (i == write_slot);
+            mask_buf[i] = ggml_fp32_to_fp16(attend ? 0.0f : -INFINITY);
+        }
+        ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(ggml_fp16_t) * max_ctx);
 
         ggml_backend_graph_compute(backend, sg.gf);
-        auto t2 = std::chrono::steady_clock::now();
 
-        const int vocab = (int)w.output->ne[1];
-        std::vector<float> logits(vocab);
-        ggml_backend_tensor_get(sg.logits, logits.data(), 0, sizeof(float) * vocab);
-        int best = 0; float bv = logits[0];
-        for (int i = 1; i < vocab; i++) if (logits[i] > bv) { bv = logits[i]; best = i; }
-        next = best;
+        ggml_backend_tensor_get(sg.argmax_out, &argmax_result, 0, sizeof(int32_t));
+        next = argmax_result;
 
-        total_build += std::chrono::duration<double>(t1 - t0).count();
-        total_compute += std::chrono::duration<double>(t2 - t1).count();
+        copy_kv_slot(cache.attn_k, write_slot, gen_start_pos + g, max_ctx, n_head_kv);
+        copy_kv_slot(cache.attn_v, write_slot, gen_start_pos + g, max_ctx, n_head_kv);
+
+        auto t1 = std::chrono::steady_clock::now();
+        total_compute += std::chrono::duration<double>(t1 - t0).count();
     }
     auto t_end = std::chrono::steady_clock::now();
     double secs = std::chrono::duration<double>(t_end - t_start).count();
     double tps  = n_gen / std::max(1e-9, secs);
 
-    // Also push the final next token so downstream sees it
     all_tokens.push_back(next);
 
     std::printf("[gen] %d new tokens in %.3f s  ->  %.2f tok/s\n", n_gen, secs, tps);
-    std::printf("[gen] build=%.3f s compute=%.3f s (%.1f%% compute)\n",
-        total_build, total_compute, 100.0 * total_compute / std::max(1e-12, total_build + total_compute));
+    std::printf("[gen] compute=%.3f s (%.1f%% of total)\n",
+        total_compute, 100.0 * total_compute / std::max(1e-12, secs));
     std::printf("[gen] tokens: ");
     for (int i = 0; i < n_gen; i++) std::printf("%d ", all_tokens[prompt.size() + i]);
     std::printf("\n");

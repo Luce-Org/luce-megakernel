@@ -23,6 +23,7 @@ endif()
 # Hardcoded for CUDA. No libllama, no BLAS, no Metal, no Vulkan.
 
 set(GGML_CUDA         ON  CACHE BOOL "" FORCE)
+set(GGML_CUDA_GRAPHS  ON  CACHE BOOL "" FORCE)
 set(GGML_BACKEND_DL   OFF CACHE BOOL "" FORCE)
 set(GGML_METAL        OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN       OFF CACHE BOOL "" FORCE)
