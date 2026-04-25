@@ -934,14 +934,16 @@ ggml_tensor * build_moe_ffn(
     ggml_tensor * sh_gate = ggml_mul_mat(ctx, L.ffn_gate_shexp, cur);
     ggml_tensor * sh_up   = ggml_mul_mat(ctx, L.ffn_up_shexp, cur);
     sh_gate = ggml_silu(ctx, sh_gate);
+    sh_gate = ggml_reshape_2d(ctx, sh_gate, w.expert_ff_dim, n_tokens);
+    sh_up   = ggml_reshape_2d(ctx, sh_up,   w.expert_ff_dim, n_tokens);
     ggml_tensor * sh_gu   = ggml_mul(ctx, sh_gate, sh_up);
     ggml_tensor * sh_down = ggml_mul_mat(ctx, L.ffn_down_shexp, sh_gu);
 
     // Shared expert gating (sigmoid)
     ggml_tensor * shared_gate = ggml_mul_mat(ctx, L.ffn_gate_inp_shexp, cur);
     shared_gate = ggml_sigmoid(ctx, shared_gate);
-    // Reshape for broadcast: shared_gate is [1, n_tokens], sh_down is [n_embd, n_tokens]
     shared_gate = ggml_reshape_2d(ctx, shared_gate, 1, n_tokens);
+    sh_down = ggml_reshape_2d(ctx, sh_down, n_embd, n_tokens);
     sh_down = ggml_mul(ctx, sh_down, ggml_repeat(ctx, shared_gate, sh_down));
 
     // 13. Combine routed + shared
