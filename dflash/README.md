@@ -108,8 +108,8 @@ Numbers will move once a Qwen3.6-matched DFlash draft lands; swap it in via `DFL
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
 cd lucebox-hub/dflash
 
-# Build (CUDA 12+, CMake 3.18+, sm_86-compatible GPU)
-cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
+# Build (CUDA 12+, CMake 3.18+, sm_86-compatible GPU; CUDA 13+ required for Jetson AGX Thor sm_110)
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target test_dflash -j
 
 # Fetch models: ~16 GB target + 3.46 GB draft
@@ -140,7 +140,7 @@ DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
   --fast-rollback --ddtree --ddtree-budget=16 --max-ctx=N   # N = align_up(prompt + n_gen + 64, 256); up to 262144
 ```
 
-**Requirements:** NVIDIA sm_86+ GPU (3090, A10, A40, 4090), CUDA 12+, 24 GB VRAM, ~80 GB disk.
+**Requirements:** NVIDIA sm_86+ GPU (3090, A10, A40, 4090) or Jetson AGX Thor sm_110, CUDA 12+ (CUDA 13+ required for Thor), 24 GB VRAM, ~80 GB disk.
 
 ## How it works
 
@@ -182,7 +182,7 @@ Research proof-of-concept, not production.
 - **Batch size 1**, single-user local inference target (Ollama / LM Studio use case)
 - **One model pair**: Qwen3.5-27B Q4_K_M target + z-lab DFlash BF16 draft. Does not generalize without rewriting the graph builders.
 - **Greedy only**: `temperature`/`top_p` on the OpenAI server accepted but ignored. Rejection sampling in the verify path is a weekend-sized addition.
-- **CUDA sm_86+** only. No Metal, ROCm, multi-GPU.
+- **CUDA sm_86+ / sm_110 Thor** only. No Metal, ROCm, multi-GPU.
 - **Q4_K_M target** costs ~30 points of per-position accept vs the paper's BF16. Q5_K_M / Q6_K would recover most of it, if they fit.
 
 Correctness: `test_vs_oracle` validates the draft graph at cos sim 0.999812 vs the PyTorch reference. The target graph matches llama.cpp's `models/qwen35.cpp` semantically and produces bit-identical output to `test_generate` in autoregressive mode.
