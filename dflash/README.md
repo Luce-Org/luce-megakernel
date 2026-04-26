@@ -81,13 +81,14 @@ huggingface-cli download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --loca
 DFLASH_TARGET=models/Qwen3.6-27B-Q4_K_M.gguf python3 scripts/bench_he.py --n-gen 128
 ```
 
-**Throughput is lower than on 3.5.** The z-lab draft was distilled against Qwen3.5 hidden states; Qwen3.6's captured features at layers {1, 16, 31, 46, 61} are shifted, so per-position accept drops about 30 points uniformly. Measured on the same RTX 3090:
+**Throughput is lower than on 3.5.** z-lab published a matched [Qwen3.6-27B-DFlash](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) draft on 2026-04-26 (still under training). AL should climb as the draft matures. Measured on the same RTX 3090:
 
-| Target | Bench | AL | Accept | Mean tok/s |
-|---|---|---:|---:|---:|
-| Qwen3.5-27B Q4_K_M | HumanEval (README config) | 8.33 | ~65% | 134.78 |
-| Qwen3.6-27B Q4_K_M | HumanEval (10 prompts, n_gen=128) | 4.74 | 30.6% | 73.67 |
-| Qwen3.6-27B Q4_K_M | Math (10 prompts, n_gen=128) | 3.63 | 23.7% | 57.00 |
+| Target | Draft | Bench | AL | Accept | Mean tok/s |
+|---|---|---|---:|---:|---:|
+| Qwen3.5-27B Q4_K_M | z-lab/Qwen3.5-27B-DFlash | HumanEval (README config) | 8.33 | ~65% | 134.78 |
+| Qwen3.6-27B Q4_K_M | z-lab/Qwen3.5-27B-DFlash (mismatch) | HumanEval (10 prompts, n_gen=128) | 4.74 | 30.6% | 73.67 |
+| Qwen3.6-27B Q4_K_M | z-lab/Qwen3.6-27B-DFlash (still training) | HumanEval (10 prompts, n_gen=128) | 5.05 | 32.3% | 77.77 |
+| Qwen3.6-27B Q4_K_M | z-lab/Qwen3.5-27B-DFlash (mismatch) | Math (10 prompts, n_gen=128) | 3.63 | 23.7% | 57.00 |
 
 Full `bench_llm.py` suite on **Qwen3.6-27B UD-Q4_K_XL** (unsloth Dynamic 2.0, 10 prompts, n_gen=256, RTX 3090 24 GB, auto-fit `--max-ctx`):
 
