@@ -38,7 +38,24 @@ struct PFLayerWeights { int layer_type; int _pad[3]; void *ptrs[14]; };
 __device__ __forceinline__ float pf_warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o); return v;
 }
+__device__ __forceinline__ float pf_warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, o)); return v;
+}
 __device__ __forceinline__ float pf_silu(float x) { return x / (1.0f + expf(-x)); }
+
+static void cublas_bf16_gemm(cublasHandle_t h,
+    const __nv_bfloat16 *A, const __nv_bfloat16 *B, __nv_bfloat16 *C,
+    int S, int N, int K);
+
+static void cublas_bf16_qk_scores(cublasHandle_t h,
+    const __nv_bfloat16 *q, int q_stride,
+    const __nv_bfloat16 *k, int k_stride,
+    float *scores, int rows, int key_count, int dim);
+
+static void cublas_bf16_probs_v(cublasHandle_t h,
+    const __nv_bfloat16 *probs, int prob_stride,
+    const __nv_bfloat16 *v, int v_stride,
+    float *out, int rows, int key_count, int dim);
 
 // Embedding
 __global__ void pf_embed(const int *ids, const __nv_bfloat16 *embed, __nv_bfloat16 *out, int S) {
@@ -731,6 +748,126 @@ __global__ void pf_causal_attn_fused(const __nv_bfloat16 *qkv_fused, __nv_bfloat
     for(int e=0;e<EPL;e++){int i=lid*EPL+e;float g=1.f/(1.f+expf(-__bfloat162float(gv[i])));ov[i]=__float2bfloat16(oa[e]*rs*g);}
 }
 
+__global__ void pf_causal_softmax_to_bf16(
+    const float *scores,
+    __nv_bfloat16 *probs,
+    int q_start,
+    int rows,
+    int key_count,
+    int stride)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int tid = threadIdx.x;
+    int wid = tid / 32;
+    int lid = tid % 32;
+    int q_pos = q_start + row;
+    const float scale = 1.0f / sqrtf(float(FA_HEAD_DIM));
+    const float *score_row = scores + row * stride;
+    __nv_bfloat16 *prob_row = probs + row * stride;
+
+    float local_max = -3.402823466e+38f;
+    for (int k = tid; k < key_count; k += blockDim.x) {
+        const float score = (k <= q_pos) ? (score_row[k] * scale) : -3.402823466e+38f;
+        local_max = fmaxf(local_max, score);
+    }
+    local_max = pf_warp_max(local_max);
+    __shared__ float warp_vals[32];
+    if (lid == 0) warp_vals[wid] = local_max;
+    __syncthreads();
+    float row_max = -3.402823466e+38f;
+    if (wid == 0) {
+        row_max = (lid < blockDim.x / 32) ? warp_vals[lid] : -3.402823466e+38f;
+        row_max = pf_warp_max(row_max);
+        if (lid == 0) warp_vals[0] = row_max;
+    }
+    __syncthreads();
+    row_max = warp_vals[0];
+
+    float local_sum = 0.0f;
+    for (int k = tid; k < key_count; k += blockDim.x) {
+        if (k <= q_pos) {
+            local_sum += expf(score_row[k] * scale - row_max);
+        }
+    }
+    local_sum = pf_warp_sum(local_sum);
+    if (lid == 0) warp_vals[wid] = local_sum;
+    __syncthreads();
+    float row_sum = 0.0f;
+    if (wid == 0) {
+        row_sum = (lid < blockDim.x / 32) ? warp_vals[lid] : 0.0f;
+        row_sum = pf_warp_sum(row_sum);
+        if (lid == 0) warp_vals[0] = row_sum;
+    }
+    __syncthreads();
+    row_sum = warp_vals[0];
+    const float inv_sum = row_sum > 0.0f ? (1.0f / row_sum) : 0.0f;
+
+    for (int k = tid; k < key_count; k += blockDim.x) {
+        float p = 0.0f;
+        if (k <= q_pos) {
+            p = expf(score_row[k] * scale - row_max) * inv_sum;
+        }
+        prob_row[k] = __float2bfloat16(p);
+    }
+}
+
+__global__ void pf_apply_attention_gate_bf16_fused(
+    const float *attn,
+    const __nv_bfloat16 *qkv_fused,
+    __nv_bfloat16 *out,
+    int q_start,
+    int rows,
+    int q_head)
+{
+    constexpr int STRIDE = FA_QPROJ_SIZE + 2*FA_KV_SIZE;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * FA_HEAD_DIM;
+    if (idx >= total) return;
+    int row = idx / FA_HEAD_DIM;
+    int d = idx % FA_HEAD_DIM;
+    const __nv_bfloat16 *gate = qkv_fused + (q_start + row) * STRIDE + q_head * FA_HEAD_DIM * 2 + FA_HEAD_DIM;
+    __nv_bfloat16 *out_row = out + (q_start + row) * FA_Q_SIZE + q_head * FA_HEAD_DIM;
+    float g = 1.0f / (1.0f + expf(-__bfloat162float(gate[d])));
+    out_row[d] = __float2bfloat16(attn[row * FA_HEAD_DIM + d] * g);
+}
+
+static void pf_causal_attn_fused_tiled_cublas(
+    cublasHandle_t h,
+    const __nv_bfloat16 *qkv_fused,
+    __nv_bfloat16 *prob_scratch,
+    float *score_scratch,
+    float *attn_scratch,
+    __nv_bfloat16 *out,
+    int S,
+    int query_block_tokens,
+    cudaStream_t stream)
+{
+    constexpr int STRIDE = FA_QPROJ_SIZE + 2*FA_KV_SIZE;
+    constexpr int K_COL = FA_QPROJ_SIZE;
+    constexpr int V_COL = FA_QPROJ_SIZE + FA_KV_SIZE;
+    query_block_tokens = max(1, min(query_block_tokens, S));
+
+    for (int qh = 0; qh < FA_Q_HEADS; ++qh) {
+        const int kvh = qh / FA_GQA;
+        const __nv_bfloat16 *k_head = qkv_fused + K_COL + kvh * FA_HEAD_DIM;
+        const __nv_bfloat16 *v_head = qkv_fused + V_COL + kvh * FA_HEAD_DIM;
+
+        for (int q0 = 0; q0 < S; q0 += query_block_tokens) {
+            const int rows = min(query_block_tokens, S - q0);
+            const int key_count = q0 + rows;
+            const __nv_bfloat16 *q_head = qkv_fused + q0 * STRIDE + qh * FA_HEAD_DIM * 2;
+
+            cublas_bf16_qk_scores(h, q_head, STRIDE, k_head, STRIDE, score_scratch, rows, key_count, FA_HEAD_DIM);
+            pf_causal_softmax_to_bf16<<<rows, 512, 0, stream>>>(
+                score_scratch, prob_scratch, q0, rows, key_count, key_count);
+            cublas_bf16_probs_v(h, prob_scratch, key_count, v_head, STRIDE, attn_scratch, rows, key_count, FA_HEAD_DIM);
+            pf_apply_attention_gate_bf16_fused<<<(rows * FA_HEAD_DIM + 255) / 256, 256, 0, stream>>>(
+                attn_scratch, qkv_fused, out, q0, rows, qh);
+        }
+    }
+}
+
 // ===== V3: Fused SiLU(gate)*up from concatenated [S, 2*N] buffer =====
 __global__ void pf_silu_mul_fused(const __nv_bfloat16 *fused, __nv_bfloat16 *out, int S, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -740,6 +877,34 @@ __global__ void pf_silu_mul_fused(const __nv_bfloat16 *fused, __nv_bfloat16 *out
     float gate_val = __bfloat162float(fused[s * 2 * N + n]);
     float up_val   = __bfloat162float(fused[s * 2 * N + N + n]);
     out[idx] = __float2bfloat16(pf_silu(gate_val) * up_val);
+}
+
+static void pf_mlp_chunked_fused(
+    cublasHandle_t cublas,
+    const __nv_bfloat16 *normalized,
+    const __nv_bfloat16 *residual,
+    __nv_bfloat16 *hidden,
+    const __nv_bfloat16 *gate_up_w,
+    const __nv_bfloat16 *down_w,
+    __nv_bfloat16 *gate_up_buf,
+    __nv_bfloat16 *mlp_buf,
+    int S,
+    int chunk_tokens,
+    cudaStream_t stream)
+{
+    chunk_tokens = max(1, min(chunk_tokens, S));
+    for (int offset = 0; offset < S; offset += chunk_tokens) {
+        const int rows = min(chunk_tokens, S - offset);
+        const __nv_bfloat16 *norm_chunk = normalized + static_cast<size_t>(offset) * HIDDEN;
+        const __nv_bfloat16 *residual_chunk = residual + static_cast<size_t>(offset) * HIDDEN;
+        __nv_bfloat16 *hidden_chunk = hidden + static_cast<size_t>(offset) * HIDDEN;
+
+        cublas_bf16_gemm(cublas, norm_chunk, gate_up_w, gate_up_buf, rows, 2 * INTER, HIDDEN);
+        pf_silu_mul_fused<<<(rows * INTER + 255) / 256, 256, 0, stream>>>(gate_up_buf, mlp_buf, rows, INTER);
+        cublas_bf16_gemm(cublas, mlp_buf, down_w, gate_up_buf, rows, HIDDEN, INTER);
+        pf_add_residual_bf16<<<(rows * HIDDEN + 255) / 256, 256, 0, stream>>>(
+            gate_up_buf, residual_chunk, hidden_chunk, rows * HIDDEN);
+    }
 }
 
 // ===== V3: Parallel pre-projection of DeltaNet Q/K/V =====
@@ -1001,6 +1166,28 @@ static void cublas_bf16_gemm(cublasHandle_t h,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
+static void cublas_bf16_qk_scores(cublasHandle_t h,
+    const __nv_bfloat16 *q, int q_stride,
+    const __nv_bfloat16 *k, int k_stride,
+    float *scores, int rows, int key_count, int dim) {
+    float alpha = 1.0f, beta_val = 0.0f;
+    cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, key_count, rows, dim,
+        &alpha, k, CUDA_R_16BF, k_stride, q, CUDA_R_16BF, q_stride,
+        &beta_val, scores, CUDA_R_32F, key_count,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+static void cublas_bf16_probs_v(cublasHandle_t h,
+    const __nv_bfloat16 *probs, int prob_stride,
+    const __nv_bfloat16 *v, int v_stride,
+    float *out, int rows, int key_count, int dim) {
+    float alpha = 1.0f, beta_val = 0.0f;
+    cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, dim, rows, key_count,
+        &alpha, v, CUDA_R_16BF, v_stride, probs, CUDA_R_16BF, prob_stride,
+        &beta_val, out, CUDA_R_32F, dim,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
 // ===== Main orchestrator =====
 extern "C" void launch_prefill_bf16(
     const int *token_ids, int seq_len, int *output_token,
@@ -1056,8 +1243,6 @@ extern "C" void launch_prefill_bf16(
             const __nv_bfloat16 *dn_norm=(const __nv_bfloat16*)lw.ptrs[8];
             const __nv_bfloat16 *out_w=(const __nv_bfloat16*)lw.ptrs[9];
             const __nv_bfloat16 *post_norm=(const __nv_bfloat16*)lw.ptrs[10];
-            const __nv_bfloat16 *gate_w=(const __nv_bfloat16*)lw.ptrs[11];
-            const __nv_bfloat16 *up_w=(const __nv_bfloat16*)lw.ptrs[12];
             const __nv_bfloat16 *down_w=(const __nv_bfloat16*)lw.ptrs[13];
 
             cublas_bf16_gemm(cublas, normalized, qkv_w, proj_buf, S, DN_CONV_CH, HIDDEN);
@@ -1120,12 +1305,19 @@ extern "C" void launch_prefill_bf16(
             pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
             {
                 const __nv_bfloat16 *gu_w = fused_gate_up_base + (size_t)li * (2*INTER) * HIDDEN;
-                cublas_bf16_gemm(cublas, normalized, gu_w, proj_buf, S, 2*INTER, HIDDEN);
-                int mlp_bk = (S*INTER+255)/256;
-                pf_silu_mul_fused<<<mlp_bk, 256, 0, stream>>>(proj_buf, mlp_buf, S, INTER);
+                pf_mlp_chunked_fused(
+                    cublas,
+                    normalized,
+                    residual,
+                    hidden,
+                    gu_w,
+                    down_w,
+                    proj_buf,
+                    mlp_buf,
+                    S,
+                    4096,
+                    stream);
             }
-            cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
-            pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
 
             dn_idx++;
         } else {
@@ -1145,8 +1337,16 @@ extern "C" void launch_prefill_bf16(
                 proj_buf, q_nw, k_nw,
                 fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, max_seq_len);
 
-            pf_causal_attn_fused<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
-                proj_buf, dn_out_buf, S);
+            pf_causal_attn_fused_tiled_cublas(
+                cublas,
+                proj_buf,
+                mlp_buf,
+                dn_pre_qkv,
+                dn_pre_qkv + static_cast<size_t>(S) * max_seq_len,
+                dn_out_buf,
+                S,
+                4096,
+                stream);
 
             cublas_bf16_gemm(cublas, dn_out_buf, o_w, proj_buf, S, HIDDEN, FA_Q_SIZE);
             pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
@@ -1154,12 +1354,19 @@ extern "C" void launch_prefill_bf16(
             pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
             {
                 const __nv_bfloat16 *gu_w = fused_gate_up_base + (size_t)li * (2*INTER) * HIDDEN;
-                cublas_bf16_gemm(cublas, normalized, gu_w, proj_buf, S, 2*INTER, HIDDEN);
-                int mlp_bk = (S*INTER+255)/256;
-                pf_silu_mul_fused<<<mlp_bk, 256, 0, stream>>>(proj_buf, mlp_buf, S, INTER);
+                pf_mlp_chunked_fused(
+                    cublas,
+                    normalized,
+                    residual,
+                    hidden,
+                    gu_w,
+                    down_w,
+                    proj_buf,
+                    mlp_buf,
+                    S,
+                    4096,
+                    stream);
             }
-            cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
-            pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
 
             fa_idx++;
         }
