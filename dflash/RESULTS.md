@@ -25,6 +25,16 @@ Reproduce with `uv run scripts/bench_llm.py` (samples 10 prompts/dataset, seed=4
 
 AR is lower than on the 3090 (~24 vs ~38 tok/s) due to laptop power limits and memory bandwidth. The DFlash speedup ratio holds — HumanEval actually improves to 3.64× at AL 8.49, consistent with the draft having been distilled on Qwen3.5 hidden states which transfer across quantisation targets.
 
+### RTX 5090 Laptop — TQ3_0 KV cache (`DFLASH27B_KV_TQ3=1`)
+
+| Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
+|-----------|:--------:|:------------:|:----:|:-------:|
+| HumanEval | 24.09    | 78.91        | 7.76 | 3.28×   |
+| GSM8K     | 23.95    | 64.75        | 6.40 | 2.70×   |
+| Math500   | 24.01    | 67.85        | 6.57 | 2.83×   |
+
+TQ3_0 (3.5 bpv) costs ~0.7 AL and ~10 tok/s vs the default KV format at short contexts. The memory saving (9.7× vs F16, vs 8× for Q4_0) is the point — TQ3 enables longer contexts on the same VRAM budget, not higher short-context throughput. A long-context sweep (32K–256K) comparing TQ3 vs Q4_0 on the 5090 has not been run yet.
+
 AR = autoregressive target-only decode via `test_generate`.
 DFlash = block-diffusion draft + DDTree budget 22 verify + fast rollback.
 AL = mean committed tokens per draft/verify step (acceptance length).
