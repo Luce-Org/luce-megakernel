@@ -1,0 +1,25 @@
+[project]
+name = "dflash"
+version = "0.1.0"
+description = "Python scripts for dflash inference, benchmarking, and serving"
+requires-python = ">=3.10"
+dependencies = [
+    "transformers",
+    "numpy",
+    "gguf",
+    "fastapi",
+    "uvicorn[standard]",
+    "jinja2",
+    "pytest",
+    "httpx",
+    "datasets",
+]
+
+[project.optional-dependencies]
+oracle = ["torch"]
+
+[project.scripts]
+dflash-server = "dflash.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
