@@ -42,7 +42,42 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/CMakeLists.txt")
         "deps/llama.cpp submodule missing. Run: "
         "git submodule update --init --recursive")
 endif()
+
+# ─── CUDA architecture auto-detection ──────────────────────────────
+# CUDA 12.8+ resolves "native" on Blackwell to sm_120a (DGX Spark variant)
+# which is forward-incompatible with consumer Blackwell (RTX 5090, SM 12.0).
+# Query nvidia-smi at configure time to get the exact SM so ggml-cuda
+# compiles for the physical GPU rather than an incompatible variant.
+if(NOT CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
+    find_program(_DFLASH_NVIDIA_SMI nvidia-smi)
+    if(_DFLASH_NVIDIA_SMI)
+        execute_process(
+            COMMAND "${_DFLASH_NVIDIA_SMI}"
+                    --query-gpu=compute_cap --format=csv,noheader
+            OUTPUT_VARIABLE _dflash_gpu_caps
+            ERROR_QUIET
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _dflash_smi_rc
+        )
+        if(_dflash_smi_rc EQUAL 0 AND _dflash_gpu_caps)
+            string(REGEX MATCH "^[0-9]+\\.[0-9]+" _dflash_cap "${_dflash_gpu_caps}")
+            string(REPLACE "." "" _dflash_arch "${_dflash_cap}")
+            if(_dflash_arch)
+                set(CMAKE_CUDA_ARCHITECTURES "${_dflash_arch}" CACHE STRING
+                    "CUDA architectures (auto-detected from nvidia-smi: ${_dflash_cap})" FORCE)
+                message(STATUS "dflash27b: GPU compute_cap ${_dflash_cap} → CUDA_ARCHITECTURES=${_dflash_arch}")
+                # Consumer Blackwell (SM 12.x, no FP4 tensor cores) must skip
+                # ggml's sm_120→sm_120a replacement or kernels will fault.
+                if(_dflash_arch MATCHES "^12[0-9]$")
+                    set(GGML_CUDA_BLACKWELL_CONSUMER ON CACHE BOOL
+                        "Skip sm_12X→sm_12Xa for consumer Blackwell (no FP4)" FORCE)
+                endif()
+            endif()
+        endif()
+    endif()
+endif()
 set(GGML_CUDA_FA_ALL_QUANTS ON CACHE BOOL "Compile fattn kernels for all quant pairs (needed for asymmetric KV-quant)" FORCE)
+
 add_subdirectory(deps/llama.cpp/ggml EXCLUDE_FROM_ALL)
 
 # ─── dflash27b static library ──────────────────────────────────────
