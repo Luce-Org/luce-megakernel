@@ -1,8 +1,7 @@
 """
 OpenAI-compatible HTTP server on top of test_dflash.
 
-    pip install fastapi uvicorn transformers
-    python3 scripts/server.py                 # serves on :8000
+    uv run scripts/server.py                  # serves on :1236
 
     curl http://localhost:8000/v1/chat/completions \\
         -H 'Content-Type: application/json' \\
@@ -12,8 +11,7 @@ Drop-in for Open WebUI / LM Studio / Cline by setting
   OPENAI_API_BASE=http://localhost:8000/v1  OPENAI_API_KEY=sk-any
 
 Streams tokens as Server-Sent Events using the OpenAI delta format.
-Model reloads per request (~10 s first-token latency). A daemon-mode
-binary that keeps the model resident is a planned follow-up.
+Model stays resident in daemon mode (default); context default is 128K.
 """
 import argparse
 import json
@@ -39,7 +37,6 @@ DEFAULT_TARGET = ROOT / "models" / "Qwen3.5-27B-Q4_K_M.gguf"
 DEFAULT_DRAFT_ROOT = ROOT / "models" / "draft"
 DEFAULT_BIN = ROOT / "build" / ("test_dflash" + (".exe" if sys.platform == "win32" else ""))
 DEFAULT_BUDGET = 22
-MODEL_NAME = "luce-dflash"
 
 
 def resolve_draft(root: Path) -> Path:
@@ -95,7 +92,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model: str = MODEL_NAME
+    model: str = ""
     messages: list[ChatMessage]
     stream: bool = False
     max_tokens: int = 512
@@ -110,7 +107,7 @@ class AnthropicMessage(BaseModel):
 
 
 class AnthropicMessagesRequest(BaseModel):
-    model: str = MODEL_NAME
+    model: str = ""
     max_tokens: int
     messages: list[AnthropicMessage]
     system: str | list[dict] | None = None
@@ -121,9 +118,11 @@ class AnthropicMessagesRequest(BaseModel):
 
 
 def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: int,
-              tokenizer: AutoTokenizer, stop_ids: set[int]) -> FastAPI:
+              tokenizer: AutoTokenizer, stop_ids: set[int],
+              model_name: str = "") -> FastAPI:
     import asyncio
     app = FastAPI(title="Luce DFlash OpenAI server")
+    MODEL_NAME = model_name
     daemon_lock = asyncio.Lock()
 
     r_pipe, w_pipe = os.pipe()
@@ -429,21 +428,14 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--port", type=int, default=1236)
     ap.add_argument("--target", type=Path, default=DEFAULT_TARGET)
     ap.add_argument("--draft",  type=Path, default=DEFAULT_DRAFT_ROOT)
     ap.add_argument("--bin",    type=Path, default=DEFAULT_BIN)
     ap.add_argument("--budget", type=int,  default=DEFAULT_BUDGET)
-    # Attention compute currently scales with --max-ctx, not the actual
-    # prompt+gen length (see https://github.com/Luce-Org/lucebox-hub/issues/10).
-    # Default 16384 fits most API workloads without the 20×+ slowdown users
-    # hit with --max-ctx=131072 on short requests. Bump via --max-ctx if you
-    # actually need long-context serving.
-    default_ctx = 16384
+    default_ctx = 131072
     ap.add_argument("--max-ctx", type=int, default=default_ctx,
-                    help=f"Maximum context length (default: {default_ctx}; "
-                         "oversizing this — e.g. 131072 on short prompts — "
-                         "can slow attention 20×+ until issue #10 is fixed)")
+                    help=f"Maximum context length (default: {default_ctx})")
     ap.add_argument("--kv-f16", action="store_true",
                     help="Force F16 KV cache. When --max-ctx > 6144 the server "
                          "auto-enables TQ3_0 KV to fit; pass --kv-f16 to opt out.")
@@ -483,8 +475,9 @@ def main():
         ids = tokenizer.encode(s, add_special_tokens=False)
         if ids: stop_ids.add(ids[0])
 
+    model_name = args.target.stem
     app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
-                    tokenizer, stop_ids)
+                    tokenizer, stop_ids, model_name=model_name)
 
     import uvicorn
     print(f"Luce DFlash OpenAI server on http://{args.host}:{args.port}")
@@ -494,6 +487,7 @@ def main():
     print(f"  budget    = {args.budget}")
     print(f"  max_ctx   = {args.max_ctx}")
     print(f"  tokenizer = {tokenizer_id}")
+    print(f"  model     = {model_name}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
