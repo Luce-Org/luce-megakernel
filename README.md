@@ -54,7 +54,7 @@ python final_bench.py
 
 | Method | Prefill pp520 | Decode tg128 | tok/J |
 |--------|:-------------:|:------------:|:-----:|
-| **Megakernel** `@220W` | **37,800** | **413** | **1.87** |
+| **Megakernel** `@220W` | **21,347** | **413** | **1.87** |
 | llama.cpp BF16 `@350W` | 11,247 | 267 | 0.76 |
 | PyTorch HF | 7,578 | 108 | n/a |
 

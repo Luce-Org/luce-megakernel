@@ -13,7 +13,7 @@ All benchmarks are **batch size 1, single-stream decode**, targeting local infer
 
 | Method | pp520 (tok/s) | tg128 (tok/s) |
 |--------|:---:|:---:|
-| **Megakernel** | **37,800** | **413** |
+| **Megakernel** | **21,347** | **413** |
 | llama.cpp BF16 | 11,247 | 267 |
 | PyTorch HF | 7,578 | 108 |
 
