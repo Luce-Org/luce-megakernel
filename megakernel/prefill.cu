@@ -489,10 +489,19 @@ __global__ void pf_dn_chunk_phase1(
 // Launch: <<<dim3(DN_HEADS, J_SPLITS), PHASE2_BLOCK>>>
 // Each block owns 1 head and a slice of DN_VAL rows (j). State slice in shared memory.
 // Sequential loop over N chunks.
+//
+// Build-flag: MEGAKERNEL_DN_PHASE2_WMMA (set via MEGAKERNEL_DN_PHASE2_WMMA env var in setup.py)
+//   0 (default) — scalar FP32 implementation below.
+//   1           — WMMA variant (not yet implemented; build will #error loudly).
+//
+// When the WMMA kernel is ready, define it inside the #else branch and
+// remove the #error. No rebuild of the default path will be required.
 constexpr int DN_PHASE2_J_SPLITS = 4;                      // split DN_VAL across this many blocks per head
 constexpr int DN_PHASE2_J_PER_BLOCK = DN_VAL / DN_PHASE2_J_SPLITS;   // 32
 constexpr int DN_PHASE2_BLOCK = 128;                       // threads per block
 
+#if !defined(MEGAKERNEL_DN_PHASE2_WMMA) || MEGAKERNEL_DN_PHASE2_WMMA == 0
+// ===== Scalar FP32 phase2 (default; will be replaced by WMMA variant) =====
 __global__ void __launch_bounds__(DN_PHASE2_BLOCK, 1)
 pf_dn_chunk_phase2(
     const float *u_in,           // [N, C, H, Dv]
@@ -667,6 +676,9 @@ pf_dn_chunk_phase2(
         state[((h * DN_VAL) + (j_start + j)) * DN_KEY + i] = s_state[j * DK_S + i];
     }
 }
+#else
+#error "MEGAKERNEL_DN_PHASE2_WMMA=1 build is not yet implemented (see .sisyphus/plans/20260428-1430-path-b-deltanet-wmma-scope.md)"
+#endif  // MEGAKERNEL_DN_PHASE2_WMMA
 
 // ===== V3: Fused QK norm + RoPE + KV cache (single fused QKV buffer) =====
 // The full attention Q/K/V live in one fused buffer with row stride (FA_QPROJ_SIZE + 2*FA_KV_SIZE).

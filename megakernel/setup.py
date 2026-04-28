@@ -30,6 +30,7 @@ num_blocks = _int_env("MEGAKERNEL_NUM_BLOCKS", 82)
 block_size = _int_env("MEGAKERNEL_BLOCK_SIZE", 512)
 lm_num_blocks = _int_env("MEGAKERNEL_LM_NUM_BLOCKS", 512)
 lm_block_size = _int_env("MEGAKERNEL_LM_BLOCK_SIZE", 256)
+dn_phase2_wmma = _int_env("MEGAKERNEL_DN_PHASE2_WMMA", 0)
 
 sources = [
     "torch_bindings.cpp",
@@ -47,7 +48,11 @@ nvcc_args = [
     f"-DBLOCK_SIZE={block_size}",
     f"-DLM_NUM_BLOCKS={lm_num_blocks}",
     f"-DLM_BLOCK_SIZE={lm_block_size}",
+    f"-DMEGAKERNEL_DN_PHASE2_WMMA={dn_phase2_wmma}",
 ]
+# Expose to host compiler (torch_bindings.cpp, prefill.cu host-side) so it
+# can also branch on the flag without needing a separate nvcc pass.
+cxx_args.append(f"-DMEGAKERNEL_DN_PHASE2_WMMA={dn_phase2_wmma}")
 
 if is_blackwell:
     sources.append("kernel_gb10_nvfp4.cu")
