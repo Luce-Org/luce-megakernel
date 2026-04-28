@@ -1006,10 +1006,18 @@ pf_dn_chunk_phase2_wmma(
         }
         __syncthreads();
         // Refresh s_state_bf16 mirror for the next chunk's d / o_inter WMMA reads.
-        for (int ji = tid; ji < DN_PHASE2_J_PER_BLOCK * DN_KEY; ji += DN_PHASE2_BLOCK) {
-            int j = ji / DN_KEY;
-            int i = ji % DN_KEY;
-            s_state_bf16[j * DK_B + i] = __float2bfloat16(s_state[j * DK_S + i]);
+        // Paired conversion via __float22bfloat162_rn: 4096 → 2048 stores per chunk.
+        // s_state_bf16 stride DK_B=128 is 4-byte aligned (bf162 is 4 bytes), and
+        // adjacent (i, i+1) within a row are in the same DK_B row. s_state stride
+        // DK_S=129 floats means &s_state[j*DK_S + i] for even i is 4-byte but not
+        // 8-byte aligned — so we read two scalars and pack rather than load float2.
+        for (int ji = tid; ji < DN_PHASE2_J_PER_BLOCK * (DN_KEY / 2); ji += DN_PHASE2_BLOCK) {
+            int j  = ji / (DN_KEY / 2);
+            int i2 = (ji % (DN_KEY / 2)) * 2;        // 0, 2, 4, ..., 126
+            float v0 = s_state[j * DK_S + i2 + 0];
+            float v1 = s_state[j * DK_S + i2 + 1];
+            __nv_bfloat162 packed = __floats2bfloat162_rn(v0, v1);
+            *reinterpret_cast<__nv_bfloat162 *>(&s_state_bf16[j * DK_B + i2]) = packed;
         }
         __syncthreads();
         // ─── /WMMA state update ─────────────────────────────────────────────
