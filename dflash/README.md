@@ -166,8 +166,16 @@ python3 examples/chat.py
 
 # OpenAI-compatible HTTP server (drop-in for Open WebUI / LM Studio / Cline)
 python3 -m venv .venv
-.venv/bin/pip install fastapi uvicorn transformers jinja2
-.venv/bin/python scripts/server.py --port 8000 --daemon
+.venv/bin/pip install -e .
+.venv/bin/dflash-server --profile agent-code-text --port 8000
+
+# Safe text-only coding-agent profile (default)
+# - max_ctx=48000, max_prompt_tokens=42000
+# - DFLASH27B_PREFILL_UBATCH=384, DFLASH27B_LAYER_PREFILL=0
+# - optional KV cache passthrough: --cache-type-k q4_0 --cache-type-v q8_0
+# - vision/multimodal payloads rejected
+# - prefix cache intentionally disabled; see docs/prefix-cache-design.md
+.venv/bin/dflash-server --profile agent-code-text --prefill-ubatch 256 --cache-type-k q4_0 --cache-type-v q8_0
 
 # Reproduce paper numbers
 python3 scripts/bench_llm.py                                 # HE + GSM8K + Math500

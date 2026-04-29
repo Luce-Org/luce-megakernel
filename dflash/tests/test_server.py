@@ -6,7 +6,13 @@ from unittest.mock import patch, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from dflash.server import build_app
+from dflash.server import (
+    AGENT_CODE_TEXT_PROFILE,
+    admission_for_prompt,
+    build_app,
+    configure_server_environment,
+    resolve_server_profile,
+)
 
 
 MODEL = "test-model"
@@ -41,6 +47,109 @@ def app(mock_tokenizer):
 @pytest.fixture
 def client(app):
     return TestClient(app)
+
+
+def test_agent_code_text_profile_defaults():
+    profile = resolve_server_profile("agent-code-text")
+    assert profile.max_ctx == 48_000
+    assert profile.max_prompt_tokens == 42_000
+    assert profile.prefill_ubatch == 384
+    assert profile.layer_prefill is False
+    assert profile.fa_window == 0
+    assert profile.vision is False
+    assert profile.prefix_cache is False
+
+
+def test_agent_code_text_profile_overrides_stay_explicit():
+    profile = resolve_server_profile("agent-code-text", prefill_ubatch=256, max_prompt_tokens=40_000)
+    assert profile.prefill_ubatch == 256
+    assert profile.max_prompt_tokens == 40_000
+    assert profile.max_ctx == 48_000
+
+
+def test_agent_code_text_admission_reserves_prompt_limit():
+    rejected = admission_for_prompt(42_001, 1024, AGENT_CODE_TEXT_PROFILE)
+    assert rejected.allowed is False
+    accepted = admission_for_prompt(42_000, 8_192, AGENT_CODE_TEXT_PROFILE)
+    assert accepted.allowed is True
+    assert accepted.generation_tokens == 5_980
+
+
+def test_agent_code_text_admission_rejects_non_positive_generation():
+    zero = admission_for_prompt(100, 0, AGENT_CODE_TEXT_PROFILE)
+    negative = admission_for_prompt(100, -1, AGENT_CODE_TEXT_PROFILE)
+    assert zero.allowed is False
+    assert negative.allowed is False
+
+
+def test_agent_code_text_admission_enforces_reserved_generation_tokens():
+    profile = resolve_server_profile("agent-code-text", max_prompt_tokens=47_000)
+    rejected = admission_for_prompt(44_000, 8_192, profile)
+    accepted = admission_for_prompt(43_884, 8_192, profile)
+    assert rejected.allowed is False
+    assert accepted.allowed is True
+    assert accepted.generation_tokens == 4_096
+
+
+def test_configure_server_environment_sets_safe_profile_defaults(monkeypatch):
+    monkeypatch.delenv("DFLASH27B_PREFILL_UBATCH", raising=False)
+    monkeypatch.delenv("DFLASH27B_LAYER_PREFILL", raising=False)
+    monkeypatch.delenv("DFLASH27B_FA_WINDOW", raising=False)
+    monkeypatch.delenv("DFLASH27B_KV_TQ3", raising=False)
+    monkeypatch.delenv("DFLASH27B_KV_K", raising=False)
+    monkeypatch.delenv("DFLASH27B_KV_V", raising=False)
+
+    configure_server_environment(AGENT_CODE_TEXT_PROFILE, kv_f16=False)
+
+    import os
+    assert os.environ["DFLASH27B_PREFILL_UBATCH"] == "384"
+    assert os.environ["DFLASH27B_LAYER_PREFILL"] == "0"
+    assert os.environ["DFLASH27B_FA_WINDOW"] == "0"
+    assert os.environ["DFLASH27B_KV_TQ3"] == "1"
+    assert "DFLASH27B_KV_K" not in os.environ
+    assert "DFLASH27B_KV_V" not in os.environ
+
+
+def test_configure_server_environment_passthroughs_kv_cache_types(monkeypatch):
+    monkeypatch.setenv("DFLASH27B_KV_TQ3", "1")
+    monkeypatch.delenv("DFLASH27B_KV_K", raising=False)
+    monkeypatch.delenv("DFLASH27B_KV_V", raising=False)
+
+    configure_server_environment(
+        AGENT_CODE_TEXT_PROFILE,
+        kv_f16=False,
+        cache_type_k="q4_0",
+        cache_type_v="q8_0",
+    )
+
+    import os
+    assert os.environ["DFLASH27B_KV_K"] == "q4_0"
+    assert os.environ["DFLASH27B_KV_V"] == "q8_0"
+    assert "DFLASH27B_KV_TQ3" not in os.environ
+
+
+@pytest.fixture
+def agent_profile_app(mock_tokenizer):
+    with patch("dflash.server.subprocess.Popen") as popen, \
+         patch("dflash.server.os.pipe", return_value=(10, 11)), \
+         patch("dflash.server.os.close"):
+        app = build_app(
+            target=Path("target.gguf"),
+            draft=Path("draft.safetensors"),
+            bin_path=Path("test_dflash"),
+            budget=22,
+            tokenizer=mock_tokenizer,
+            stop_ids={2},
+            model_name=MODEL,
+            profile=AGENT_CODE_TEXT_PROFILE,
+        )
+        app.state.daemon_proc_mock = popen.return_value
+        return app
+
+
+@pytest.fixture
+def agent_profile_client(agent_profile_app):
+    return TestClient(agent_profile_app)
 
 
 # ── /v1/models ─────────────────────────────────────────────────────
@@ -126,6 +235,72 @@ def test_chat_context_exceeded(client, mock_tokenizer):
         "stream": False,
     })
     assert r.status_code == 400
+
+
+def test_agent_profile_rejects_openai_image_payload(agent_profile_client):
+    r = agent_profile_client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "file:///tmp/x.png"}},
+        ]}],
+        "stream": False,
+    })
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "unsupported_content"
+
+
+def test_agent_profile_rejects_openai_non_text_content_block(agent_profile_client):
+    r = agent_profile_client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "transcribe"},
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+        ]}],
+        "stream": False,
+    })
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "unsupported_content"
+
+
+def test_agent_profile_rejects_openai_zero_max_tokens(agent_profile_client):
+    r = agent_profile_client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 0,
+        "stream": False,
+    })
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "context_limit"
+
+
+def test_agent_profile_rejects_openai_negative_max_tokens(agent_profile_client):
+    r = agent_profile_client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": -1,
+        "stream": False,
+    })
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "context_limit"
+
+
+def test_agent_profile_rejects_prompt_above_safe_limit(agent_profile_client, mock_tokenizer):
+    mock_tokenizer.encode.return_value = list(range(AGENT_CODE_TEXT_PROFILE.max_prompt_tokens + 1))
+    r = agent_profile_client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": False,
+    })
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "context_limit"
+
+
+@patch("dflash.server.os.read")
+def test_agent_profile_uses_legacy_run_command_without_prefix_cache(mock_read, agent_profile_client, agent_profile_app):
+    mock_read.side_effect = _token_bytes(10, -1)
+    r = agent_profile_client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": False,
+    })
+    assert r.status_code == 200
+    written = agent_profile_app.state.daemon_proc_mock.stdin.write.call_args[0][0].decode()
+    assert not written.startswith("RUN_PREFIX ")
 
 
 # ── /v1/chat/completions — streaming ─────────────────────────────
@@ -283,6 +458,42 @@ def test_anthropic_context_exceeded(client, mock_tokenizer):
     r = client.post("/v1/messages", json={
         "model": MODEL,
         "max_tokens": 512,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 400
+    assert r.json()["type"] == "error"
+
+
+def test_agent_profile_rejects_anthropic_image_payload(agent_profile_client):
+    r = agent_profile_client.post("/v1/messages", json={
+        "model": MODEL,
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}},
+        ]}],
+    })
+    assert r.status_code == 400
+    assert r.json()["type"] == "error"
+
+
+def test_agent_profile_rejects_anthropic_non_text_content_block(agent_profile_client):
+    r = agent_profile_client.post("/v1/messages", json={
+        "model": MODEL,
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "read"},
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "x"}},
+        ]}],
+    })
+    assert r.status_code == 400
+    assert r.json()["type"] == "error"
+
+
+def test_agent_profile_rejects_anthropic_zero_max_tokens(agent_profile_client):
+    r = agent_profile_client.post("/v1/messages", json={
+        "model": MODEL,
+        "max_tokens": 0,
         "messages": [{"role": "user", "content": "hi"}],
     })
     assert r.status_code == 400

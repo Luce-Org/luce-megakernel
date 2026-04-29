@@ -11,7 +11,9 @@ Drop-in for Open WebUI / LM Studio / Cline by setting
   OPENAI_API_BASE=http://localhost:1236/v1  OPENAI_API_KEY=sk-any
 
 Supports OpenAI /v1/chat/completions with tools and Anthropic /v1/messages.
-Model stays resident in daemon mode (default); context default is 128K.
+Model stays resident in daemon mode (default). The default `agent-code-text`
+profile is text-only with 48K context, a 42K prompt admission limit, and
+prefix caching disabled.
 """
 import argparse
 import json
@@ -22,6 +24,7 @@ import sys
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -43,6 +46,140 @@ DEFAULT_MODELS_DIR = ROOT / "models"
 DEFAULT_DRAFT_ROOT = ROOT / "models" / "draft"
 DEFAULT_BIN = ROOT / "build" / ("test_dflash" + (".exe" if sys.platform == "win32" else ""))
 DEFAULT_BUDGET = 22
+
+
+@dataclass(frozen=True)
+class ServerProfile:
+    name: str
+    max_ctx: int
+    max_prompt_tokens: int
+    reserved_generation_tokens: int
+    prefill_ubatch: int
+    layer_prefill: bool
+    fa_window: int
+    single_request_per_gpu: bool
+    vision: bool
+    prefix_cache: bool = False
+
+
+AGENT_CODE_TEXT_PROFILE = ServerProfile(
+    name="agent-code-text",
+    max_ctx=48_000,
+    max_prompt_tokens=42_000,
+    reserved_generation_tokens=4_096,
+    prefill_ubatch=384,
+    layer_prefill=False,
+    fa_window=0,
+    single_request_per_gpu=True,
+    vision=False,
+    prefix_cache=False,
+)
+
+
+def resolve_server_profile(
+    profile_name: str,
+    *,
+    max_ctx: int | None = None,
+    max_prompt_tokens: int | None = None,
+    reserved_generation_tokens: int | None = None,
+    prefill_ubatch: int | None = None,
+    fa_window: int | None = None,
+) -> ServerProfile:
+    if profile_name != AGENT_CODE_TEXT_PROFILE.name:
+        raise ValueError(f"unknown server profile: {profile_name}")
+
+    profile = AGENT_CODE_TEXT_PROFILE
+    overrides = {}
+    if max_ctx is not None:
+        overrides["max_ctx"] = max_ctx
+    if max_prompt_tokens is not None:
+        overrides["max_prompt_tokens"] = max_prompt_tokens
+    if reserved_generation_tokens is not None:
+        overrides["reserved_generation_tokens"] = reserved_generation_tokens
+    if prefill_ubatch is not None:
+        overrides["prefill_ubatch"] = prefill_ubatch
+    if fa_window is not None:
+        overrides["fa_window"] = fa_window
+    return replace(profile, **overrides)
+
+
+@dataclass(frozen=True)
+class AdmissionDecision:
+    allowed: bool
+    generation_tokens: int
+    reason: str = ""
+
+
+def admission_for_prompt(prompt_tokens: int, requested_max_tokens: int, profile: ServerProfile) -> AdmissionDecision:
+    if requested_max_tokens <= 0:
+        return AdmissionDecision(
+            allowed=False,
+            generation_tokens=0,
+            reason=f"max_tokens must be positive, got {requested_max_tokens}",
+        )
+    if prompt_tokens > profile.max_prompt_tokens:
+        return AdmissionDecision(
+            allowed=False,
+            generation_tokens=0,
+            reason=(
+                f"prompt_tokens={prompt_tokens} exceeds max_prompt_tokens="
+                f"{profile.max_prompt_tokens} for profile {profile.name}"
+            ),
+        )
+
+    available = profile.max_ctx - prompt_tokens - 20
+    if available < profile.reserved_generation_tokens:
+        return AdmissionDecision(
+            allowed=False,
+            generation_tokens=0,
+            reason=(
+                f"prompt_tokens={prompt_tokens} leaves {available} generation tokens, "
+                f"below reserved_generation_tokens={profile.reserved_generation_tokens} "
+                f"for profile {profile.name}"
+            ),
+        )
+    return AdmissionDecision(allowed=True, generation_tokens=min(requested_max_tokens, available))
+
+
+def configure_server_environment(
+    profile: ServerProfile,
+    *,
+    kv_f16: bool,
+    cache_type_k: str | None = None,
+    cache_type_v: str | None = None,
+) -> None:
+    os.environ["DFLASH27B_PREFILL_UBATCH"] = str(profile.prefill_ubatch)
+    os.environ["DFLASH27B_LAYER_PREFILL"] = "1" if profile.layer_prefill else "0"
+    os.environ["DFLASH27B_FA_WINDOW"] = str(profile.fa_window)
+
+    if cache_type_k or cache_type_v:
+        for legacy_name in ("DFLASH27B_KV_TQ3", "DFLASH27B_KV_TBQ", "DFLASH27B_KV_Q4", "DFLASH27B_KV_F16"):
+            os.environ.pop(legacy_name, None)
+    if cache_type_k:
+        os.environ["DFLASH27B_KV_K"] = cache_type_k
+    if cache_type_v:
+        os.environ["DFLASH27B_KV_V"] = cache_type_v
+    if profile.max_ctx > 6144 and not kv_f16 and not (cache_type_k or cache_type_v):
+        os.environ.setdefault("DFLASH27B_KV_TQ3", "1")
+
+
+def request_contains_vision_payload(req) -> bool:
+    data = req.model_dump() if hasattr(req, "model_dump") else req
+    blocks = []
+    if isinstance(data, dict):
+        blocks.extend(data.get("messages") or [])
+        system = data.get("system")
+        if isinstance(system, list):
+            blocks.append({"content": system})
+    for msg in blocks:
+        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    return True
+                if part.get("type") != "text":
+                    return True
+    return False
 
 
 def autodetect_target(models_dir: Path) -> Path | None:
@@ -101,9 +238,20 @@ def _tokenizer_id_from_gguf(gguf_path: Path) -> str:
 
 
 def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
-              max_ctx: int, tokenizer: AutoTokenizer, stop_ids: set[int],
-              model_name: str = "") -> FastAPI:
+              max_ctx: int | None = None, tokenizer: AutoTokenizer | None = None,
+              stop_ids: set[int] | None = None, model_name: str = "",
+              profile: ServerProfile | None = None) -> FastAPI:
     import asyncio
+    if profile is None:
+        if max_ctx is None:
+            profile = AGENT_CODE_TEXT_PROFILE
+        else:
+            profile = replace(AGENT_CODE_TEXT_PROFILE, name="legacy", max_ctx=max_ctx, max_prompt_tokens=max_ctx)
+    max_ctx = profile.max_ctx
+    if tokenizer is None:
+        raise ValueError("tokenizer is required")
+    if stop_ids is None:
+        stop_ids = set()
     app = FastAPI(title="Luce DFlash OpenAI server")
     daemon_lock = asyncio.Lock()
 
@@ -244,17 +392,22 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
                            "message": "tool_choice must be 'auto', 'none', 'required', "
                                       "or {type:'function',function:{name:str}}"}},
                 status_code=400)
+        if not profile.vision and request_contains_vision_payload(req):
+            return JSONResponse(
+                {"error": {"code": "unsupported_content",
+                           "message": f"profile {profile.name} is text-only and does not accept image content"}},
+                status_code=400)
 
         prompt_bin, started_in_thinking = _tokenize_prompt(req)
         prompt_len = prompt_bin.stat().st_size // 4
-        available_gen = max_ctx - prompt_len - 20
-        gen_len = min(req.max_tokens, available_gen)
-        if gen_len <= 0:
+        decision = admission_for_prompt(prompt_len, req.max_tokens, profile)
+        if not decision.allowed:
             try: prompt_bin.unlink()
             except Exception: pass
             return JSONResponse(
-                {"detail": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"},
+                {"error": {"code": "context_limit", "message": decision.reason}},
                 status_code=400)
+        gen_len = decision.generation_tokens
 
         completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
@@ -469,16 +622,21 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
 
     @app.post("/v1/messages")
     async def anthropic_messages(req: AnthropicMessagesRequest):
+        if not profile.vision and request_contains_vision_payload(req):
+            return JSONResponse(
+                {"type": "error", "error": {"type": "invalid_request_error",
+                 "message": f"profile {profile.name} is text-only and does not accept image content"}},
+                status_code=400)
         prompt_bin, prompt_len = _tokenize_anthropic(req)
-        available_gen = max_ctx - prompt_len - 20
-        gen_len = min(req.max_tokens, available_gen)
-        if gen_len <= 0:
+        decision = admission_for_prompt(prompt_len, req.max_tokens, profile)
+        if not decision.allowed:
             try: prompt_bin.unlink()
             except Exception: pass
             return JSONResponse(
                 {"type": "error", "error": {"type": "invalid_request_error",
-                 "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}},
+                 "message": decision.reason}},
                 status_code=400)
+        gen_len = decision.generation_tokens
 
         msg_id = "msg_" + uuid.uuid4().hex[:24]
 
@@ -529,13 +687,23 @@ def main():
     ap.add_argument("--draft",  type=Path, default=DEFAULT_DRAFT_ROOT)
     ap.add_argument("--bin",    type=Path, default=DEFAULT_BIN)
     ap.add_argument("--budget", type=int,  default=DEFAULT_BUDGET)
-    ap.add_argument("--max-ctx", type=int, default=16384,
-                    help="Maximum context length (default: 16384). "
-                         "Larger values trigger the FA-stride / VRAM-cliff "
-                         "trap on 24 GB cards — see issue #10. Bump only "
-                         "if your real per-request context exceeds 16K.")
+    ap.add_argument("--profile", default=AGENT_CODE_TEXT_PROFILE.name,
+                    choices=[AGENT_CODE_TEXT_PROFILE.name],
+                    help="Serving profile (default: agent-code-text, 48K text-only coding-agent profile)")
+    ap.add_argument("--max-ctx", type=int, default=None,
+                    help="Maximum context length (default: profile value)")
+    ap.add_argument("--max-prompt-tokens", type=int, default=None,
+                    help="Safe prompt admission limit (default: profile value)")
+    ap.add_argument("--reserved-generation-tokens", type=int, default=None,
+                    help="Reserved generation/headroom budget for profile accounting")
+    ap.add_argument("--prefill-ubatch", type=int, default=None,
+                    help="Set DFLASH27B_PREFILL_UBATCH (default: profile value)")
+    ap.add_argument("--cache-type-k", "-ctk", default=None,
+                    help="Passthrough KV key cache type to test_dflash, e.g. q4_0 or q8_0")
+    ap.add_argument("--cache-type-v", "-ctv", default=None,
+                    help="Passthrough KV value cache type to test_dflash, e.g. q4_0 or q8_0")
     ap.add_argument("--kv-f16", action="store_true",
-                    help="Force F16 KV cache (default: TQ3_0 when --max-ctx > 6144)")
+                    help="Force F16 KV cache (legacy; default still uses TQ3_0 when --max-ctx > 6144)")
     ap.add_argument("--fa-window", type=int, default=None,
                     help="Sliding window for FA layers; 0 = full attention")
     ap.add_argument("--tokenizer", type=str, default=None,
@@ -544,10 +712,24 @@ def main():
                     help="(accepted, ignored — daemon is always on)")
     args = ap.parse_args()
 
-    if args.max_ctx > 6144 and not args.kv_f16:
-        os.environ.setdefault("DFLASH27B_KV_TQ3", "1")
-    if args.fa_window is not None:
-        os.environ["DFLASH27B_FA_WINDOW"] = str(args.fa_window)
+    try:
+        profile = resolve_server_profile(
+            args.profile,
+            max_ctx=args.max_ctx,
+            max_prompt_tokens=args.max_prompt_tokens,
+            reserved_generation_tokens=args.reserved_generation_tokens,
+            prefill_ubatch=args.prefill_ubatch,
+            fa_window=args.fa_window,
+        )
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
+
+    configure_server_environment(
+        profile,
+        kv_f16=args.kv_f16,
+        cache_type_k=args.cache_type_k,
+        cache_type_v=args.cache_type_v,
+    )
 
     if not args.bin.is_file():
         raise SystemExit(f"binary not found at {args.bin}")
@@ -570,16 +752,27 @@ def main():
         if ids: stop_ids.add(ids[0])
 
     model_name = args.target.stem
-    app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
-                    tokenizer, stop_ids, model_name=model_name)
+    app = build_app(args.target, draft, args.bin, args.budget,
+                    tokenizer=tokenizer, stop_ids=stop_ids, model_name=model_name,
+                    profile=profile)
 
     import uvicorn
     print(f"Luce DFlash OpenAI server on http://{args.host}:{args.port}")
-    print(f"  target    = {args.target}")
-    print(f"  draft     = {draft}")
-    print(f"  bin       = {args.bin}")
-    print(f"  budget    = {args.budget}")
-    print(f"  max_ctx   = {args.max_ctx}")
-    print(f"  tokenizer = {tokenizer_id}")
-    print(f"  model     = {model_name}")
+    print(f"  target            = {args.target}")
+    print(f"  draft             = {draft}")
+    print(f"  bin               = {args.bin}")
+    print(f"  budget            = {args.budget}")
+    print(f"  profile           = {profile.name}")
+    print(f"  vision            = {str(profile.vision).lower()}")
+    print(f"  max_ctx           = {profile.max_ctx}")
+    print(f"  max_prompt_tokens = {profile.max_prompt_tokens}")
+    print(f"  reserved_gen      = {profile.reserved_generation_tokens}")
+    print(f"  prefill_ubatch    = {profile.prefill_ubatch}")
+    print(f"  layer_prefill     = {str(profile.layer_prefill).lower()}")
+    print(f"  fa_window         = {profile.fa_window}")
+    print(f"  cache_type_k      = {args.cache_type_k or 'default'}")
+    print(f"  cache_type_v      = {args.cache_type_v or 'default'}")
+    print(f"  prefix_cache      = {str(profile.prefix_cache).lower()}")
+    print(f"  tokenizer         = {tokenizer_id}")
+    print(f"  model             = {model_name}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
