@@ -184,7 +184,11 @@ def _stream_prompt(url: str, model: str, system: str, user: str,
                         t_first = time.perf_counter()
 
     except urllib.error.URLError as e:
-        return ProbResult(name="", ttft_ms=0, decode_tok_s=0, n_tok=0, error=str(e))
+        return ProbResult(name="", ttft_ms=0, decode_tok_s=0, overall_tok_s=0,
+                          n_tok=0, error=str(e))
+    except Exception as e:  # HTTPError, ConnectionResetError, etc. mid-stream
+        return ProbResult(name="", ttft_ms=0, decode_tok_s=0, overall_tok_s=0,
+                          n_tok=0, error=str(e))
 
     t_end = time.perf_counter()
 
