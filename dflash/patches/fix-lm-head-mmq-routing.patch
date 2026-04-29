@@ -1,0 +1,136 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 93bf76c51..9136d610b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2306,6 +2306,82 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+ }
+ 
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    // dflash27b drift-firewall (overnight 2026-04-28):
++    // GGML_CUDA_FIXED_BATCH=N           pad src1->ne[1] up to N (single safe shape).
++    // GGML_CUDA_SAFE_SHAPES=N1,N2,..    sorted-asc list, round up to nearest >= orig_n.
++    // Both env vars together: SAFE_SHAPES checked first; if no shape >= orig_n,
++    //   fall through to FIXED_BATCH (acts as the cap).
++    // Prevents shape-dependent kernel/algorithm pick from drifting col-0 logits.
++    static const int dflash_fixed_batch = []{
++        const char * e = std::getenv("GGML_CUDA_FIXED_BATCH");
++        return e ? std::atoi(e) : 0;
++    }();
++    static const std::vector<int> dflash_safe_shapes = []{
++        std::vector<int> v;
++        const char * e = std::getenv("GGML_CUDA_SAFE_SHAPES");
++        if (!e || !*e) return v;
++        const char * p = e;
++        while (*p) {
++            int n = std::atoi(p);
++            if (n > 0) v.push_back(n);
++            while (*p && *p != ',') ++p;
++            if (*p == ',') ++p;
++        }
++        std::sort(v.begin(), v.end());
++        v.erase(std::unique(v.begin(), v.end()), v.end());
++        return v;
++    }();
++
++    if ((!dflash_safe_shapes.empty() || dflash_fixed_batch > 0)
++        && src1->ne[1] > 0 && src1->ne[2] == 1 && src1->ne[3] == 1
++        && dst->ne[1]  == src1->ne[1]
++        && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
++        && !ggml_backend_buft_is_cuda_split(src0->buffer->buft)) {
++        const int orig_n = (int)src1->ne[1];
++        int target_n = 0;
++        for (int s : dflash_safe_shapes) {
++            if (s >= orig_n) { target_n = s; break; }
++        }
++        if (target_n == 0 && dflash_fixed_batch >= orig_n) {
++            target_n = dflash_fixed_batch;
++        }
++        if (target_n > orig_n) {
++            const int    pad_n  = target_n;
++            const int64_t K     = src1->ne[0];
++            const int64_t M     = dst->ne[0];
++            const size_t s1_elt = ggml_type_size(src1->type);
++            const size_t d_elt  = ggml_type_size(dst->type);
++            cudaStream_t stream = ctx.stream();
++
++            ggml_cuda_pool_alloc<char> pad_s1(ctx.pool(), (size_t)K * pad_n * s1_elt);
++            ggml_cuda_pool_alloc<char> pad_d (ctx.pool(), (size_t)M * pad_n * d_elt);
++            CUDA_CHECK(cudaMemcpyAsync(pad_s1.get(), src1->data,
++                (size_t)K * orig_n * s1_elt, cudaMemcpyDeviceToDevice, stream));
++            CUDA_CHECK(cudaMemsetAsync(pad_s1.get() + (size_t)K * orig_n * s1_elt, 0,
++                (size_t)K * (pad_n - orig_n) * s1_elt, stream));
++
++            ggml_tensor s1_pad = *src1;
++            s1_pad.ne[1] = pad_n;
++            s1_pad.nb[2] = (size_t)s1_pad.nb[1] * pad_n;
++            s1_pad.nb[3] = s1_pad.nb[2];
++            s1_pad.data  = pad_s1.get();
++
++            ggml_tensor d_pad = *dst;
++            d_pad.ne[1] = pad_n;
++            d_pad.nb[2] = (size_t)d_pad.nb[1] * pad_n;
++            d_pad.nb[3] = d_pad.nb[2];
++            d_pad.data  = pad_d.get();
++            if (d_pad.src[1] == src1) d_pad.src[1] = &s1_pad;
++
++            // Recurse with padded shapes. Inner call's orig_n == pad_n (no further pad).
++            ggml_cuda_mul_mat(ctx, src0, &s1_pad, &d_pad);
++
++            CUDA_CHECK(cudaMemcpyAsync(dst->data, pad_d.get(),
++                (size_t)M * orig_n * d_elt, cudaMemcpyDeviceToDevice, stream));
++            return;
++        }
++    }
++
+     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+ 
+     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
+@@ -2324,6 +2400,48 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
+         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+ 
++    // dflash27b root-cause fix (2026-04-28):
++    // Route LM head GEMM (dst named "logits") to cuBLAS-via-dequant path.
++    // MMQ's mul_mat_q_case picks per-N tile size mmq_x ∈ {8,16,...,128} based on
++    // ncols_max — different mmq_x template instantiations have different reduction
++    // tree shapes, producing bit-level differences at column 0 across N. That's
++    // the exact mechanism behind the budget=36/56/64 LOOP pathology.
++    // Bypass MMQ for the LM head; cuBLAS GEMM (one cublasGemmEx with TENSOR_OP)
++    // is much more shape-stable for fixed (M,K).
++    // Disable via DFLASH27B_LM_HEAD_FIX=0; set DFLASH27B_LM_HEAD_FIX_NAMES="name1,name2"
++    // to extend to additional named tensors.
++    static const bool dflash_lm_head_fix = []{
++        const char * e = std::getenv("DFLASH27B_LM_HEAD_FIX");
++        return !e || std::atoi(e) != 0;  // default ON
++    }();
++    static const std::vector<std::string> dflash_lm_head_extra_names = []{
++        std::vector<std::string> v;
++        const char * e = std::getenv("DFLASH27B_LM_HEAD_FIX_NAMES");
++        if (!e || !*e) return v;
++        std::string s(e);
++        size_t p = 0;
++        while (p < s.size()) {
++            size_t c = s.find(',', p);
++            if (c == std::string::npos) c = s.size();
++            v.push_back(s.substr(p, c - p));
++            p = c + 1;
++        }
++        return v;
++    }();
++    if (dflash_lm_head_fix && dst->name[0]) {
++        const std::string dst_name = dst->name;
++        bool is_lm_head = (dst_name == "logits");
++        if (!is_lm_head) {
++            for (const auto & n : dflash_lm_head_extra_names) {
++                if (dst_name == n) { is_lm_head = true; break; }
++            }
++        }
++        if (is_lm_head) {
++            use_mul_mat_q     = false;
++            use_mul_mat_vec_q = false;
++        }
++    }
++
+     bool any_gpus_with_slow_fp16 = false;
+ 
+     if (split) {
