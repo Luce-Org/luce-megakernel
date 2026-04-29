@@ -834,6 +834,10 @@ int main(int argc, char ** argv) {
     int   ddtree_budget = 64;
     float ddtree_temp   = 1.0f;   // softmax temperature for top-K extract
     bool  ddtree_chain_seed = true;  // pre-seed full chain (vs paper's pure best-first)
+    // acceptwin: rolling p95(accept_depth) + margin as dynamic budget
+    bool  ddtree_acceptwin_active = false;
+    int   ddtree_acceptwin_size   = 32;    // rolling window length
+    int   ddtree_acceptwin_margin = 4;     // budget = p95(window) + margin
     bool  profile_scaling = false;  // microbench: time target forward at varying N
     bool  test_window_mode = false;
     int   stream_fd     = -1;     // write each committed token to this fd (int32 LE) as they land
@@ -853,6 +857,18 @@ int main(int argc, char ** argv) {
         }
         else if (std::strcmp(argv[i], "--ddtree-no-chain-seed") == 0) {
             ddtree_chain_seed = false;
+        }
+        else if (std::strcmp(argv[i], "--ddtree-acceptwin") == 0) {
+            ddtree_acceptwin_active = true;
+        }
+        else if (std::strncmp(argv[i], "--ddtree-acceptwin-size=", 24) == 0) {
+            ddtree_acceptwin_size = std::atoi(argv[i] + 24);
+            if (ddtree_acceptwin_size <= 0) ddtree_acceptwin_size = 32;
+            ddtree_acceptwin_active = true;
+        }
+        else if (std::strncmp(argv[i], "--ddtree-acceptwin-margin=", 26) == 0) {
+            ddtree_acceptwin_margin = std::atoi(argv[i] + 26);
+            ddtree_acceptwin_active = true;
         }
         else if (std::strcmp(argv[i], "--test-window") == 0)      { test_window_mode = true; }
     else if (std::strcmp(argv[i], "--profile-scaling") == 0) {
@@ -1532,6 +1548,13 @@ int main(int argc, char ** argv) {
         return std::chrono::steady_clock::now();
     };
 
+    std::vector<int> acceptwin_buf;
+    if (ddtree_acceptwin_active) {
+        acceptwin_buf.reserve(ddtree_acceptwin_size + 1);
+        std::printf("[acceptwin] active: window=%d margin=%d\n",
+                    ddtree_acceptwin_size, ddtree_acceptwin_margin);
+    }
+
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
 
@@ -1692,6 +1715,14 @@ int main(int argc, char ** argv) {
         //      conv_state ← use the (depth-1)-th slot of cache.conv_input_cache
         if (ddtree_mode) {
             const int L = q_len - 1;
+            if (ddtree_acceptwin_active && (int)acceptwin_buf.size() >= 8) {
+                std::vector<int> sorted_win = acceptwin_buf;
+                std::sort(sorted_win.begin(), sorted_win.end());
+                const int p95_idx = (int)((sorted_win.size() - 1) * 0.95f);
+                const int p95     = sorted_win[p95_idx];
+                const int target  = p95 + ddtree_acceptwin_margin;
+                ddtree_budget     = std::max(8, std::min(target, 64));
+            }
             DDTree tree = build_ddtree(
                 ddtree_top_log_probs.data(),
                 ddtree_top_token_ids.data(),
@@ -1768,6 +1799,11 @@ int main(int argc, char ** argv) {
             int next_token = -1;
             std::vector<int> accepted = follow_verified_tree(tree, posterior.data(), next_token);
             const int accept_depth = (int)accepted.size();  // includes root
+            if (ddtree_acceptwin_active) {
+                acceptwin_buf.push_back(accept_depth);
+                if ((int)acceptwin_buf.size() > ddtree_acceptwin_size)
+                    acceptwin_buf.erase(acceptwin_buf.begin());
+            }
 
             // Detect when the walk takes a sibling branch (accepted node
             // whose DFS index is OUTSIDE the chain spine [0..L]).
