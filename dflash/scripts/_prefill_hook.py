@@ -161,3 +161,67 @@ def compress_text_via_daemon(
 
     # 6) decode compressed drafter ids back to text for re-tokenisation by target
     return drafter_tokenizer.decode(compressed_ids, skip_special_tokens=True)
+
+
+def compress_texts_batch_via_daemon(
+    *,
+    daemon_stdin,
+    r_pipe: int,
+    drafter_tokenizer,
+    cfg: PrefillConfig,
+    prompt_texts: list,
+) -> list:
+    """Compress N texts in one daemon dance (park-once, drafter-loads-once,
+    free-once). Each compress reuses the loaded drafter; only the final
+    `free drafter` + unpark fires after all texts are done.
+
+    Returns a list of compressed texts, one per input. Empty inputs map to
+    empty outputs without triggering a daemon round-trip.
+    """
+    if not prompt_texts:
+        return []
+
+    # 1) park target + draft so drafter has VRAM headroom on a 24 GB card
+    _send_and_ack(daemon_stdin, r_pipe, "park target\n")
+    _send_and_ack(daemon_stdin, r_pipe, "park draft\n")
+
+    keep_x1000 = int(round(cfg.keep_ratio * 1000))
+    out: list[str] = []
+    tmp_paths: list[str] = []
+    try:
+        for prompt_text in prompt_texts:
+            if not prompt_text:
+                out.append("")
+                continue
+
+            drafter_ids = drafter_tokenizer(
+                prompt_text, return_tensors=None,
+                add_special_tokens=False)["input_ids"]
+            if isinstance(drafter_ids[0], list):
+                drafter_ids = drafter_ids[0]
+
+            fd, path = tempfile.mkstemp(suffix=".bin")
+            tmp_paths.append(path)
+            with os.fdopen(fd, "wb") as f:
+                for t in drafter_ids:
+                    f.write(struct.pack("<i", int(t)))
+
+            # The first compress loads the drafter; subsequent calls reuse
+            # the loaded weights (the daemon only frees on `free drafter`).
+            daemon_stdin.write(
+                f"compress {path} {keep_x1000} {cfg.drafter_gguf}\n".encode("utf-8"))
+            daemon_stdin.flush()
+            compressed_ids = _drain_until_sentinel(r_pipe)
+            out.append(drafter_tokenizer.decode(
+                compressed_ids, skip_special_tokens=True))
+
+        # 2) free drafter once at the end, then restore target + draft.
+        _send_and_ack(daemon_stdin, r_pipe, "free drafter\n")
+        _send_and_ack(daemon_stdin, r_pipe, "unpark target\n")
+        _send_and_ack(daemon_stdin, r_pipe, "unpark draft\n")
+    finally:
+        for path in tmp_paths:
+            try: os.unlink(path)
+            except Exception: pass
+
+    return out
