@@ -6,7 +6,7 @@
 // without touching the daemon.
 //
 // Usage:
-//   smoke_qwen3_0p6b_forward <gguf_path> <seq_len_or_FILE:path> [keep_ratio]
+//   smoke_qwen3_0p6b_forward <gguf_path> <seq_len_or_FILE:path> [keep_ratio] [n_lookahead] [chunk_size] [pool_kernel]
 // Examples:
 //   smoke_qwen3_0p6b_forward .../Qwen3-0.6B-BF16.gguf 140000 0.02
 //   smoke_qwen3_0p6b_forward .../Qwen3-0.6B-BF16.gguf FILE:/tmp/niah_32k.bin 0.05
@@ -28,12 +28,17 @@ using namespace dflash27b;
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <gguf> <seq_len> [keep_ratio=0.02]\n", argv[0]);
+        std::fprintf(stderr,
+            "usage: %s <gguf> <seq_len_or_FILE:path> [keep_ratio=0.02] [n_lookahead=8] [chunk_size=32] [pool_kernel=13]\n",
+            argv[0]);
         return 2;
     }
     const std::string gguf = argv[1];
     const std::string arg2 = argv[2];
     const float keep_ratio = (argc >= 4) ? std::atof(argv[3]) : 0.02f;
+    const int n_lookahead = (argc >= 5) ? std::atoi(argv[4]) : 8;
+    const int chunk_size  = (argc >= 6) ? std::atoi(argv[5]) : 32;
+    const int pool_kernel = (argc >= 7) ? std::atoi(argv[6]) : 13;
 
     std::vector<int32_t> ids_from_file;
     int S = 0;
@@ -83,14 +88,14 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < S; ++i) ids[i] = dist(rng);
     }
 
-    std::printf("[smoke] running drafter_score_and_compress S=%d keep_ratio=%.3f...\n",
-        S, keep_ratio);
+    std::printf("[smoke] running drafter_score_and_compress S=%d keep_ratio=%.3f n_lookahead=%d chunk_size=%d pool_kernel=%d...\n",
+        S, keep_ratio, n_lookahead, chunk_size, pool_kernel);
     std::fflush(stdout);
 
     auto t0 = std::chrono::steady_clock::now();
     std::vector<int32_t> out = drafter_score_and_compress(
         ctx, ids, keep_ratio,
-        /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13);
+        chunk_size, n_lookahead, pool_kernel);
     auto t1 = std::chrono::steady_clock::now();
 
     if (out.empty()) {

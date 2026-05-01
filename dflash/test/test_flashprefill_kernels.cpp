@@ -17,6 +17,7 @@
 #include <vector>
 #include <random>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
 #include "../src/flashprefill.h"
@@ -31,13 +32,12 @@ void launch_compute_mean_vector_bf16(
 
 void launch_compute_block_score_bf16(
     const void * Q, const void * mean_K, float sm_scale,
-    void * score, void * score_max,
+    void * score,
     int batch, int n_q_heads, int n_k_heads,
     int seq_len, int head_dim, int block_size,
     int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
     int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
     int s_S_b, int s_S_m, int s_S_n, int s_S_h,
-    int s_M_b, int s_M_m, int s_M_n, int s_M_h,
     cudaStream_t stream);
 
 void launch_sparse_flash_forward_bf16(
@@ -63,8 +63,15 @@ void launch_sparse_flash_forward_bf16(
     } \
 } while (0)
 
-static __nv_bfloat16 f2b(float x) { return __float2bfloat16(x); }
-static float b2f(__nv_bfloat16 x) { return __bfloat162float(x); }
+#if defined(DFLASH27B_MIN_SM) && DFLASH27B_MIN_SM < 80
+using fp_elem = __half;
+static fp_elem f2b(float x) { return __float2half(x); }
+static float b2f(fp_elem x) { return __half2float(x); }
+#else
+using fp_elem = __nv_bfloat16;
+static fp_elem f2b(float x) { return __float2bfloat16(x); }
+static float b2f(fp_elem x) { return __bfloat162float(x); }
+#endif
 
 int main() {
     constexpr int B = 1;
@@ -79,27 +86,26 @@ int main() {
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
 
-    std::vector<__nv_bfloat16> Q(B * S * H * D), K(B * S * Hk * D), V(B * S * Hk * D);
+    std::vector<fp_elem> Q(B * S * H * D), K(B * S * Hk * D), V(B * S * Hk * D);
     for (auto & x : Q) x = f2b(dist(rng));
     for (auto & x : K) x = f2b(dist(rng));
     for (auto & x : V) x = f2b(dist(rng));
 
-    __nv_bfloat16 *dQ, *dK, *dV, *dO, *dmK;
-    float *dS, *dM;
+    fp_elem *dQ, *dK, *dV, *dO, *dmK;
+    float *dS;
     int32_t *dIdx, *dCnt;
-    CK(cudaMalloc(&dQ, Q.size() * sizeof(__nv_bfloat16)));
-    CK(cudaMalloc(&dK, K.size() * sizeof(__nv_bfloat16)));
-    CK(cudaMalloc(&dV, V.size() * sizeof(__nv_bfloat16)));
-    CK(cudaMalloc(&dO, B * S * H * D * sizeof(__nv_bfloat16)));
-    CK(cudaMalloc(&dmK, B * M * Hk * D * sizeof(__nv_bfloat16)));
+    CK(cudaMalloc(&dQ, Q.size() * sizeof(fp_elem)));
+    CK(cudaMalloc(&dK, K.size() * sizeof(fp_elem)));
+    CK(cudaMalloc(&dV, V.size() * sizeof(fp_elem)));
+    CK(cudaMalloc(&dO, B * S * H * D * sizeof(fp_elem)));
+    CK(cudaMalloc(&dmK, B * M * Hk * D * sizeof(fp_elem)));
     CK(cudaMalloc(&dS, B * M * M * H * sizeof(float)));
-    CK(cudaMalloc(&dM, B * M * M * H * sizeof(float)));
     CK(cudaMalloc(&dIdx, B * M * M * H * sizeof(int32_t)));
     CK(cudaMalloc(&dCnt, B * M * H * sizeof(int32_t)));
 
-    CK(cudaMemcpy(dQ, Q.data(), Q.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dK, K.data(), K.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dV, V.data(), V.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dQ, Q.data(), Q.size() * sizeof(fp_elem), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dK, K.data(), K.size() * sizeof(fp_elem), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dV, V.data(), V.size() * sizeof(fp_elem), cudaMemcpyHostToDevice));
 
     // Strides (elements). Layout: [B, S, H, D] row-major, D fastest.
     int s_Q_b = S * H * D, s_Q_n = H * D, s_Q_h = D, s_Q_d = 1;
@@ -117,8 +123,8 @@ int main() {
     CK(cudaDeviceSynchronize());
 
     // Verify host vs GPU mean for one block.
-    std::vector<__nv_bfloat16> mK_h(B * M * Hk * D);
-    CK(cudaMemcpy(mK_h.data(), dmK, mK_h.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    std::vector<fp_elem> mK_h(B * M * Hk * D);
+    CK(cudaMemcpy(mK_h.data(), dmK, mK_h.size() * sizeof(fp_elem), cudaMemcpyDeviceToHost));
     float max_diff_mean = 0.0f;
     for (int n = 0; n < M; ++n) {
         for (int h = 0; h < Hk; ++h) {
@@ -137,15 +143,17 @@ int main() {
     }
     std::printf("[fp-test] kernel 1 (compute_mean_vector): max diff = %.5f %s\n",
                 max_diff_mean, max_diff_mean < 1e-2f ? "PASS" : "FAIL");
+    if (max_diff_mean >= 1e-2f) {
+        return 1;
+    }
 
     // ── Kernel 2: compute_block_score ──
     float scale = 1.0f / std::sqrt((float)D);
     launch_compute_block_score_bf16(
-        dQ, dmK, scale, dS, dM,
+        dQ, dmK, scale, dS,
         B, H, Hk, S, D, BLOCK,
         s_Q_b, s_Q_n, s_Q_h, s_Q_d,
         s_mK_b, s_mK_m, s_mK_h, s_mK_d,
-        s_S_b, s_S_m, s_S_n, s_S_h,
         s_S_b, s_S_m, s_S_n, s_S_h, 0);
     CK(cudaDeviceSynchronize());
     std::printf("[fp-test] kernel 2 (compute_block_score): launch ok\n");
@@ -176,12 +184,15 @@ int main() {
     cudaError_t le = cudaDeviceSynchronize();
     std::printf("[fp-test] kernel 4 (sparse_flash_forward): launch %s\n",
                 le == cudaSuccess ? "ok" : cudaGetErrorString(le));
+    if (le != cudaSuccess) {
+        return 1;
+    }
 
     // Numerical check kernel 4: compare GPU sparse output to CPU dense
     // attention reference (full mask, fully causal). Should match within bf16
     // numerical tolerance.
-    std::vector<__nv_bfloat16> O_h(B * S * H * D);
-    CK(cudaMemcpy(O_h.data(), dO, O_h.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    std::vector<fp_elem> O_h(B * S * H * D);
+    CK(cudaMemcpy(O_h.data(), dO, O_h.size() * sizeof(fp_elem), cudaMemcpyDeviceToHost));
 
     float max_diff_attn = 0.0f;
     for (int q = 0; q < S; ++q) {
@@ -212,16 +223,31 @@ int main() {
                     ref += p[j] * b2f(V[j * Hk * D + hk * D + d]);
                 }
                 float gpu = b2f(O_h[q * H * D + h * D + d]);
+                if (!std::isfinite(ref) || !std::isfinite(gpu)) {
+                    std::fprintf(stderr,
+                                 "[fp-test] non-finite attention output at q=%d h=%d d=%d: ref=%g gpu=%g\n",
+                                 q, h, d, ref, gpu);
+                    return 1;
+                }
                 float diff = std::fabs(ref - gpu);
+                if (!std::isfinite(diff)) {
+                    std::fprintf(stderr,
+                                 "[fp-test] non-finite attention diff at q=%d h=%d d=%d: ref=%g gpu=%g\n",
+                                 q, h, d, ref, gpu);
+                    return 1;
+                }
                 if (diff > max_diff_attn) max_diff_attn = diff;
             }
         }
     }
     std::printf("[fp-test] kernel 4 (sparse_flash_forward) numerics: max diff = %.5f %s\n",
                 max_diff_attn, max_diff_attn < 5e-2f ? "PASS" : "FAIL");
+    if (max_diff_attn >= 5e-2f) {
+        return 1;
+    }
 
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
-    cudaFree(dmK); cudaFree(dS); cudaFree(dM); cudaFree(dIdx); cudaFree(dCnt);
+    cudaFree(dmK); cudaFree(dS); cudaFree(dIdx); cudaFree(dCnt);
 
     // ── End-to-end FlashPrefill at 8K context ──
     // Tests the full pipeline (kernels 1-4 + block_select) wrapped via
@@ -231,22 +257,22 @@ int main() {
         constexpr int BB = 1, BS = 8192, BH = 16, BHk = 8, BD = 128;
         constexpr int BL = 128;
 
-        std::vector<__nv_bfloat16> bQ(BB * BS * BH * BD);
-        std::vector<__nv_bfloat16> bK(BB * BS * BHk * BD);
-        std::vector<__nv_bfloat16> bV(BB * BS * BHk * BD);
+        std::vector<fp_elem> bQ(BB * BS * BH * BD);
+        std::vector<fp_elem> bK(BB * BS * BHk * BD);
+        std::vector<fp_elem> bV(BB * BS * BHk * BD);
         for (auto & x : bQ) x = f2b(dist(rng));
         for (auto & x : bK) x = f2b(dist(rng));
         for (auto & x : bV) x = f2b(dist(rng));
 
-        __nv_bfloat16 *bdQ, *bdK, *bdV, *bdO;
-        CK(cudaMalloc(&bdQ, bQ.size() * sizeof(__nv_bfloat16)));
-        CK(cudaMalloc(&bdK, bK.size() * sizeof(__nv_bfloat16)));
-        CK(cudaMalloc(&bdV, bV.size() * sizeof(__nv_bfloat16)));
-        CK(cudaMalloc(&bdO, bQ.size() * sizeof(__nv_bfloat16)));
+        fp_elem *bdQ, *bdK, *bdV, *bdO;
+        CK(cudaMalloc(&bdQ, bQ.size() * sizeof(fp_elem)));
+        CK(cudaMalloc(&bdK, bK.size() * sizeof(fp_elem)));
+        CK(cudaMalloc(&bdV, bV.size() * sizeof(fp_elem)));
+        CK(cudaMalloc(&bdO, bQ.size() * sizeof(fp_elem)));
 
-        CK(cudaMemcpy(bdQ, bQ.data(), bQ.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(bdK, bK.data(), bK.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(bdV, bV.data(), bV.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(bdQ, bQ.data(), bQ.size() * sizeof(fp_elem), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(bdK, bK.data(), bK.size() * sizeof(fp_elem), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(bdV, bV.data(), bV.size() * sizeof(fp_elem), cudaMemcpyHostToDevice));
 
         dflash27b::flashprefill::FlashPrefillConfig cfg;
         cfg.block_size = BL;

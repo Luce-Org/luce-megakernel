@@ -26,11 +26,14 @@
 #include "internal.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
+#include <cuda_runtime.h>
 
 namespace dflash27b {
 
@@ -46,9 +49,62 @@ bool copy_tensor_from_file(gguf_context * gctx, const char * name,
     }
     const size_t off = gguf_get_tensor_offset(gctx, idx);
     const size_t bytes = ggml_nbytes(dst);
+    const ggml_type src_type = gguf_get_tensor_type(gctx, idx);
     const uint8_t * src = (const uint8_t *)mmap_base + data_offset + off;
-    ggml_backend_tensor_set(dst, src, 0, bytes);
-    return true;
+
+    if (src_type == dst->type) {
+        ggml_backend_tensor_set(dst, src, 0, bytes);
+        return true;
+    }
+
+    if (src_type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F16) {
+        const size_t n = ggml_nelements(dst);
+        if (bytes != n * sizeof(uint16_t)) {
+            std::fprintf(stderr, "[qwen3-0.6b] BF16->F16 size mismatch: %s\n", name);
+            return false;
+        }
+        std::vector<uint16_t> tmp(n);
+        const uint16_t * s = (const uint16_t *)src;
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t bits = ((uint32_t)s[i]) << 16;
+            float f;
+            std::memcpy(&f, &bits, 4);
+            uint32_t u;
+            std::memcpy(&u, &f, 4);
+            uint32_t sign = (u >> 16) & 0x8000;
+            int32_t  exp  = ((u >> 23) & 0xFF) - 127 + 15;
+            uint32_t mant = (u >> 13) & 0x03FF;
+            if (exp <= 0)       tmp[i] = (uint16_t)sign;
+            else if (exp >= 31) tmp[i] = (uint16_t)(sign | 0x7C00);
+            else                tmp[i] = (uint16_t)(sign | (exp << 10) | mant);
+        }
+        ggml_backend_tensor_set(dst, tmp.data(), 0, bytes);
+        return true;
+    }
+
+    std::fprintf(stderr, "[qwen3-0.6b] unsupported tensor dtype for %s: %s -> %s\n",
+                 name, ggml_type_name(src_type), ggml_type_name(dst->type));
+    return false;
+}
+
+bool cuda_has_native_bf16() {
+    const char * env = std::getenv("DFLASH27B_DRAFT_FP16");
+    if (env && std::atoi(env) != 0) return false;
+    int device = 0;
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "[qwen3-0.6b] cudaGetDevice failed: %s; using FP16 draft weights\n",
+                     cudaGetErrorString(err));
+        return false;
+    }
+    cudaDeviceProp prop{};
+    err = cudaGetDeviceProperties(&prop, device);
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "[qwen3-0.6b] cudaGetDeviceProperties failed: %s; using FP16 draft weights\n",
+                     cudaGetErrorString(err));
+        return false;
+    }
+    return prop.major >= 8;
 }
 
 uint32_t get_u32(gguf_context * g, const char * key, uint32_t def) {
@@ -86,6 +142,24 @@ bool load_qwen3_0p6b_drafter(const std::string & path,
     out.head_dim   = (int)get_u32(gctx, "qwen3.attention.key_length", 128);
     out.rope_theta = get_f32(gctx, "qwen3.rope.freq_base", 1000000.0f);
 
+    const int tok_idx = gguf_find_tensor(gctx, "token_embd.weight");
+    if (tok_idx < 0) {
+        set_last_error("Qwen3-0.6B GGUF missing token_embd.weight");
+        gguf_free(gctx);
+        return false;
+    }
+    const ggml_type src_weight_type = gguf_get_tensor_type(gctx, tok_idx);
+    if (src_weight_type == GGML_TYPE_F16) {
+        out.compute_type = GGML_TYPE_F16;
+    } else if (src_weight_type == GGML_TYPE_BF16) {
+        out.compute_type = cuda_has_native_bf16() ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    } else {
+        set_last_error(std::string("unsupported Qwen3-0.6B weight type: ") +
+                       ggml_type_name(src_weight_type));
+        gguf_free(gctx);
+        return false;
+    }
+
     // Compute total tensor metadata size for context allocation.
     const int n_layer = out.n_layer;
     const int n_tensors_per_layer = 11;
@@ -106,11 +180,12 @@ bool load_qwen3_0p6b_drafter(const std::string & path,
     const int n_vocab   = out.n_vocab;
     const int q_dim     = n_head * head_dim;
     const int kv_dim    = n_head_kv * head_dim;
+    const ggml_type WT  = out.compute_type;
 
     // Top-level tensors.
-    out.tok_embd = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, n_vocab);
+    out.tok_embd = ggml_new_tensor_2d(out.ctx, WT, n_embd, n_vocab);
     out.out_norm = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, n_embd);
-    out.output   = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, n_vocab);
+    out.output   = ggml_new_tensor_2d(out.ctx, WT, n_embd, n_vocab);
     ggml_set_name(out.tok_embd, "token_embd.weight");
     ggml_set_name(out.out_norm, "output_norm.weight");
     ggml_set_name(out.output,   "output.weight");
@@ -119,16 +194,16 @@ bool load_qwen3_0p6b_drafter(const std::string & path,
     for (int il = 0; il < n_layer; ++il) {
         auto & L = out.layers[il];
         L.attn_norm = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, n_embd);
-        L.wq        = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, q_dim);
-        L.wk        = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, kv_dim);
-        L.wv        = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, kv_dim);
-        L.wo        = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, q_dim, n_embd);
+        L.wq        = ggml_new_tensor_2d(out.ctx, WT, n_embd, q_dim);
+        L.wk        = ggml_new_tensor_2d(out.ctx, WT, n_embd, kv_dim);
+        L.wv        = ggml_new_tensor_2d(out.ctx, WT, n_embd, kv_dim);
+        L.wo        = ggml_new_tensor_2d(out.ctx, WT, q_dim, n_embd);
         L.q_norm    = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, head_dim);
         L.k_norm    = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, head_dim);
         L.ffn_norm  = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, n_embd);
-        L.ffn_gate  = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, n_ff);
-        L.ffn_up    = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, n_ff);
-        L.ffn_down  = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_ff, n_embd);
+        L.ffn_gate  = ggml_new_tensor_2d(out.ctx, WT, n_embd, n_ff);
+        L.ffn_up    = ggml_new_tensor_2d(out.ctx, WT, n_embd, n_ff);
+        L.ffn_down  = ggml_new_tensor_2d(out.ctx, WT, n_ff, n_embd);
     }
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);

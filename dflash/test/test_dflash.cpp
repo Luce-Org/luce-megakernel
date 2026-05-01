@@ -107,6 +107,11 @@ static int argmax_f32(const float * x, int n) {
     return best;
 }
 
+static bool env_flag_enabled(const char * name) {
+    const char * s = std::getenv(name);
+    return s && s[0] != '\0' && std::atoi(s) != 0;
+}
+
 // ggml_flash_attn_ext expects kv_len aligned to KQ_MASK_PAD (32) on the
 // f16/Q* paths, and to FATTN_KQ_STRIDE (256) on the TurboQuant FA paths.
 // The global `g_kq_stride_pad` below is set at init time and applied by
@@ -1316,14 +1321,42 @@ int main(int argc, char ** argv) {
                 // Park target + draft before allocating drafter context so
                 // the drafter's KV (~1.3 GB Q4_0) + scratch (~600 MB) have
                 // headroom on a 24 GB card. Restore after scoring.
-                bool restore_target = !target_parked;
-                bool restore_draft  = !draft_parked;
-                if (restore_target) {
+                //
+                // On SM75/22 GB, reloading the 27B target costs ~11 s. Allow
+                // an experimental target-resident path when the caller has
+                // already freed enough headroom (typically by parking draft).
+                bool keep_target_for_pflash = env_flag_enabled("DFLASH_PFLASH_KEEP_TARGET");
+                bool skip_draft_restore = env_flag_enabled("DFLASH_PFLASH_SKIP_DRAFT_RELOAD");
+                if (keep_target_for_pflash) {
+                    step_graph_destroy(sg);
+                    if (cache.rollback_buf || cache.rollback_ctx) {
+                        if (cache.rollback_buf) {
+                            ggml_backend_buffer_free(cache.rollback_buf);
+                            cache.rollback_buf = nullptr;
+                        }
+                        if (cache.rollback_ctx) {
+                            ggml_free(cache.rollback_ctx);
+                            cache.rollback_ctx = nullptr;
+                        }
+                        const size_t n_delta = cache.ssm_state.size();
+                        cache.ssm_state_snap.assign(n_delta, nullptr);
+                        cache.conv_state_snap.assign(n_delta, nullptr);
+                        cache.ssm_intermediate.assign(n_delta, nullptr);
+                        cache.conv_input_cache.assign(n_delta, nullptr);
+                        std::printf("[compress] rollback cache released for keep-target pflash\n");
+                        std::fflush(stdout);
+                    }
+                }
+                bool parked_target_for_compress = !target_parked && !keep_target_for_pflash;
+                bool parked_draft_for_compress  = !draft_parked;
+                bool restore_target = parked_target_for_compress;
+                bool restore_draft  = parked_draft_for_compress && !skip_draft_restore;
+                if (parked_target_for_compress) {
                     free_target_weights(w);
                     target_parked = true;
                     std::printf("[compress] target parked\n"); std::fflush(stdout);
                 }
-                if (restore_draft) {
+                if (parked_draft_for_compress) {
                     free_draft_weights(dw);
                     draft_parked = true;
                     std::printf("[compress] draft parked\n"); std::fflush(stdout);
@@ -1368,6 +1401,9 @@ int main(int argc, char ** argv) {
                     }
                     draft_parked = false;
                     std::printf("[compress] draft restored\n"); std::fflush(stdout);
+                } else if (parked_draft_for_compress && skip_draft_restore) {
+                    std::printf("[compress] draft left parked (DFLASH_PFLASH_SKIP_DRAFT_RELOAD=1)\n");
+                    std::fflush(stdout);
                 }
 
                 for (int32_t t : compressed) stream_emit(t);
@@ -1408,6 +1444,24 @@ int main(int argc, char ** argv) {
         std::vector<int32_t> out_all = prompt;
         int committed = 0;
         int32_t last_tok = -1;
+        const bool force_target_only_decode = env_flag_enabled("DFLASH_TARGET_ONLY_DECODE");
+        const bool target_only_when_draft_parked =
+            env_flag_enabled("DFLASH_TARGET_ONLY_WHEN_DRAFT_PARKED") ||
+            env_flag_enabled("DFLASH_PFLASH_TARGET_ONLY_WHEN_DRAFT_PARKED") ||
+            env_flag_enabled("DFLASH_PFLASH_SKIP_DRAFT_RELOAD");
+        const bool target_only_decode =
+            force_target_only_decode || (draft_parked && target_only_when_draft_parked);
+        if (target_parked) {
+            std::fprintf(stderr,
+                         "target is parked; unpark target before generate or keep target resident during PFlash\n");
+            if (daemon_mode) { stream_emit(-1); continue; } else return 1;
+        }
+        if (draft_parked && !target_only_decode) {
+            std::fprintf(stderr,
+                         "draft is parked; set DFLASH_PFLASH_SKIP_DRAFT_RELOAD=1 "
+                         "or unpark draft before DFlash decode\n");
+            if (daemon_mode) { stream_emit(-1); continue; } else return 1;
+        }
 
     // ── Prefill: two modes available ────────────────────────────────────
     // Layer-segmented: iterate layers (outer) × token chunks (inner).
@@ -1561,16 +1615,21 @@ int main(int argc, char ** argv) {
                     std::chrono::duration<double>(t_pf1 - t_pf0).count(),
                     last_tok);
 
-        // Promote prefill-only cache to full decode cache
-        auto t_mig0 = std::chrono::steady_clock::now();
-        step_graph_destroy(sg);
-        if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, backend, cache)) {
-            std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
-            return 1;
+        if (target_only_decode) {
+            step_graph_destroy(sg);
+            std::printf("[migrate] skipped for target-only decode\n");
+        } else {
+            // Promote prefill-only cache to full decode cache
+            auto t_mig0 = std::chrono::steady_clock::now();
+            step_graph_destroy(sg);
+            if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, backend, cache)) {
+                std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
+                return 1;
+            }
+            auto t_mig1 = std::chrono::steady_clock::now();
+            std::printf("[migrate] %.2f ms\n",
+                        std::chrono::duration<double, std::milli>(t_mig1 - t_mig0).count());
         }
-        auto t_mig1 = std::chrono::steady_clock::now();
-        std::printf("[migrate] %.2f ms\n",
-                    std::chrono::duration<double, std::milli>(t_mig1 - t_mig0).count());
     }
     // ── Token-segmented prefill (legacy) ────────────────────────────────
     if (!layer_prefill) {
@@ -1641,18 +1700,92 @@ int main(int argc, char ** argv) {
                 std::chrono::duration<double>(t_pf1 - t_pf0).count(),
                 last_tok);
 
-    // Promote prefill-only cache to full decode cache with rollback tensors.
-    // Copies KV, SSM/conv state, and target_feat device→device (~1 ms).
-    auto t_mig0 = std::chrono::steady_clock::now();
-    step_graph_destroy(sg);
-    if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, backend, cache)) {
-        std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
-        return 1;
+    if (target_only_decode) {
+        step_graph_destroy(sg);
+        std::printf("[migrate] skipped for target-only decode\n");
+    } else {
+        // Promote prefill-only cache to full decode cache with rollback tensors.
+        auto t_mig0 = std::chrono::steady_clock::now();
+        step_graph_destroy(sg);
+        if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, backend, cache)) {
+            std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
+            return 1;
+        }
+        auto t_mig1 = std::chrono::steady_clock::now();
+        std::printf("[migrate] %.2f ms\n",
+                    std::chrono::duration<double, std::milli>(t_mig1 - t_mig0).count());
     }
-    auto t_mig1 = std::chrono::steady_clock::now();
-    std::printf("[migrate] %.2f ms\n",
-                std::chrono::duration<double, std::milli>(t_mig1 - t_mig0).count());
     } // end if (!layer_prefill)
+
+    if (target_only_decode) {
+        std::vector<float> ar_embed_buf(hidden);
+        std::vector<float> ar_logits_buf(vocab);
+        int32_t ar_pos4[4];
+        int n_generated = 0;
+        bool ar_failed = false;
+        auto t_gen0 = std::chrono::steady_clock::now();
+        while (n_generated < n_gen) {
+            const int32_t tok = last_tok;
+            out_all.push_back(tok);
+            stream_emit(tok);
+            n_generated++;
+            if (tok == 248045 || n_generated >= n_gen) {
+                committed++;
+                break;
+            }
+
+            if (!build_target_step(sg, w, cache, backend,
+                                    /*kv_start=*/committed, /*n_tokens=*/1,
+                                    /*with_mask=*/false, /*capture=*/true,
+                                    /*capture_delta_intermediate=*/false,
+                                    g_fa_window)) {
+                std::fprintf(stderr, "target-only build failed\n");
+                if (daemon_mode) { ar_failed = true; break; } else return 1;
+            }
+            if (!w.embedder.embed(&tok, 1, ar_embed_buf.data())) {
+                if (daemon_mode) { ar_failed = true; break; } else return 1;
+            }
+            ggml_backend_tensor_set(sg.inp_embed, ar_embed_buf.data(), 0,
+                                    sizeof(float) * ar_embed_buf.size());
+            ar_pos4[0] = committed;
+            ar_pos4[1] = committed;
+            ar_pos4[2] = committed;
+            ar_pos4[3] = 0;
+            ggml_backend_tensor_set(sg.positions, ar_pos4, 0, sizeof(ar_pos4));
+
+            auto st_ar = ggml_backend_graph_compute(backend, sg.gf);
+            if (st_ar != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "target-only compute %d\n", (int)st_ar);
+                if (daemon_mode) { ar_failed = true; break; } else return 1;
+            }
+            ggml_backend_tensor_get(sg.logits, ar_logits_buf.data(), 0,
+                                    sizeof(float) * ar_logits_buf.size());
+            last_tok = argmax_f32(ar_logits_buf.data(), vocab);
+            committed++;
+        }
+        if (ar_failed) {
+            stream_emit(-1);
+            continue;
+        }
+
+        auto t_gen1 = std::chrono::steady_clock::now();
+        double gen_s = std::chrono::duration<double>(t_gen1 - t_gen0).count();
+        double tps = n_generated / std::max(1e-9, gen_s);
+        std::printf("\n[target-only] generated %d tokens in %.3f s  ->  %.2f tok/s\n",
+                    n_generated, gen_s, tps);
+        std::printf("[target-only] output tail: ");
+        int tail_start = std::max(0, (int)out_all.size() - 20);
+        for (int i = tail_start; i < (int)out_all.size(); i++) std::printf("%d ", out_all[i]);
+        std::printf("\n");
+
+        if (daemon_mode) {
+            stream_emit(-1);
+            continue;
+        } else {
+            if (out_path) write_int32_file(out_path, out_all);
+            break;
+        }
+    }
 
     // ── DFlash decode loop
     int n_draft_steps = 0, n_accept_sum = 0, n_generated = 0;

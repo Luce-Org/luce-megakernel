@@ -8,7 +8,7 @@
 //   1. compute_mean_vector_kernel  — mean K over BLOCK_SIZE blocks.
 //      Output: mean_k[B, n_k_blocks, n_kv_heads, D]
 //   2. compute_block_score_kernel  — per (q_block, k_block) score via
-//      Q · mean_K^T.  Output: score[B, M, N, H], max[B, M, N, H]
+//      Q · mean_K^T.  Output: score[B, M, N, H]
 //   3. block_select (host or CUDA) — pick top-K blocks per Q row, with
 //      sink + window + dynamic alpha threshold + always-on last blocks.
 //      Output: compact_indices[B, M, N, H], counts[B, M, H]
@@ -26,27 +26,45 @@
 //   - score shape: [B, M, N, n_q_heads]   (M = N = ceil(S/BLOCK))
 
 #include <cstdint>
+#include <cstdlib>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <mma.h>
 
 namespace dflash27b {
 namespace flashprefill {
 
+#if defined(DFLASH27B_MIN_SM) && DFLASH27B_MIN_SM < 80
+// SM75 has no native BF16 tensor cores. Remap the existing BF16 kernel source
+// to FP16 so the same code path compiles and runs on Turing.
+#define __nv_bfloat16 __half
+#define __bfloat162float __half2float
+#define __float2bfloat16 __float2half
+#endif
+
 // ── cp.async helpers (sm_8x) ─────────────────────────────────────────
 // 16-byte (uint4) async global → shared copy. Issued by every thread that
 // participates in the cooperative load. wait_all() drains all outstanding
 // transfers; commit_group()/wait_group(N) supports multi-stage pipelines.
 __device__ inline void cp_async16(void * smem_ptr, const void * gmem_ptr) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
                  :: "r"(smem_addr), "l"(gmem_ptr));
+#else
+    *reinterpret_cast<uint4 *>(smem_ptr) = *reinterpret_cast<const uint4 *>(gmem_ptr);
+#endif
 }
 __device__ inline void cp_async_commit() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     asm volatile("cp.async.commit_group;\n");
+#endif
 }
 __device__ inline void cp_async_wait_all() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     asm volatile("cp.async.wait_all;\n");
+#endif
 }
 
 
@@ -133,15 +151,13 @@ __global__ void compute_block_score_kernel_bf16(
     const __nv_bfloat16 * __restrict__ mean_K,
     float sm_scale,
     float * __restrict__ score,    // [B, M, N, H]
-    float * __restrict__ score_max,// [B, M, N, H]
     int batch, int n_q_heads, int n_k_heads,
     int q_block_idx_max,           // total q blocks  M = ceil(S/BLOCK)
     int k_block_idx_max,           // total k blocks  N = ceil(S/BLOCK)
     // strides (in elements)
     int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
     int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
-    int s_S_b, int s_S_m, int s_S_n, int s_S_h,
-    int s_M_b, int s_M_m, int s_M_n, int s_M_h)
+    int s_S_b, int s_S_m, int s_S_n, int s_S_h)
 {
     const int q_block_idx = blockIdx.x;
     const int zh = blockIdx.y;
@@ -208,25 +224,24 @@ __global__ void compute_block_score_kernel_bf16(
         float p_sum = smem[0];
         __syncthreads();
 
-        // Thread 0 writes the (score, max) for this (q_block, n).
+        // Thread 0 writes the score for this (q_block, n). The row max was
+        // needed by an earlier host normalization path; block_select only
+        // consumes the final score.
         if (tid == 0) {
             score    [(size_t)b * s_S_b + (size_t)q_block_idx * s_S_m
                       + (size_t)n * s_S_n + (size_t)qh * s_S_h] = p_sum;
-            score_max[(size_t)b * s_M_b + (size_t)q_block_idx * s_M_m
-                      + (size_t)n * s_M_n + (size_t)qh * s_M_h] = m_block;
         }
     }
 }
 
 extern "C" void launch_compute_block_score_bf16(
     const void * Q, const void * mean_K, float sm_scale,
-    void * score, void * score_max,
+    void * score,
     int batch, int n_q_heads, int n_k_heads,
     int seq_len, int head_dim, int block_size,
     int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
     int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
     int s_S_b, int s_S_m, int s_S_n, int s_S_h,
-    int s_M_b, int s_M_m, int s_M_n, int s_M_h,
     cudaStream_t stream)
 {
     const int M = (seq_len + block_size - 1) / block_size;
@@ -236,12 +251,11 @@ extern "C" void launch_compute_block_score_bf16(
     if (head_dim == 128 && block_size == 128) {
         compute_block_score_kernel_bf16<128, 128, 1><<<grid, block, smem, stream>>>(
             (const __nv_bfloat16 *)Q, (const __nv_bfloat16 *)mean_K, sm_scale,
-            (float *)score, (float *)score_max,
+            (float *)score,
             batch, n_q_heads, n_k_heads, M, M,
             s_Q_b, s_Q_n, s_Q_h, s_Q_d,
             s_mK_b, s_mK_m, s_mK_h, s_mK_d,
-            s_S_b, s_S_m, s_S_n, s_S_h,
-            s_M_b, s_M_m, s_M_n, s_M_h);
+            s_S_b, s_S_m, s_S_n, s_S_h);
     }
 }
 
@@ -292,6 +306,8 @@ __global__ void sparse_flash_forward_kernel_bf16(
     constexpr int NNK = K_TILE / MMA_N;       // 4 N-tiles along K_TILE (when K_TILE=64)
     constexpr int N_INNER = BLOCK / K_TILE;   // 2 inner iters per selected block
     constexpr int NTHREADS = (Q_TILE / MMA_M) * 32;  // 1 warp per 16 Q rows
+    constexpr int D_STRIDE = D_HEAD + 8;
+    constexpr int P_STRIDE = K_TILE + 8;
 
     const int q_tile_idx = blockIdx.x;
     const int zh = blockIdx.y;
@@ -308,9 +324,9 @@ __global__ void sparse_flash_forward_kernel_bf16(
     // SMEM: Q + KV (K or V at a time, alias) + P + row state
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __nv_bfloat16 * Q_sh   = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16 * KV_sh  = Q_sh + (size_t)Q_TILE * D_HEAD;
-    __nv_bfloat16 * P_sh   = KV_sh + (size_t)K_TILE * D_HEAD;
-    float         * row_m  = reinterpret_cast<float*>(P_sh + (size_t)Q_TILE * K_TILE);
+    __nv_bfloat16 * KV_sh  = Q_sh + (size_t)Q_TILE * D_STRIDE;
+    __nv_bfloat16 * P_sh   = KV_sh + (size_t)K_TILE * D_STRIDE;
+    float         * row_m  = reinterpret_cast<float*>(P_sh + (size_t)Q_TILE * P_STRIDE);
     float         * row_l  = row_m + Q_TILE;
 
     if (tid < Q_TILE) {
@@ -325,7 +341,7 @@ __global__ void sparse_flash_forward_kernel_bf16(
             int row = idx / D_HEAD;
             int dim = idx - row * D_HEAD;
             int q_global = q_tile_idx * Q_TILE + row;
-            Q_sh[row * D_HEAD + dim] = (q_global < seq_len)
+            Q_sh[row * D_STRIDE + dim] = (q_global < seq_len)
                 ? Qp[(size_t)q_global * s_Q_n + (size_t)dim * s_Q_d]
                 : __float2bfloat16(0.0f);
         }
@@ -336,8 +352,10 @@ __global__ void sparse_flash_forward_kernel_bf16(
     {
         const float sm_scale = scale * 1.4426950408889634f;
         for (int idx = tid; idx < Q_TILE * D_HEAD; idx += NTHREADS) {
-            float v = __bfloat162float(Q_sh[idx]);
-            Q_sh[idx] = __float2bfloat16(v * sm_scale);
+            const int row = idx / D_HEAD;
+            const int dim = idx - row * D_HEAD;
+            float v = __bfloat162float(Q_sh[(size_t)row * D_STRIDE + dim]);
+            Q_sh[(size_t)row * D_STRIDE + dim] = __float2bfloat16(v * sm_scale);
         }
     }
     __syncthreads();
@@ -370,7 +388,7 @@ __global__ void sparse_flash_forward_kernel_bf16(
                         int row8 = idx / (D_HEAD / 8);
                         int d8   = idx - row8 * (D_HEAD / 8);
                         int j = k_lo + row8;
-                        __nv_bfloat16 * dst = KV_sh + row8 * D_HEAD + d8 * 8;
+                            __nv_bfloat16 * dst = KV_sh + row8 * D_STRIDE + d8 * 8;
                         if (j < seq_len) {
                             cp_async16(dst, Kp + (size_t)j * s_K_n + (size_t)(d8 * 8));
                         } else {
@@ -395,11 +413,11 @@ __global__ void sparse_flash_forward_kernel_bf16(
                 #pragma unroll
                 for (int dk = 0; dk < NDK; ++dk) {
                     wmma::load_matrix_sync(Af,
-                        Q_sh + (size_t)(wid * MMA_M) * D_HEAD + dk * MMA_K, D_HEAD);
+                        Q_sh + (size_t)(wid * MMA_M) * D_STRIDE + dk * MMA_K, D_STRIDE);
                     #pragma unroll
                     for (int nt = 0; nt < NNK; ++nt) {
                         wmma::load_matrix_sync(Bf,
-                            KV_sh + (size_t)(nt * MMA_N) * D_HEAD + dk * MMA_K, D_HEAD);
+                            KV_sh + (size_t)(nt * MMA_N) * D_STRIDE + dk * MMA_K, D_STRIDE);
                         wmma::mma_sync(S_frag[nt], Af, Bf, S_frag[nt]);
                     }
                 }
@@ -478,7 +496,7 @@ __global__ void sparse_flash_forward_kernel_bf16(
                     float p = (v == -INFINITY) ? 0.0f : exp2f(v - mn);
                     if (i < 4) rs0 += p; else rs1 += p;
                     int p_row = wid * MMA_M + ((i < 4) ? row0_in_warp : row1_in_warp);
-                    P_sh[(size_t)p_row * K_TILE + col_in_KTILE] = __float2bfloat16(p);
+                    P_sh[(size_t)p_row * P_STRIDE + col_in_KTILE] = __float2bfloat16(p);
                 }
             }
             // Reduce rowsum across quad
@@ -522,7 +540,7 @@ __global__ void sparse_flash_forward_kernel_bf16(
                         int row8 = idx / (D_HEAD / 8);
                         int d8   = idx - row8 * (D_HEAD / 8);
                         int j = k_lo + row8;
-                        __nv_bfloat16 * dst = KV_sh + row8 * D_HEAD + d8 * 8;
+                        __nv_bfloat16 * dst = KV_sh + row8 * D_STRIDE + d8 * 8;
                         if (j < seq_len) {
                             cp_async16(dst, Vp + (size_t)j * s_V_n + (size_t)(d8 * 8));
                         } else {
@@ -545,11 +563,11 @@ __global__ void sparse_flash_forward_kernel_bf16(
                 #pragma unroll
                 for (int kk = 0; kk < NNK; ++kk) {
                     wmma::load_matrix_sync(Af,
-                        P_sh + (size_t)(wid * MMA_M) * K_TILE + kk * MMA_K, K_TILE);
+                        P_sh + (size_t)(wid * MMA_M) * P_STRIDE + kk * MMA_K, P_STRIDE);
                     #pragma unroll
                     for (int dt = 0; dt < NDK; ++dt) {
                         wmma::load_matrix_sync(Bf,
-                            KV_sh + (size_t)(kk * MMA_K) * D_HEAD + dt * MMA_N, D_HEAD);
+                            KV_sh + (size_t)(kk * MMA_K) * D_STRIDE + dt * MMA_N, D_STRIDE);
                         wmma::mma_sync(O_frag[dt], Af, Bf, O_frag[dt]);
                     }
                 }
@@ -558,11 +576,10 @@ __global__ void sparse_flash_forward_kernel_bf16(
         } // inner
     } // it
 
-    // Write O = acc / l_i. Store frag → SMEM (reuse Q_sh region as scratch), divide row-wise.
-    // Q_sh is no longer needed; treat Q_sh region as f32 [Q_TILE][D_HEAD] (since 64*128*2 bf16 = 64*128*2 = 16K, but f32 needs 64*128*4 = 32K — won't fit). Use P_sh as scratch (8K, only first 4K rows needed for D=128 per warp store).
-    // Simpler: store one D col tile at a time into a small scratch and write out.
-    // We'll reuse the KV_sh region as f32 staging ([Q_TILE, MMA_N] = 64*16*4 = 4K) for one col tile at a time.
-    float * stage_f32 = reinterpret_cast<float*>(KV_sh);  // 4 KB needed, KV_sh is 16 KB, plenty.
+    // Write O = acc / l_i. Store frag -> SMEM one D tile at a time, then
+    // divide row-wise and write global. This is sync-heavy but numerically
+    // stable across the WMMA fragment layouts we currently support.
+    float * stage_f32 = reinterpret_cast<float*>(KV_sh);  // 4 KB needed, KV_sh is at least 8 KB.
     #pragma unroll
     for (int d = 0; d < NDK; ++d) {
         __syncthreads();
@@ -619,28 +636,68 @@ extern "C" void launch_sparse_flash_forward_bf16(
     dim3 grid(q_tiles, batch * n_q_heads, 1);
     dim3 block(q_tile, 1, 1);
     if (q_tile == 64 && block_size == 128 && head_dim == 128) {
-        // FA-2 register-resident layout @ Q_TILE=64 (4 warps, 128 threads), 2 CTAs/SM.
-        constexpr int Q_TILE = 64, K_TILE = 64, BLOCK = 128, D_HEAD = 128;
-        size_t smem_bytes = sizeof(__nv_bfloat16) * (Q_TILE * D_HEAD)
-                           + sizeof(__nv_bfloat16) * (K_TILE * D_HEAD)
-                           + sizeof(__nv_bfloat16) * (Q_TILE * K_TILE)
-                           + sizeof(float)         * (2 * Q_TILE);
+        // FA-2 register-resident layout @ Q_TILE=64 (4 warps, 128 threads).
+        // K_TILE=64 is the original path. K_TILE=32 is useful on SM75/Turing
+        // experiments because it cuts dynamic shared memory and S fragments,
+        // at the cost of twice as many inner K iterations.
+        int k_tile = 64;
+#if defined(DFLASH27B_MIN_SM) && DFLASH27B_MIN_SM < 80
+        k_tile = 32;
+#endif
+        if (const char * env = std::getenv("DFLASH_FP_K_TILE")) {
+            const int v = std::atoi(env);
+            if (v == 32 || v == 64) {
+                k_tile = v;
+            }
+        }
         dim3 block128(128, 1, 1);
-        cudaFuncSetAttribute(
-            (const void*)sparse_flash_forward_kernel_bf16<Q_TILE, K_TILE, BLOCK, D_HEAD>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)smem_bytes);
-        sparse_flash_forward_kernel_bf16<Q_TILE, K_TILE, BLOCK, D_HEAD><<<grid, block128, smem_bytes, stream>>>(
-            (const __nv_bfloat16 *)Q, (const __nv_bfloat16 *)K,
-            (const __nv_bfloat16 *)V, (__nv_bfloat16 *)O,
-            block_index, counts, scale,
-            batch, n_q_heads, n_k_heads, seq_len, M,
-            s_Q_b, s_Q_n, s_Q_h, s_Q_d,
-            s_K_b, s_K_n, s_K_h, s_K_d,
-            s_V_b, s_V_n, s_V_h, s_V_d,
-            s_O_b, s_O_n, s_O_h, s_O_d,
-            s_idx_b, s_idx_m, s_idx_n, s_idx_h,
-            s_cnt_b, s_cnt_m, s_cnt_h);
+        if (k_tile == 32) {
+            constexpr int Q_TILE = 64, K_TILE = 32, BLOCK = 128, D_HEAD = 128;
+            constexpr int D_STRIDE = D_HEAD + 8;
+            constexpr int P_STRIDE = K_TILE + 8;
+            size_t smem_bytes = sizeof(__nv_bfloat16) * (Q_TILE * D_STRIDE)
+                               + sizeof(__nv_bfloat16) * (K_TILE * D_STRIDE)
+                               + sizeof(__nv_bfloat16) * (Q_TILE * P_STRIDE)
+                               + sizeof(float)         * (2 * Q_TILE);
+            cudaFuncSetAttribute(
+                (const void*)sparse_flash_forward_kernel_bf16<Q_TILE, K_TILE, BLOCK, D_HEAD>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)smem_bytes);
+            sparse_flash_forward_kernel_bf16<Q_TILE, K_TILE, BLOCK, D_HEAD><<<grid, block128, smem_bytes, stream>>>(
+                (const __nv_bfloat16 *)Q, (const __nv_bfloat16 *)K,
+                (const __nv_bfloat16 *)V, (__nv_bfloat16 *)O,
+                block_index, counts, scale,
+                batch, n_q_heads, n_k_heads, seq_len, M,
+                s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+                s_K_b, s_K_n, s_K_h, s_K_d,
+                s_V_b, s_V_n, s_V_h, s_V_d,
+                s_O_b, s_O_n, s_O_h, s_O_d,
+                s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+                s_cnt_b, s_cnt_m, s_cnt_h);
+        } else {
+            constexpr int Q_TILE = 64, K_TILE = 64, BLOCK = 128, D_HEAD = 128;
+            constexpr int D_STRIDE = D_HEAD + 8;
+            constexpr int P_STRIDE = K_TILE + 8;
+            size_t smem_bytes = sizeof(__nv_bfloat16) * (Q_TILE * D_STRIDE)
+                               + sizeof(__nv_bfloat16) * (K_TILE * D_STRIDE)
+                               + sizeof(__nv_bfloat16) * (Q_TILE * P_STRIDE)
+                               + sizeof(float)         * (2 * Q_TILE);
+            cudaFuncSetAttribute(
+                (const void*)sparse_flash_forward_kernel_bf16<Q_TILE, K_TILE, BLOCK, D_HEAD>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)smem_bytes);
+            sparse_flash_forward_kernel_bf16<Q_TILE, K_TILE, BLOCK, D_HEAD><<<grid, block128, smem_bytes, stream>>>(
+                (const __nv_bfloat16 *)Q, (const __nv_bfloat16 *)K,
+                (const __nv_bfloat16 *)V, (__nv_bfloat16 *)O,
+                block_index, counts, scale,
+                batch, n_q_heads, n_k_heads, seq_len, M,
+                s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+                s_K_b, s_K_n, s_K_h, s_K_d,
+                s_V_b, s_V_n, s_V_h, s_V_d,
+                s_O_b, s_O_n, s_O_h, s_O_d,
+                s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+                s_cnt_b, s_cnt_m, s_cnt_h);
+        }
     }
 }
 

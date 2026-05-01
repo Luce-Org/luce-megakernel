@@ -4,7 +4,7 @@
 // Wraps kernels 1-4 + GPU block_select into one call. Call signature mirrors
 // the upstream `flash_prefill` from qhfan/FlashPrefill (arXiv:2603.06199).
 //
-// Tensor layout (all CUDA, bf16, contiguous, D fastest):
+// Tensor layout (all CUDA, fp16/bf16, contiguous, D fastest):
 //   Q[B, S, n_q_heads, D]
 //   K[B, S, n_k_heads, D]
 //   V[B, S, n_k_heads, D]
@@ -16,6 +16,10 @@
 //     kernel (FA-2 derived, m16n8k16 PTX, sm_80+ via cuBLAS BF16 GEMM).
 //     Requires building with -DDFLASH27B_ENABLE_BSA=ON. ~3x faster than WMMA
 //     on RTX 3090 at S=128K.
+//   - On SM75/Turing (e.g. RTX 2080 Ti), BSA is unavailable and BF16 tensor
+//     cores do not exist. The drafter should use FP16 weights/compute and this
+//     WMMA path; tune alpha/keep ratio and preserve quality with the PFlash
+//     compressor knobs documented in qwen3_drafter.h.
 //
 // Tunables (env vars):
 //   DFLASH_FP_USE_BSA      [0/1] enable BSA backend (default: 0).
@@ -26,6 +30,9 @@
 //   DFLASH_FP_PROFILE      [set] log per-stage timing (mean / score / select /
 //                          forward) to stderr.
 //   DFLASH_FP_DUMP_COUNTS  [set] log per-row select counts to stderr.
+//   DFLASH_FP_K_TILE       [32/64] internal WMMA sparse-forward tile tuning.
+//                          Default 32 on SM75, 64 elsewhere; 32 trades more
+//                          inner iterations for lower shared/register pressure.
 
 #pragma once
 
@@ -50,6 +57,12 @@ struct FlashPrefillConfig {
 // Scratch memory (allocated/freed per call inside): ~M*M*H*4 * 3 + M*H*4
 // where M = ceil(seq_len/block_size). At S=140K, M≈1093, H=16: ~300 MB.
 int flash_prefill_forward_bf16(
+    const void * Q, const void * K, const void * V, void * O,
+    int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
+    float scale,
+    const FlashPrefillConfig & cfg);
+
+int flash_prefill_forward_f16(
     const void * Q, const void * K, const void * V, void * O,
     int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
     float scale,
