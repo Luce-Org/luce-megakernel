@@ -43,7 +43,16 @@ bool load_drafter(const std::string & gguf_path, int gpu_layers,
 void free_drafter(DrafterContext & ctx);
 
 // Score importance per token via Liu Q-hook tail attention, then chunk-top-K
-// span merge. Returns surviving token IDs (drafter vocab).
+// lexical rescue + span merge. Returns surviving token IDs (drafter vocab).
+//
+// Runtime quality/speed knobs:
+//   DFLASH_PFLASH_LOOKAHEAD        override n_lookahead
+//   DFLASH_PFLASH_CHUNK_RADIUS     keep neighbor chunks around score winners
+//   DFLASH_PFLASH_QUERY_TAIL       tail window used for rare-token rescue
+//   DFLASH_PFLASH_RARE_MAX_FREQ    max whole-prompt frequency for a rescue token
+//   DFLASH_PFLASH_QUERY_MIN_HITS   rare-token hits needed to rescue a chunk
+//   DFLASH_PFLASH_QUERY_RADIUS     keep neighbor chunks around lexical hits
+//   DFLASH_PFLASH_DUMP_CHUNKS      CSV dump of chunk scores/selections
 //
 //   ids          input token IDs of length S
 //   keep_ratio   fraction of `chunk_size`-token chunks to keep

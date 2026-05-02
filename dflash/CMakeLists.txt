@@ -60,6 +60,7 @@ add_library(dflash27b STATIC
     src/qwen35_target_graph.cpp
     src/qwen3_dflash_graph.cpp
     src/qwen3_drafter.cpp
+    src/pflash_chunk_select.cpp
     src/qwen3_0p6b_loader.cpp
     src/qwen3_0p6b_graph.cpp
     src/flashprefill_kernels.cu
@@ -174,7 +175,13 @@ if(DFLASH27B_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
         set_target_properties(test_flashprefill_kernels PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_archs}")
+        target_compile_definitions(test_flashprefill_kernels PRIVATE DFLASH27B_MIN_SM=${_dflash27b_min_sm})
         target_link_libraries(test_flashprefill_kernels PRIVATE dflash27b CUDA::cudart)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_pflash_chunk_select.cpp")
+        add_executable(test_pflash_chunk_select test/test_pflash_chunk_select.cpp)
+        target_include_directories(test_pflash_chunk_select PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_pflash_chunk_select PRIVATE dflash27b)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kv_quant.cpp")
         add_executable(test_kv_quant test/test_kv_quant.cpp)

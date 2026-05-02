@@ -125,7 +125,9 @@ def compress_text_via_daemon(
     """Run the daemon's compress + memory dance, return the compressed text.
 
     Caller holds the daemon lock for the full duration. After this returns,
-    the daemon has its target + draft restored and is ready for ``generate``.
+    the daemon has its target restored and is ready for ``generate``. If
+    ``DFLASH_PFLASH_SKIP_DRAFT_RELOAD=1`` is set, the draft remains parked and
+    the daemon must use its target-only decode fallback for that request.
     """
     # 1) drafter-tokenize the prompt
     drafter_ids = drafter_tokenizer(prompt_text, return_tensors=None,
@@ -140,8 +142,13 @@ def compress_text_via_daemon(
             for t in drafter_ids:
                 f.write(struct.pack("<i", int(t)))
 
-        # 3) park target + draft so drafter has VRAM headroom on a 24 GB card
-        _send_and_ack(daemon_stdin, r_pipe, "park target\n")
+        # 3) park target + draft so drafter has VRAM headroom on a 24 GB card.
+        # Experimental SM75 path: keep target resident and only park the DFlash
+        # draft. This avoids reloading the 27B target after compression, but can
+        # OOM on tighter contexts, so it is opt-in via env.
+        keep_target = os.environ.get("DFLASH_PFLASH_KEEP_TARGET", "0") not in ("", "0")
+        if not keep_target:
+            _send_and_ack(daemon_stdin, r_pipe, "park target\n")
         _send_and_ack(daemon_stdin, r_pipe, "park draft\n")
 
         # 4) compress: drafter loads, FlashPrefill scoring, emit compressed ids, drafter held
@@ -151,10 +158,15 @@ def compress_text_via_daemon(
         daemon_stdin.flush()
         compressed_ids = _drain_until_sentinel(r_pipe)
 
-        # 5) free drafter weights + BSA scratch, then restore target + draft
+        # 5) free drafter weights + BSA scratch, then restore target + draft.
+        # For short outputs, reloading the DFlash draft can dominate the whole
+        # PFlash path; the matching daemon env falls back to target-only decode.
+        skip_draft_reload = os.environ.get("DFLASH_PFLASH_SKIP_DRAFT_RELOAD", "0") not in ("", "0")
         _send_and_ack(daemon_stdin, r_pipe, "free drafter\n")
-        _send_and_ack(daemon_stdin, r_pipe, "unpark target\n")
-        _send_and_ack(daemon_stdin, r_pipe, "unpark draft\n")
+        if not keep_target:
+            _send_and_ack(daemon_stdin, r_pipe, "unpark target\n")
+        if not skip_draft_reload:
+            _send_and_ack(daemon_stdin, r_pipe, "unpark draft\n")
     finally:
         try: os.unlink(path)
         except Exception: pass

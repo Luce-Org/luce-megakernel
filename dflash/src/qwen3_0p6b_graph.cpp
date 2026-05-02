@@ -24,7 +24,7 @@
 // Memory at S=140K, B=1, H=16, Hk=8, D=128, hidden=1024, ff=3072:
 //   weights                                            ~1.5 GB
 //   28 × K_curr [D, Hk, S] bf16 + 28 × V_curr same   ~15.7 GB
-//   28 × Q_last [D, H, N] bf16                        ~1 KB
+//   28 × Q_last [D, H, N] fp16/bf16                    ~1 KB
 //   hidden_buf [hidden, S] f32                         0.57 GB
 //   pos / mask_tail                                    1 MB
 //   per-ubatch graph transients (chunk_s sized)        ~2-3 GB
@@ -115,6 +115,7 @@ bool forward_qwen3_0p6b_drafter(
     const float eps    = 1e-6f;
     const float scale  = 1.0f / std::sqrt((float)D);
     const float rope_b = w.rope_theta;
+    const ggml_type compute_type = w.compute_type;
 
     if (S < n_lookahead + 1) {
         set_last_error("forward_qwen3_0p6b_drafter: S too small");
@@ -147,16 +148,16 @@ bool forward_qwen3_0p6b_drafter(
         if (!make_pers(w.backend, GGML_TYPE_F32,  2, d_h, hidden_buf) ||
             !make_pers(w.backend, GGML_TYPE_I32,  1, d_p, pos_buf)    ||
             !make_pers(w.backend, GGML_TYPE_F32,  2, d_mt, mask_tail_buf) ||
-            !make_pers(w.backend, GGML_TYPE_BF16, 3, d_q, Q_buf) ||
-            !make_pers(w.backend, GGML_TYPE_BF16, 3, d_q, attn_out_buf)) {
+            !make_pers(w.backend, compute_type,  3, d_q, Q_buf) ||
+            !make_pers(w.backend, compute_type,  3, d_q, attn_out_buf)) {
             set_last_error("forward_qwen3_0p6b: persistent alloc failed (hidden/pos/mask/Q/attn_out)");
             cleanup_all();
             return false;
         }
         for (int il = 0; il < w.n_layer; ++il) {
-            if (!make_pers(w.backend, GGML_TYPE_BF16, 3, d_kv, K_curr_v[il]) ||
-                !make_pers(w.backend, GGML_TYPE_BF16, 3, d_kv, V_curr_v[il]) ||
-                !make_pers(w.backend, GGML_TYPE_F32, 3, d_ql, Q_last_v[il])) {
+            if (!make_pers(w.backend, compute_type,  3, d_kv, K_curr_v[il]) ||
+                !make_pers(w.backend, compute_type,  3, d_kv, V_curr_v[il]) ||
+                !make_pers(w.backend, compute_type, 3, d_ql, Q_last_v[il])) {
                 set_last_error("forward_qwen3_0p6b: K_curr/V_curr/Q_last alloc failed at layer " + std::to_string(il));
                 cleanup_all();
                 return false;
@@ -315,14 +316,23 @@ bool forward_qwen3_0p6b_drafter(
 
         // ── FP CUDA call: attn = flash_prefill(Q, K, V) ──
         auto tF0 = std::chrono::steady_clock::now();
-        int rc = flashprefill::flash_prefill_forward_bf16(
-            Q_buf.t->data,
-            K_curr_v[il].t->data,
-            V_curr_v[il].t->data,
-            attn_out_buf.t->data,
-            1, S, H, Hk, D, scale, fp_cfg);
+        int rc = (compute_type == GGML_TYPE_F16)
+            ? flashprefill::flash_prefill_forward_f16(
+                Q_buf.t->data,
+                K_curr_v[il].t->data,
+                V_curr_v[il].t->data,
+                attn_out_buf.t->data,
+                1, S, H, Hk, D, scale, fp_cfg)
+            : flashprefill::flash_prefill_forward_bf16(
+                Q_buf.t->data,
+                K_curr_v[il].t->data,
+                V_curr_v[il].t->data,
+                attn_out_buf.t->data,
+                1, S, H, Hk, D, scale, fp_cfg);
         if (rc != 0) {
-            set_last_error("flash_prefill_forward_bf16 failed at layer " + std::to_string(il));
+            set_last_error(std::string("flash_prefill_forward_") +
+                           ggml_type_name(compute_type) +
+                           " failed at layer " + std::to_string(il));
             ggml_gallocr_free(galloc); cleanup_all(); return false;
         }
         cudaError_t e = cudaGetLastError();
@@ -403,10 +413,8 @@ bool forward_qwen3_0p6b_drafter(
         ip.no_alloc = true;
         ggml_context * gctx = ggml_init(ip);
 
-        ggml_tensor * K_f32 = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, D, Hk, S);
-        ggml_tensor * K_cast = ggml_cpy(gctx, K_curr_v[il].t, K_f32);
         ggml_tensor * K_perm = ggml_cont(gctx,
-            ggml_permute(gctx, K_cast, 0, 2, 1, 3));
+            ggml_permute(gctx, K_curr_v[il].t, 0, 2, 1, 3));
         ggml_tensor * K_score = K_perm;
         if (gqa > 1) {
             ggml_tensor * K_4d = ggml_reshape_4d(gctx, K_perm, D, S, 1, Hk);

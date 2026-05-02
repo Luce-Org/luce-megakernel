@@ -1,7 +1,7 @@
 // Glue between the 4 FlashPrefill steps:
 //   1. compute_mean_vector_bf16    (kernel)
-//   2. compute_block_score_bf16    (kernel)  + normalise on host
-//   3. block_select_host           (host)
+//   2. compute_block_score_bf16    (kernel)
+//   3. block_select                (kernel)
 //   4. sparse_flash_forward_bf16   (kernel)
 
 #include "flashprefill.h"
@@ -25,13 +25,12 @@ void launch_compute_mean_vector_bf16(
 
 void launch_compute_block_score_bf16(
     const void * Q, const void * mean_K, float sm_scale,
-    void * score, void * score_max,
+    void * score,
     int batch, int n_q_heads, int n_k_heads,
     int seq_len, int head_dim, int block_size,
     int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
     int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
     int s_S_b, int s_S_m, int s_S_n, int s_S_h,
-    int s_M_b, int s_M_m, int s_M_n, int s_M_h,
     cudaStream_t stream);
 
 void launch_block_select(
@@ -107,12 +106,11 @@ int flash_prefill_forward_bf16(
 
     // Allocate scratch on the same device as Q.
     void * dmK = nullptr;
-    float * dS = nullptr, * dM = nullptr;
+    float * dS = nullptr;
     int32_t * dIdx = nullptr, * dCnt = nullptr;
     cudaError_t e;
     if ((e = cudaMalloc(&dmK,  (size_t)B * M * Hk * D * 2)) != cudaSuccess) goto err;  // bf16
     if ((e = cudaMalloc(&dS,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
-    if ((e = cudaMalloc(&dM,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
     if ((e = cudaMalloc(&dIdx, (size_t)B * M * N * H * sizeof(int32_t))) != cudaSuccess) goto err;
     if ((e = cudaMalloc(&dCnt, (size_t)B * M * H * sizeof(int32_t))) != cudaSuccess) goto err;
 
@@ -129,11 +127,10 @@ int flash_prefill_forward_bf16(
     if (prof) cudaEventRecord(pE[1]);
     // 2. block scores
     launch_compute_block_score_bf16(
-        Q, dmK, scale, dS, dM,
+        Q, dmK, scale, dS,
         B, H, Hk, S, D, BLOCK,
         s_Q_b, s_Q_n, s_Q_h, s_Q_d,
         s_mK_b, s_mK_m, s_mK_h, s_mK_d,
-        s_S_b, s_S_m, s_S_n, s_S_h,
         s_S_b, s_S_m, s_S_n, s_S_h, 0);
 
     if (prof) cudaEventRecord(pE[2]);
@@ -192,17 +189,25 @@ int flash_prefill_forward_bf16(
             S, n_q_heads, n_k_heads, t1, t2, t3, t4);
         for (int i=0;i<5;i++) cudaEventDestroy(pE[i]);
     }
-    cudaFree(dmK); cudaFree(dS); cudaFree(dM); cudaFree(dIdx); cudaFree(dCnt);
+    cudaFree(dmK); cudaFree(dS); cudaFree(dIdx); cudaFree(dCnt);
     return 0;
 
 err:
     if (dmK)  cudaFree(dmK);
     if (dS)   cudaFree(dS);
-    if (dM)   cudaFree(dM);
     if (dIdx) cudaFree(dIdx);
     if (dCnt) cudaFree(dCnt);
     std::fprintf(stderr, "[flashprefill] cudaMalloc failed: %s\n", cudaGetErrorString(e));
     return -1;
+}
+
+int flash_prefill_forward_f16(
+    const void * Q, const void * K, const void * V, void * O,
+    int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
+    float scale,
+    const FlashPrefillConfig & cfg)
+{
+    return flash_prefill_forward_bf16(Q, K, V, O, batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
 }
 
 } // namespace flashprefill

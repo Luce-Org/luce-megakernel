@@ -16,6 +16,7 @@
 #include "qwen3_drafter.h"
 #include "qwen3_0p6b_drafter.h"
 #include "internal.h"
+#include "pflash_chunk_select.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -24,6 +25,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -62,8 +64,9 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
 
     out.loaded = true;
     std::fprintf(stderr,
-        "[drafter] loaded Qwen3-0.6B BF16: n_layer=%d n_head=%d n_kv=%d "
+        "[drafter] loaded Qwen3-0.6B %s: n_layer=%d n_head=%d n_kv=%d "
         "n_embd=%d n_ff=%d head_dim=%d vocab=%d\n",
+        ggml_type_name(out.weights.compute_type),
         out.weights.n_layer, out.weights.n_head, out.weights.n_head_kv,
         out.weights.n_embd, out.weights.n_ff, out.weights.head_dim,
         out.weights.n_vocab);
@@ -94,6 +97,14 @@ std::vector<int32_t> drafter_score_and_compress(
         return {};
     }
     const int S = (int)ids.size();
+
+    if (const char * env = std::getenv("DFLASH_PFLASH_LOOKAHEAD")) {
+        int v = std::atoi(env);
+        if (v > 0 && v <= 256) {
+            n_lookahead = v;
+        }
+    }
+
     if (S < n_lookahead + 1) {
         // Too short to score — return as-is.
         return ids;
@@ -132,52 +143,55 @@ std::vector<int32_t> drafter_score_and_compress(
         smooth[j] = (n > 0) ? (s / (float)n) : 0.0f;
     }
 
-    // ── 4. Chunk-top-K + span merge ───────────────────────────────────
-    int n_chunks = (S + chunk_size - 1) / chunk_size;
-    int n_keep   = std::max(1, (int)((float)n_chunks * keep_ratio));
-    std::vector<std::pair<float, int>> chunk_means;
-    chunk_means.reserve((size_t)n_chunks);
-    for (int c = 0; c < n_chunks; ++c) {
-        int s_ = c * chunk_size;
-        int e_ = std::min(S, (c + 1) * chunk_size);
-        float m = 0.0f;
-        for (int j = s_; j < e_; ++j) m += smooth[j];
-        m /= std::max(1, e_ - s_);
-        chunk_means.push_back({m, c});
-    }
-    std::partial_sort(chunk_means.begin(),
-                      chunk_means.begin() + n_keep,
-                      chunk_means.end(),
-                      [](auto a, auto b) { return a.first > b.first; });
-    std::vector<int> selected;
-    selected.reserve((size_t)n_keep);
-    for (int i = 0; i < n_keep; ++i) selected.push_back(chunk_means[i].second);
-    std::sort(selected.begin(), selected.end());
-
-    std::vector<int32_t> out;
-    out.reserve((size_t)n_keep * chunk_size + 16);
-    int span_start = -1, span_end = -1;
-    for (int c : selected) {
-        int s_ = c * chunk_size;
-        int e_ = std::min(S, (c + 1) * chunk_size);
-        if (span_start < 0) {
-            span_start = s_; span_end = e_;
-        } else if (s_ == span_end) {
-            span_end = e_;
-        } else {
-            for (int j = span_start; j < span_end; ++j) out.push_back(ids[j]);
-            span_start = s_; span_end = e_;
+    // ── 4. Chunk-top-K + lexical rescue + span merge ──────────────────
+    PFlashChunkSelectOptions select_opts;
+    select_opts.keep_ratio = keep_ratio;
+    select_opts.chunk_size = chunk_size;
+    if (const char * env = std::getenv("DFLASH_PFLASH_CHUNK_RADIUS")) {
+        int v = std::atoi(env);
+        if (v >= 0 && v <= 16) {
+            select_opts.chunk_radius = v;
         }
     }
-    if (span_start >= 0) {
-        for (int j = span_start; j < span_end; ++j) out.push_back(ids[j]);
+    if (const char * env = std::getenv("DFLASH_PFLASH_QUERY_TAIL")) {
+        int v = std::atoi(env);
+        if (v >= 0 && v <= 4096) {
+            select_opts.query_tail = v;
+        }
     }
+    if (const char * env = std::getenv("DFLASH_PFLASH_RARE_MAX_FREQ")) {
+        int v = std::atoi(env);
+        if (v >= 0 && v <= 1024) {
+            select_opts.rare_max_freq = v;
+        }
+    }
+    if (const char * env = std::getenv("DFLASH_PFLASH_QUERY_MIN_HITS")) {
+        int v = std::atoi(env);
+        if (v >= 1 && v <= 64) {
+            select_opts.query_min_hits = v;
+        }
+    }
+    if (const char * env = std::getenv("DFLASH_PFLASH_QUERY_RADIUS")) {
+        int v = std::atoi(env);
+        if (v >= 0 && v <= 16) {
+            select_opts.query_radius = v;
+        }
+    }
+    if (const char * dump_path = std::getenv("DFLASH_PFLASH_DUMP_CHUNKS")) {
+        select_opts.dump_chunks_path = dump_path;
+    }
+    PFlashChunkSelectStats select_stats;
+    std::vector<int32_t> out =
+        pflash_select_and_compress(ids, smooth, select_opts, &select_stats);
 
     auto t2 = std::chrono::steady_clock::now();
     std::fprintf(stderr,
-        "[drafter] score_and_compress total %.2fs S=%d kept=%zu (%d/%d chunks)\n",
+        "[drafter] score_and_compress total %.2fs S=%d kept=%zu (%zu selected chunks, top=%d/%d radius=%d lexical=%d tail=%d rare<=%d min_hits=%d q_radius=%d)\n",
         std::chrono::duration<double>(t2 - t0).count(),
-        S, out.size(), n_keep, n_chunks);
+        S, out.size(), (size_t) select_stats.selected_chunks,
+        select_stats.top_keep_chunks, select_stats.n_chunks, select_opts.chunk_radius,
+        select_stats.lexical_chunks, select_opts.query_tail, select_opts.rare_max_freq,
+        select_opts.query_min_hits, select_opts.query_radius);
     std::fflush(stderr);
 
     return out;

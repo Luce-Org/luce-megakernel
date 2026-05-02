@@ -51,6 +51,66 @@ DFLASH_FP_PROFILE=1    # log mean/score/select/forward stage timings
 
 See `src/flashprefill.h` for the full list and defaults.
 
+PFlash compression is tuned separately from the sparse-attention kernel:
+
+```
+DFLASH_PFLASH_LOOKAHEAD=8       # override tail Q count used for scoring
+DFLASH_PFLASH_KEEP_TARGET=0     # experimental: keep target resident during
+                                # compression; caller should park draft first
+DFLASH_PFLASH_SKIP_DRAFT_RELOAD=0
+                                # experimental: after PFlash compression, keep
+                                # DFlash draft parked for TTFT-only fallback
+DFLASH_PFLASH_CHUNK_RADIUS=0    # keep neighbor chunks around score winners
+DFLASH_PFLASH_QUERY_TAIL=128    # tail tokens scanned for lexical rescue
+DFLASH_PFLASH_RARE_MAX_FREQ=4   # only rare tail tokens can rescue chunks
+DFLASH_PFLASH_QUERY_MIN_HITS=2  # rare-token hits required in a body chunk
+DFLASH_PFLASH_QUERY_RADIUS=1    # keep neighbor chunks around lexical hits
+DFLASH_PFLASH_DUMP_CHUNKS=/tmp/pflash_chunks.csv
+```
+
+The lexical rescue path is a quality guard for long-prompt retrieval cases:
+if the final question contains rare tokens also present near the answer, those
+body chunks are kept even when the score-only top-K misses them. It only scans
+body chunks before the query tail, so the query itself does not spuriously
+rescue neighboring tail chunks. Set `DFLASH_PFLASH_RARE_MAX_FREQ=0` to disable
+it for controlled ablations.
+
+## SM75 / RTX 2080 Ti
+
+SM75 does not have BF16 tensor cores and cannot run the BSA backend
+(`DFLASH27B_ENABLE_BSA=ON` auto-disables when the build arch includes 75).
+For RTX 2080 Ti, build the local path with FP16 drafter compute:
+
+```
+cmake -S . -B build-sm75-f16 -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CUDA_ARCHITECTURES=75 -DDFLASH27B_ENABLE_BSA=OFF
+cmake --build build-sm75-f16 --target \
+      test_dflash test_flashprefill_kernels test_pflash_chunk_select -j
+```
+
+Local benchmark setup: RTX 2080 Ti 22 GB, driver 595.58.03, CUDA 12.0,
+power limit 280 W, persistence mode enabled, Qwen3.6-27B Q4_K_M target,
+Qwen3-0.6B FP16 GGUF drafter, same 16K NIAH qtail prompt, model load excluded.
+
+| Case | Request time | Speedup | Notes |
+|------|-------------:|--------:|-------|
+| no PFlash | 50.35 s | 1.00x | original 16K prompt |
+| current PFlash hook | 26.11 s | 1.93x | parks and reloads target + draft |
+| `DFLASH_PFLASH_KEEP_TARGET=1` | 14.19 s | 3.55x | target stays resident, draft reloads |
+| `KEEP_TARGET=1` + `SKIP_DRAFT_RELOAD=1` | 4.13 s | 12.21x | TTFT-only fallback; no speculative decode |
+
+The last row is a TTFT / very short-output fallback, not a replacement for
+full DFlash speculative decode. The daemon skips `migrate_prefill_cache` when
+the DFlash draft remains parked because rollback tensors are only needed by
+speculative verification. This fallback should not be used as a decode
+performance claim.
+
+The candidate quality smoke is retrieval-only: the original 16K NIAH prompt
+and a 5-position synthetic 16K NIAH sweep retained the key and answer. Broader
+long-prompt QA should pass before enabling this by default. Keeping the 0.6B
+PFlash drafter resident across requests was rejected locally because the lower
+second compression time was offset by slower target prefill.
+
 ## Performance
 
 NIAH single-needle end-to-end on RTX 3090 (Qwen3.6-27B Q4_K_M target,
@@ -73,6 +133,7 @@ src/
   flashprefill.{h,cpp}         FlashPrefill C++ entry + dispatcher
   flashprefill_kernels.cu       4 CUDA kernels (mean_K, score, select, sparse_fwd)
   flashprefill_select.cpp       Host fallback for block_select (rarely used)
+  pflash_chunk_select.{h,cpp}   CPU chunk top-K + lexical rescue + span merge
   bsa_launcher.cu               BSA launcher: blockmask conversion + Flash_fwd_params
   bsa_fwd_inst.cu               Single-TU instantiation of BSA's hdim128 kernel
   qwen3_0p6b_loader.cpp         GGUF → Qwen3-0.6B BF16 weight tensors
@@ -85,6 +146,7 @@ test/
   test_dflash.cpp               daemon executable; supports
                                   `compress / generate / park / unpark / free drafter`
   test_flashprefill_kernels.cpp parity tests for the 4 FP kernels
+  test_pflash_chunk_select.cpp  regression for rare-query lexical rescue
   smoke_qwen3_0p6b_forward.cpp  drafter forward smoke at S=8K-128K
 deps/
   llama.cpp/                    submodule (ggml only; libllama not built)

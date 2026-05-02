@@ -148,6 +148,15 @@ Everything is configured via env vars on the daemon process. Full list in [`../d
 | `DFLASH_FP_ALPHA` | `0.12` | Block-selection threshold. Higher = stricter = fewer K-blocks per Q-row. `0.85` is the bench setting; `0.99` cuts another second at 128K with a small NIAH-margin loss. |
 | `DFLASH_FP_PROFILE` | `0` | Set to `1` to log per-stage timings (`mean_K / score / select / forward`). |
 | `DFLASH_FP_DUMP_COUNTS` | `0` | Set to `1` to dump per-row K-block counts for debugging keep-ratio tuning. |
+| `DFLASH_PFLASH_LOOKAHEAD` | unset | Override the tail Q-token count used by the drafter scorer. |
+| `DFLASH_PFLASH_KEEP_TARGET` | `0` | Experimental low-VRAM mode: keep the target resident during compression when the caller has already parked the DFlash draft. |
+| `DFLASH_PFLASH_SKIP_DRAFT_RELOAD` | `0` | Experimental TTFT / very short-output fallback: leave the DFlash draft parked after compression. This is not a replacement for speculative decode. |
+| `DFLASH_PFLASH_CHUNK_RADIUS` | `0` | Keep neighbor chunks around score-selected chunks. Higher is safer but keeps more tokens. |
+| `DFLASH_PFLASH_QUERY_TAIL` | `128` | Tail token window used for rare-token lexical rescue; body scan excludes this tail window. |
+| `DFLASH_PFLASH_RARE_MAX_FREQ` | `4` | Max whole-prompt frequency for tail tokens that can rescue a body chunk. Set `0` to disable lexical rescue. |
+| `DFLASH_PFLASH_QUERY_MIN_HITS` | `2` | Rare-token hits required before a body chunk is rescued. |
+| `DFLASH_PFLASH_QUERY_RADIUS` | `1` | Keep neighbor chunks around lexical hits. |
+| `DFLASH_PFLASH_DUMP_CHUNKS` | unset | Write chunk score/selection CSV for quality debugging. |
 | `DFLASH27B_FA_WINDOW` | (auto) | Set to `0` to force full attention on the compressed prompt (recommended). |
 | `DFLASH27B_KV_K` / `DFLASH27B_KV_V` | (auto) | KV-cache quant types. `q4_0` / `q4_0` is the bench setting. `tq3_0` saves another ~4 GB at 128K. |
 
@@ -183,7 +192,7 @@ prompt (≤ 128K tokens)
 
 **Drafter forward.** Custom Qwen3-0.6B graph (`qwen3_0p6b_graph.cpp`) per-layer A/FP/B blocks: dense attention up to ~32K source, FlashPrefill sparse attention at and above. The 4 FP kernels live in `flashprefill_kernels.cu`; BSA dispatch is in `bsa_launcher.cu` + `bsa_fwd_inst.cu`.
 
-**Scoring + selection.** Tail attention `Q[-N:] @ K^T / sqrt(d)` per layer/head, max over (L, H), mean over the tail window. Block-level threshold by `alpha * mean(scores)` selects which K-blocks each Q-block attends to. Configurable via `DFLASH_FP_ALPHA`.
+**Scoring + selection.** Tail attention `Q[-N:] @ K^T / sqrt(d)` per layer/head, max over (L, H), mean over the tail window. The compressor keeps the top scoring chunks, merges spans, and then applies rare-query lexical rescue: rare tokens from the final question can pull matching body chunks back into the compressed prompt. `DFLASH_FP_ALPHA` controls sparse-attention block selection inside the drafter forward; the `DFLASH_PFLASH_*` knobs control final token retention.
 
 **Memory budget on 24 GB.** Drafter scoring at 128K needs ~7-10 GB (drafter + KV + BSA scratch). Target + draft idle is ~18 GB. They can't coexist. The daemon's `park` / `unpark` / `free drafter` commands sequence VRAM occupancy across the request:
 
@@ -219,6 +228,8 @@ What we built:
 - **Qwen3.6-27B Q4_K_M target + Qwen3-0.6B drafter** is the validated pair. Other targets/drafters need keep_ratio + alpha re-calibration.
 - **NIAH single-needle** is the only retrieval task validated end-to-end. Multi-doc QA, long-form code retrieval, etc. still TBD.
 - **sm_80+** required for BSA (RTX 3090 sm_86 is the reference). On sm_75 (Turing) the build auto-disables BSA and falls back to the WMMA path; expect a slower drafter forward at long ctx.
+- **SM75 local path** should use FP16 drafter weights. BF16 tensor cores are not available on RTX 2080 Ti, so the 3090/BSA headline numbers are not the right comparison target. The local WMMA path uses padded shared-memory tiles and defaults to `DFLASH_FP_K_TILE=32` on SM75.
+- **SM75 target-resident mode** (`DFLASH_PFLASH_KEEP_TARGET=1 DFLASH_PFLASH_SKIP_DRAFT_RELOAD=1`) is an opt-in TTFT / very short-output fallback. It avoids target and draft reload on RTX 2080 Ti, but should not be presented as full PFlash + DFlash speculative decode or as a decode-speed result.
 
 ## Citation
 

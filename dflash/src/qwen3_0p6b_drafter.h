@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "ggml.h"
+
 struct ggml_context;
 struct ggml_tensor;
 struct ggml_backend;
@@ -51,6 +53,10 @@ struct Qwen3DrafterWeights {
     ggml_tensor * output      = nullptr;  // [hidden, vocab] (lm_head)
 
     std::vector<Qwen3DrafterLayer> layers;  // size = n_layer = 28
+
+    // Projection/embedding compute dtype. SM75 should use F16; BF16 is only
+    // kept for native-BF16 GPUs.
+    ggml_type compute_type = GGML_TYPE_BF16;
 
     // Architecture metadata.
     int n_layer    = 28;
