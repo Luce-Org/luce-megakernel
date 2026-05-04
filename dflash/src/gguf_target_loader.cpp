@@ -327,6 +327,19 @@ bool load_target_gguf(const std::string & path,
     out.ssm_dt_rank= (int)ssm_dt;
     out.ssm_n_group= (int)ssm_grp;
 
+    // EOS token ids from GGUF tokenizer metadata (stored as UINT32 by the
+    // GGUF spec; we use the u32 helper and cast). UINT32_MAX is the
+    // missing-key sentinel and maps to int32_t -1, which the runtime EOS
+    // check rejects via the `>= 0` guard.
+    {
+        const uint32_t kEosKeyMissing = 0xFFFFFFFFu;
+        const uint32_t raw_eos      = get_u32_or(gctx, "tokenizer.ggml.eos_token_id", kEosKeyMissing);
+        const uint32_t raw_eos_chat = get_u32_or(gctx, "tokenizer.ggml.eot_token_id", kEosKeyMissing);
+        out.eos_id      = (raw_eos      == kEosKeyMissing) ? -1 : (int32_t)raw_eos;
+        out.eos_chat_id = (raw_eos_chat == kEosKeyMissing) ? -1 : (int32_t)raw_eos_chat;
+        std::printf("[loader] eos_id=%d eos_chat_id=%d\n", out.eos_id, out.eos_chat_id);
+    }
+
     // Compute capture layer IDs: evenly spaced through the target layers.
     // step = (n_layer - 2) / (N - 1), ids[k] = 1 + k * step.
     {

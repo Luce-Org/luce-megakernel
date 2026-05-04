@@ -81,6 +81,17 @@ extern "C" void dflash27b_launch_bf16_to_f32(const void * src,
 
 using namespace dflash27b;
 
+// True iff `tok` matches one of the model's declared end-of-output ids
+// (loaded into TargetWeights from GGUF tokenizer metadata). Replaces the
+// previous hardcoded `tok == 248045` check at the spec-decode commit
+// sites: token 248045 is `<|im_start|>` (chat-START), not EOS, and the
+// old check truncated chat-formatted output at the natural turn boundary
+// `<|im_end|>\n<|im_start|>`. The `>= 0` guards make a missing GGUF key
+// (-1 sentinel) a never-match.
+#define IS_EOS_TOK(tok, w)                                         \
+    ( ((w).eos_chat_id >= 0 && (tok) == (w).eos_chat_id)                  \
+   || ((w).eos_id      >= 0 && (tok) == (w).eos_id     ) )
+
 // ─── Small utilities ──────────────────────────────────────────────
 
 static std::vector<int32_t> read_int32_file(const std::string & path) {
@@ -2635,7 +2646,7 @@ int main(int argc, char ** argv) {
                     ? last_tok
                     : tree.token_ids[dfs_idx - 1];
                 out_all.push_back(tok); stream_emit(tok);
-                if (tok == 248045) hit_eos = true;
+                if (IS_EOS_TOK(tok, w)) hit_eos = true;
             }
             last_tok = next_token;
 
@@ -3061,7 +3072,7 @@ int main(int argc, char ** argv) {
             bool hit_eos = false;
             for (int i = 0; i < commit_n; i++) {
                 out_all.push_back(draft_tok[i]); stream_emit(draft_tok[i]);
-                if (draft_tok[i] == 248045) hit_eos = true;
+                if (IS_EOS_TOK(draft_tok[i], w)) hit_eos = true;
             }
             if (hit_eos) break;
         } else {
@@ -3127,7 +3138,7 @@ int main(int argc, char ** argv) {
             bool hit_eos = false;
             for (int i = 0; i < commit_n; i++) {
                 out_all.push_back(replay_tok[i]); stream_emit(replay_tok[i]);
-                if (replay_tok[i] == 248045) hit_eos = true;
+                if (IS_EOS_TOK(replay_tok[i], w)) hit_eos = true;
             }
             if (hit_eos) break;
         }

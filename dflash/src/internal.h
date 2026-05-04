@@ -128,6 +128,13 @@ struct TargetWeights {
     int ssm_dt_rank             = 48;
     int ssm_n_group             = 16;
 
+    // EOS token ids loaded from the GGUF tokenizer metadata
+    // (`tokenizer.ggml.eos_token_id` and `tokenizer.ggml.eot_token_id`).
+    // -1 = key absent in this GGUF; the runtime EOS check guards both
+    // comparands with `>= 0` so the sentinel never matches a real token.
+    int32_t eos_id      = -1;
+    int32_t eos_chat_id = -1;
+
     // Target layer IDs captured for the DFlash draft model.
     // Computed from n_layer at load time: step = (n_layer - 2) / (N - 1),
     // ids[k] = 1 + k * step.  E.g. 27B→{1,16,31,46,61}, 9B→{1,8,15,22,29}.
