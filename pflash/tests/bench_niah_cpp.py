@@ -6,6 +6,19 @@ from transformers import AutoTokenizer
 from pflash.dflash_client import DflashClient
 
 
+def _alpha_or_die(raw, src):
+    """Parse + range-check alpha. The daemon silently ignores values outside
+    (0, 1) (see dflash/src/qwen3_0p6b_graph.cpp), so reject them here loudly."""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        sys.exit(f"[error] {src} is not a number: {raw!r}")
+    if not (0.0 < v < 1.0):
+        sys.exit(f"[error] {src}={v} must be in (0, 1); the daemon silently "
+                 f"ignores values outside this range.")
+    return v
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", required=True)
@@ -31,7 +44,55 @@ def main():
                     help="3-bit KV cache; saves VRAM")
     ap.add_argument("--auto-max-ctx", action="store_true",
                     help="Auto-size --max-ctx based on src tokens")
+    ap.add_argument("--bsa", type=int, choices=[0, 1], default=None,
+                    help="Enable BSA (Block-Sparse Attention) for the drafter "
+                         "scoring forward. Required for valid NIAH validation "
+                         "at long ctx. Falls back to DFLASH_FP_USE_BSA env var "
+                         "when unset.")
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="BSA block-selection threshold. Falls back to "
+                         "DFLASH_FP_ALPHA env var when unset. Validate per "
+                         "setup; e.g. alpha=0.85 fails 2/10 NIAH at 117K on "
+                         "Qwen3.6-27B / RTX 5090.")
     args = ap.parse_args()
+
+    # Resolve BSA + alpha so the daemon subprocess inherits a consistent env.
+    # CLI flags take priority over inherited env vars.
+    #
+    # The daemon enables BSA on env-var *presence* (getenv != nullptr in
+    # dflash/src/flashprefill.cpp), not value, so:
+    #   - --bsa 1 or env-var present → ensure DFLASH_FP_USE_BSA is set
+    #   - --bsa 0 (explicit disable) → POP DFLASH_FP_USE_BSA so the daemon
+    #     does not inherit it (otherwise --bsa 0 is a no-op when the user's
+    #     shell has DFLASH_FP_USE_BSA=1, or even =0 — value is ignored)
+    if args.bsa is None:
+        bsa_enabled = "DFLASH_FP_USE_BSA" in os.environ
+    else:
+        bsa_enabled = bool(args.bsa)
+
+    if args.alpha is not None:
+        alpha = _alpha_or_die(args.alpha, "--alpha")
+    elif "DFLASH_FP_ALPHA" in os.environ:
+        alpha = _alpha_or_die(os.environ["DFLASH_FP_ALPHA"], "DFLASH_FP_ALPHA")
+    else:
+        alpha = None
+
+    if bsa_enabled:
+        os.environ["DFLASH_FP_USE_BSA"] = "1"
+    else:
+        os.environ.pop("DFLASH_FP_USE_BSA", None)
+    if alpha is not None:
+        os.environ["DFLASH_FP_ALPHA"] = str(alpha)
+
+    if not bsa_enabled:
+        print("[warn] BSA disabled. NIAH validation requires BSA enabled "
+              "(--bsa 1 or DFLASH_FP_USE_BSA set in env); the WMMA fallback "
+              "path is ~3.4x slower at long ctx and silently fails NIAH.",
+              flush=True)
+    elif alpha is None:
+        print("[warn] BSA enabled but neither --alpha nor DFLASH_FP_ALPHA set; "
+              "daemon will use its hardcoded default. For reproducible "
+              "benchmarks, set --alpha explicitly.", flush=True)
 
     target_tok = AutoTokenizer.from_pretrained(args.target_tokenizer)
     drafter_tok = AutoTokenizer.from_pretrained(args.drafter_tokenizer)
