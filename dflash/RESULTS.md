@@ -326,3 +326,81 @@ Budget 12 failed all prompts with a ggml shape assertion. Budget 22 remains the
 best short-context throughput default on this 5090 build. Budget 30 produced
 the highest mean AL but lower throughput, so it is a quality-biased experiment
 rather than the base setting.
+
+## RTX 5090 (Blackwell, sm_120/sm_120a, 32 GB) — long-context NIAH
+
+> **Companion to the short-context RTX 5090 section** (HumanEval / Math500 /
+> GSM8K, added in #86). That section validates speculative decoding on
+> short prompts where PFlash compression is not engaged; this one validates
+> the full PFlash drafter scoring + ~20× compression + DFlash decode
+> pipeline at 117K tokens.
+
+Single RTX 5090 32 GB, CUDA 13.2, driver 595.58.
+Target: `unsloth/Qwen3.6-27B-GGUF` (`Qwen3.6-27B-Q4_K_M.gguf`, ~16.8 GB).
+Q4_K_M (vs Q5_K_XL in the short-context section above) leaves more
+VRAM headroom for the FP16 KV cache at 117K context.
+Draft: local Qwen3.6-27B DFlash safetensors + Qwen3-0.6B-BF16 PFlash drafter.
+
+Build: `cmake -B build-luce-sm120 -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DDFLASH27B_USER_CUDA_ARCHITECTURES=120 -DDFLASH27B_ENABLE_BSA=ON`
+
+Runtime config:
+- `keep_ratio=0.05`
+- `alpha=0.70` (with `DFLASH_FP_USE_BSA=1`)
+- `ddtree_budget=22`
+- `fa_window=4096`
+- `kv_tq3=0` (FP16 KV cache; 5090 has VRAM headroom)
+- `n_gen=1024`
+
+Test set: 10 NIAH prompts at 117K tokens (margin under Qwen3.6-27B's 131K
+native RoPE limit, generated with `niah_gen.py` at calibrated
+`char_per_tok`).
+
+### RTX 5090 long-ctx headline
+
+| Metric                 | Value                              |
+|------------------------|------------------------------------|
+| NIAH accuracy          | **20/20** across 2 runs of n=10    |
+| Decode throughput      | 210.7 t/s avg (range 179–230)      |
+| TTFT                   | 10.0 s                             |
+| Compression            | 20.2× (117064 → 5800 tokens)       |
+| Prefill (compressed)   | 3.9 s for ~5800 tokens             |
+| Drafter score+migrate  | ~5.8 s                             |
+
+### Cross-reference: budget=22 holds across context regimes
+
+The short-context budget sweep above identifies budget=22 as the
+throughput-optimal default at HumanEval-scale prompts (211.20 mean tok/s
+at AL 7.25). My long-context sweep at 117K NIAH also converges on
+budget=22:
+
+| Budget | Long-ctx NIAH @ 117K | Decode t/s |
+|:------:|:--------------------:|:----------:|
+| **22** | 10/10                | **217.4**  |
+| 28     | 10/10                | 210.7      |
+| 30     | 10/10                | 211.1      |
+
+Budget=22 is therefore a stable default for Qwen3.6-27B on Blackwell across
+both regimes, not a knob that needs per-context-length tuning.
+
+### Note on `kv_tq3`
+
+I set `kv_tq3=0` (FP16 KV cache). 3-bit KV cache trades VRAM for memory
+bandwidth; on a 5090 with 32 GB and ~22 GB peak usage at 117K, the
+bandwidth trade is not worth it. Users on 4090 or 3090 (24 GB) at this
+context length should likely keep `kv_tq3=1`.
+
+### Note on `alpha`
+
+I tested `alpha=0.60, 0.70, 0.85` at this configuration:
+
+| Alpha | NIAH    | Decode t/s |
+|:-----:|:-------:|:----------:|
+| 0.60  | 10/10   | 213.7      |
+| 0.70  | 10/10   | 210.6      |
+| 0.85  | **8/10**| 204.6      |
+
+The docs default of 0.85 fails 2 prompts at this setup. This may be
+specific to long context, Qwen3.6, or Blackwell — I have not isolated
+which. Either way, validating `alpha` per setup is recommended. I chose
+0.70 over 0.60 for reliability margin (n=10 sample; 0.60 wins decode by
+only 1.5%, below the run-to-run variance).
