@@ -156,6 +156,7 @@ struct DraftLayer {
     ggml_tensor * w_gate;
     ggml_tensor * w_up;
     ggml_tensor * w_down;
+    bool is_swa = false;  // sliding window attention (Qwen3.6 draft)
 };
 
 struct DraftWeights {
@@ -175,6 +176,7 @@ struct DraftWeights {
     int head_dim  = DFLASH27B_TARGET_HEAD_DIM;         // 128
     int n_embd    = DFLASH27B_TARGET_HIDDEN;           // 5120
     int n_ff      = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
+    int swa_window = 0;  // sliding window size (0 = full attention, 2048 for Qwen3.6 draft)
 };
 
 bool load_draft_safetensors(const std::string & path,

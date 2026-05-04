@@ -433,6 +433,64 @@ bool load_draft_safetensors(const std::string & path,
         }
     }
 
+    // ── 4b. Read config.json for SWA layer_types (Qwen3.6 draft) ──
+    {
+        // config.json sits next to model.safetensors
+        std::string dir = path;
+        auto slash = dir.find_last_of('/');
+        if (slash != std::string::npos) dir = dir.substr(0, slash);
+        std::string cfg_path = dir + "/config.json";
+        FILE * f = std::fopen(cfg_path.c_str(), "r");
+        if (f) {
+            std::fseek(f, 0, SEEK_END);
+            long flen = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            std::string cfg(flen, '\0');
+            std::fread(&cfg[0], 1, flen, f);
+            std::fclose(f);
+
+            // Parse sliding_window
+            auto sw_pos = cfg.find("\"sliding_window\"");
+            if (sw_pos != std::string::npos) {
+                auto colon = cfg.find(':', sw_pos);
+                if (colon != std::string::npos) {
+                    int sw = std::atoi(cfg.c_str() + colon + 1);
+                    if (sw > 0) out.swa_window = sw;
+                }
+            }
+
+            // Parse layer_types array
+            auto lt_pos = cfg.find("\"layer_types\"");
+            if (lt_pos != std::string::npos) {
+                auto arr_start = cfg.find('[', lt_pos);
+                auto arr_end   = cfg.find(']', arr_start);
+                if (arr_start != std::string::npos && arr_end != std::string::npos) {
+                    std::string arr = cfg.substr(arr_start, arr_end - arr_start + 1);
+                    int li = 0;
+                    size_t search_pos = 0;
+                    while (li < n_layers && search_pos < arr.size()) {
+                        auto q1 = arr.find('"', search_pos);
+                        if (q1 == std::string::npos) break;
+                        auto q2 = arr.find('"', q1 + 1);
+                        if (q2 == std::string::npos) break;
+                        std::string lt = arr.substr(q1 + 1, q2 - q1 - 1);
+                        out.layers[li].is_swa = (lt == "sliding_attention");
+                        li++;
+                        search_pos = q2 + 1;
+                    }
+                }
+            }
+
+            int n_swa = 0;
+            for (int il = 0; il < n_layers; il++) {
+                if (out.layers[il].is_swa) n_swa++;
+            }
+            if (n_swa > 0) {
+                fprintf(stderr, "[draft] SWA layers: %d/%d (window=%d)\n", n_swa, n_layers, out.swa_window);
+            }
+        }
+    }
+
     // ── 5. Allocate backend buffer, copy bytes ───────────────────
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
     if (!out.buf) { set_last_error("ggml_backend_alloc_ctx_tensors failed (draft)"); return false; }
