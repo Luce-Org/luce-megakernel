@@ -19,6 +19,8 @@
 //
 // Tunables (env vars):
 //   DFLASH_FP_USE_BSA      [0/1] enable BSA backend (default: 0).
+//   DFLASH_FP_FUSED_SELECT [0/1] compute score+select in one CUDA kernel,
+//                          avoiding full score/max scratch materialization.
 //   DFLASH_FP_ALPHA        [float in (0,1)] override FlashPrefillConfig.alpha.
 //                          Higher = stricter selection = fewer K-blocks per Q
 //                          row = faster but riskier. Default 0.12. For long
@@ -48,8 +50,9 @@ struct FlashPrefillConfig {
 // Returns 0 on success, non-zero on failure (allocator OOM, bad shape, etc.).
 // Output O is written in place.
 //
-// Scratch memory (allocated/freed per call inside): ~M*M*H*4 * 3 + M*H*4
-// where M = ceil(seq_len/block_size). At S=140K, M≈1093, H=16: ~300 MB.
+// Scratch memory (allocated/freed per call inside): default ~M*M*H*4 * 3 +
+// M*H*4 where M = ceil(seq_len/block_size). At S=140K, M≈1093, H=16:
+// ~300 MB. DFLASH_FP_FUSED_SELECT=1 skips the float score/max scratch.
 int flash_prefill_forward_bf16(
     const void * Q, const void * K, const void * V, void * O,
     int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,

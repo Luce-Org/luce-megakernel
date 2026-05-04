@@ -1,7 +1,7 @@
 // Glue between the 4 FlashPrefill steps:
 //   1. compute_mean_vector_bf16    (kernel)
-//   2. compute_block_score_bf16    (kernel)  + normalise on host
-//   3. block_select_host           (host)
+//   2. compute_block_score_bf16    (kernel), or fused score/select
+//   3. block_select                (kernel)
 //   4. sparse_flash_forward_bf16   (kernel)
 
 #include "flashprefill.h"
@@ -39,6 +39,18 @@ void launch_block_select(
     int B, int M, int N, int H,
     int attention_sink, int window, int last_n_full, float alpha,
     int s_b, int s_m, int s_n, int s_h,
+    int idx_s_b, int idx_s_m, int idx_s_n, int idx_s_h,
+    int cnt_s_b, int cnt_s_m, int cnt_s_h,
+    int32_t * idx_out, int32_t * cnt_out,
+    cudaStream_t stream);
+
+void launch_compute_block_select_bf16(
+    const void * Q, const void * mean_K, float sm_scale,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int head_dim, int block_size,
+    int attention_sink, int window, int last_n_full, float alpha,
+    int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
+    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
     int idx_s_b, int idx_s_m, int idx_s_n, int idx_s_h,
     int cnt_s_b, int cnt_s_m, int cnt_s_h,
     int32_t * idx_out, int32_t * cnt_out,
@@ -110,9 +122,10 @@ int flash_prefill_forward_bf16(
     float * dS = nullptr, * dM = nullptr;
     int32_t * dIdx = nullptr, * dCnt = nullptr;
     cudaError_t e;
+    static const bool fused_select = (std::getenv("DFLASH_FP_FUSED_SELECT") != nullptr);
     if ((e = cudaMalloc(&dmK,  (size_t)B * M * Hk * D * 2)) != cudaSuccess) goto err;  // bf16
-    if ((e = cudaMalloc(&dS,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
-    if ((e = cudaMalloc(&dM,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
+    if (!fused_select && (e = cudaMalloc(&dS, (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
+    if (!fused_select && (e = cudaMalloc(&dM, (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
     if ((e = cudaMalloc(&dIdx, (size_t)B * M * N * H * sizeof(int32_t))) != cudaSuccess) goto err;
     if ((e = cudaMalloc(&dCnt, (size_t)B * M * H * sizeof(int32_t))) != cudaSuccess) goto err;
 
@@ -127,24 +140,39 @@ int flash_prefill_forward_bf16(
         s_mK_b, s_mK_m, s_mK_h, s_mK_d, 0);
 
     if (prof) cudaEventRecord(pE[1]);
-    // 2. block scores
-    launch_compute_block_score_bf16(
-        Q, dmK, scale, dS, dM,
-        B, H, Hk, S, D, BLOCK,
-        s_Q_b, s_Q_n, s_Q_h, s_Q_d,
-        s_mK_b, s_mK_m, s_mK_h, s_mK_d,
-        s_S_b, s_S_m, s_S_n, s_S_h,
-        s_S_b, s_S_m, s_S_n, s_S_h, 0);
+    if (fused_select) {
+        // 2+3. Fused score/select. Recomputes per-block scores for the
+        // threshold pass, but avoids full B*M*N*H score/max scratch writes.
+        launch_compute_block_select_bf16(
+            Q, dmK, scale,
+            B, H, Hk, S, D, BLOCK,
+            cfg.attention_sink, cfg.window, cfg.last_n_full, cfg.alpha,
+            s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+            s_mK_b, s_mK_m, s_mK_h, s_mK_d,
+            s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+            s_cnt_b, s_cnt_m, s_cnt_h,
+            dIdx, dCnt, 0);
+        if (prof) cudaEventRecord(pE[2]);
+    } else {
+        // 2. block scores
+        launch_compute_block_score_bf16(
+            Q, dmK, scale, dS, dM,
+            B, H, Hk, S, D, BLOCK,
+            s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+            s_mK_b, s_mK_m, s_mK_h, s_mK_d,
+            s_S_b, s_S_m, s_S_n, s_S_h,
+            s_S_b, s_S_m, s_S_n, s_S_h, 0);
 
-    if (prof) cudaEventRecord(pE[2]);
-    // 3. block_select on GPU.
-    launch_block_select(
-        dS, B, M, N, H,
-        cfg.attention_sink, cfg.window, cfg.last_n_full, cfg.alpha,
-        s_S_b, s_S_m, s_S_n, s_S_h,
-        s_idx_b, s_idx_m, s_idx_n, s_idx_h,
-        s_cnt_b, s_cnt_m, s_cnt_h,
-        dIdx, dCnt, 0);
+        if (prof) cudaEventRecord(pE[2]);
+        // 3. block_select on GPU.
+        launch_block_select(
+            dS, B, M, N, H,
+            cfg.attention_sink, cfg.window, cfg.last_n_full, cfg.alpha,
+            s_S_b, s_S_m, s_S_n, s_S_h,
+            s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+            s_cnt_b, s_cnt_m, s_cnt_h,
+            dIdx, dCnt, 0);
+    }
 
     if (prof) cudaEventRecord(pE[3]);
     static const bool dump_cnt = (std::getenv("DFLASH_FP_DUMP_COUNTS") != nullptr);
@@ -188,8 +216,8 @@ int flash_prefill_forward_bf16(
         cudaEventElapsedTime(&t3, pE[2], pE[3]);
         cudaEventElapsedTime(&t4, pE[3], pE[4]);
         std::fprintf(stderr,
-            "[fp-prof] S=%d H=%d Hk=%d  mean=%.2fms  score=%.2fms  select=%.2fms  forward=%.2fms\n",
-            S, n_q_heads, n_k_heads, t1, t2, t3, t4);
+            "[fp-prof] S=%d H=%d Hk=%d  mean=%.2fms  score%s=%.2fms  select=%.2fms  forward=%.2fms\n",
+            S, n_q_heads, n_k_heads, t1, fused_select ? "+select" : "", t2, t3, t4);
         for (int i=0;i<5;i++) cudaEventDestroy(pE[i]);
     }
     cudaFree(dmK); cudaFree(dS); cudaFree(dM); cudaFree(dIdx); cudaFree(dCnt);

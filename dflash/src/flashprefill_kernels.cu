@@ -745,5 +745,182 @@ extern "C" void launch_block_select(
         idx_out, cnt_out);
 }
 
+// ---- Kernel 3b: fused block_score + block_select on GPU ----
+//
+// Opt-in prototype for DFLASH_FP_FUSED_SELECT=1. It keeps the public sparse
+// forward contract unchanged while avoiding the B*M*N*H score/max scratch
+// allocation and materialization. Each CTA owns one (B, q_block, q_head), uses
+// the same score formula as compute_block_score_kernel_bf16, finds the max in
+// a first pass, then recomputes scores for selection in sorted n order.
+
+template <int BLOCK, int D_HEAD>
+__device__ float compute_one_block_score_bf16(
+    const float (&q_reg)[D_HEAD],
+    bool q_valid,
+    const __nv_bfloat16 * __restrict__ mean_K,
+    int b, int kh, int n,
+    float sm_scale,
+    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
+    float * smem)
+{
+    const int tid = threadIdx.x;
+    float dot = -INFINITY;
+    if (q_valid) {
+        const __nv_bfloat16 * mKp = mean_K + (size_t)b * s_mK_b
+                                            + (size_t)n * s_mK_m
+                                            + (size_t)kh * s_mK_h;
+        dot = 0.0f;
+        #pragma unroll
+        for (int d = 0; d < D_HEAD; ++d) {
+            dot += q_reg[d] * __bfloat162float(mKp[(size_t)d * s_mK_d]);
+        }
+        dot *= sm_scale * 1.4426950408889634f;
+    }
+
+    smem[tid] = dot;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) smem[tid] = fmaxf(smem[tid], smem[tid + off]);
+        __syncthreads();
+    }
+    const float m_block = smem[0];
+    __syncthreads();
+
+    const float p = q_valid ? exp2f(dot - m_block) : 0.0f;
+    smem[tid] = p;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) smem[tid] += smem[tid + off];
+        __syncthreads();
+    }
+    const float p_sum = smem[0];
+    __syncthreads();
+    return p_sum;
+}
+
+template <int BLOCK, int D_HEAD>
+__global__ void compute_block_select_kernel_bf16(
+    const __nv_bfloat16 * __restrict__ Q,
+    const __nv_bfloat16 * __restrict__ mean_K,
+    float sm_scale,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int M,
+    int attention_sink, int window, int last_n_full, float alpha,
+    int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
+    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
+    int idx_s_b, int idx_s_m, int idx_s_n, int idx_s_h,
+    int cnt_s_b, int cnt_s_m, int cnt_s_h,
+    int32_t * __restrict__ idx_out,
+    int32_t * __restrict__ cnt_out)
+{
+    const int q_block_idx = blockIdx.x;
+    const int zh = blockIdx.y;
+    const int b = zh / n_q_heads;
+    const int qh = zh % n_q_heads;
+    if (b >= batch) return;
+
+    const int kh = qh * n_k_heads / n_q_heads;
+    const int tid = threadIdx.x;
+    const int q_row_global = q_block_idx * BLOCK + tid;
+    const bool q_valid = (tid < BLOCK) && (q_row_global < seq_len);
+
+    float q_reg[D_HEAD];
+    if (q_valid) {
+        const __nv_bfloat16 * Qp = Q + (size_t)b * s_Q_b
+                                      + (size_t)q_row_global * s_Q_n
+                                      + (size_t)qh * s_Q_h;
+        #pragma unroll
+        for (int d = 0; d < D_HEAD; ++d) {
+            q_reg[d] = __bfloat162float(Qp[(size_t)d * s_Q_d]);
+        }
+    } else {
+        #pragma unroll
+        for (int d = 0; d < D_HEAD; ++d) q_reg[d] = 0.0f;
+    }
+
+    extern __shared__ float smem[];
+    float max_score = -INFINITY;
+    for (int n = 0; n <= q_block_idx; ++n) {
+        const float score = compute_one_block_score_bf16<BLOCK, D_HEAD>(
+            q_reg, q_valid, mean_K, b, kh, n, sm_scale,
+            s_mK_b, s_mK_m, s_mK_h, s_mK_d, smem);
+        if (tid == 0) smem[0] = fmaxf(max_score, score);
+        __syncthreads();
+        max_score = smem[0];
+        __syncthreads();
+    }
+
+    int32_t * idxp = idx_out + (size_t)b * idx_s_b
+                             + (size_t)q_block_idx * idx_s_m
+                             + (size_t)qh * idx_s_h;
+    const bool last_full = (q_block_idx >= M - last_n_full);
+    const float thresh = max_score * alpha;
+    __shared__ int total_shared;
+    int total = 0;
+
+    for (int n = 0; n <= q_block_idx; ++n) {
+        float score = 0.0f;
+        if (!last_full) {
+            score = compute_one_block_score_bf16<BLOCK, D_HEAD>(
+                q_reg, q_valid, mean_K, b, kh, n, sm_scale,
+                s_mK_b, s_mK_m, s_mK_h, s_mK_d, smem);
+        }
+
+        if (tid == 0) {
+            const bool keep = last_full
+                || (n < attention_sink)
+                || ((q_block_idx - n) < window)
+                || (score >= thresh);
+            if (keep) {
+                idxp[(size_t)total * idx_s_n] = (int32_t)n;
+                ++total;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) total_shared = total;
+    __syncthreads();
+    total = total_shared;
+
+    for (int n = total + tid; n < M; n += BLOCK) {
+        idxp[(size_t)n * idx_s_n] = (int32_t)-1;
+    }
+    if (tid == 0) {
+        cnt_out[(size_t)b * cnt_s_b
+              + (size_t)q_block_idx * cnt_s_m
+              + (size_t)qh * cnt_s_h] = total;
+    }
+}
+
+extern "C" void launch_compute_block_select_bf16(
+    const void * Q, const void * mean_K, float sm_scale,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int head_dim, int block_size,
+    int attention_sink, int window, int last_n_full, float alpha,
+    int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
+    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
+    int idx_s_b, int idx_s_m, int idx_s_n, int idx_s_h,
+    int cnt_s_b, int cnt_s_m, int cnt_s_h,
+    int32_t * idx_out, int32_t * cnt_out,
+    cudaStream_t stream)
+{
+    const int M = (seq_len + block_size - 1) / block_size;
+    dim3 grid(M, batch * n_q_heads, 1);
+    dim3 block(block_size, 1, 1);
+    size_t smem = block_size * sizeof(float);
+    if (head_dim == 128 && block_size == 128) {
+        compute_block_select_kernel_bf16<128, 128><<<grid, block, smem, stream>>>(
+            (const __nv_bfloat16 *)Q, (const __nv_bfloat16 *)mean_K, sm_scale,
+            batch, n_q_heads, n_k_heads, seq_len, M,
+            attention_sink, window, last_n_full, alpha,
+            s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+            s_mK_b, s_mK_m, s_mK_h, s_mK_d,
+            idx_s_b, idx_s_m, idx_s_n, idx_s_h,
+            cnt_s_b, cnt_s_m, cnt_s_h,
+            idx_out, cnt_out);
+    }
+}
+
 } // namespace flashprefill
 } // namespace dflash27b

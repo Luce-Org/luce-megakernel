@@ -43,6 +43,52 @@ extern "C" void dflash27b_launch_bf16_to_f32(const void * src,
                                              void * dst,
                                              size_t n_elems,
                                              cudaStream_t stream);
+extern "C" bool dflash27b_cuda_draft_topk_logprobs_f32(const float * logits,
+                                                       int n_positions,
+                                                       int vocab,
+                                                       int K,
+                                                       float temperature,
+                                                       float * out_log_probs,
+                                                       int32_t * out_token_ids,
+                                                       cudaStream_t stream);
+extern "C" bool dflash27b_prepare_ddtree_accepted(const int * accepted,
+                                                  int count,
+                                                  cudaStream_t stream);
+extern "C" void dflash27b_launch_ddtree_compact_target_feat(
+    void * target_feat,
+    int committed,
+    int commit_n,
+    int target_feat_cap,
+    size_t col_stride,
+    size_t bytes_per_col,
+    cudaStream_t stream);
+extern "C" void dflash27b_launch_ddtree_compact_kv_pair(
+    void * k_data,
+    void * v_data,
+    int committed,
+    int commit_n,
+    int n_head_k,
+    int n_head_v,
+    size_t k_slot_stride,
+    size_t v_slot_stride,
+    size_t k_head_stride,
+    size_t v_head_stride,
+    size_t k_bytes_per_head_slot,
+    size_t v_bytes_per_head_slot,
+    cudaStream_t stream);
+extern "C" bool dflash27b_prepare_ddtree_verify_inputs(
+    int committed,
+    int past_length,
+    int win_start,
+    int N,
+    int kv_pad,
+    int q_pad,
+    const int * depths,
+    const int * parents,
+    void * positions,
+    void * parent_ids,
+    void * attn_mask,
+    cudaStream_t stream);
 
 #include <algorithm>
 #include <chrono>
@@ -116,6 +162,7 @@ static constexpr int KQ_MASK_PAD = 32;
 static int g_kq_stride_pad = KQ_MASK_PAD;   // overridden to 256 when TBQ KV is active
 static int g_max_ctx_override = 0;           // overridden by --max-ctx=N (default 4096)
 static int g_fa_window       = 2048;         // overridden by DFLASH27B_FA_WINDOW=N
+static bool g_gpu_ddtree_topk = true;        // DFLASH27B_GPU_DDTREE_TOPK=0 disables
 static int align_up(int x, int a) { return ((x + a - 1) / a) * a; }
 
 // F16 encoding for the two values we use: 0 and -inf.
@@ -832,6 +879,9 @@ int main(int argc, char ** argv) {
     if (const char * s = std::getenv("DFLASH27B_FA_WINDOW")) {
         g_fa_window = std::max(0, std::atoi(s));
     }
+    if (const char * s = std::getenv("DFLASH27B_GPU_DDTREE_TOPK")) {
+        g_gpu_ddtree_topk = (std::atoi(s) != 0);
+    }
     const char * target_path = argv[1];
     const char * draft_path  = argv[2];
     const char * prompt_path = (argc >= 6 && argv[3][0] != '-') ? argv[3] : nullptr;
@@ -861,6 +911,14 @@ int main(int argc, char ** argv) {
     bool  test_window_mode = false;
     int   stream_fd     = -1;     // write each committed token to this fd (int32 LE) as they land
     bool  daemon_mode   = false;
+    bool  gpu_ddtree_rollback = true;   // DFLASH27B_GPU_DDTREE_ROLLBACK=0 disables
+    bool  gpu_ddtree_prep = false;      // DFLASH27B_GPU_DDTREE_PREP=1
+    if (const char * s = std::getenv("DFLASH27B_GPU_DDTREE_ROLLBACK")) {
+        gpu_ddtree_rollback = (std::atoi(s) != 0);
+    }
+    if (const char * s = std::getenv("DFLASH27B_GPU_DDTREE_PREP")) {
+        gpu_ddtree_prep = (std::atoi(s) != 0);
+    }
     for (int i = 3; i < argc; i++) {
         if      (std::strcmp(argv[i], "--daemon") == 0)        daemon_mode = true;
         else if (std::strcmp(argv[i], "--seq-verify") == 0)    seq_verify = true;
@@ -932,9 +990,11 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "--fast-rollback and --seq-verify are mutually exclusive\n");
         return 2;
     }
-    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d\n",
+    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d gpu_ddtree_topk=%d gpu_ddtree_rollback=%d gpu_ddtree_prep=%d\n",
                 (int)seq_verify, (int)fast_rollback, (int)ddtree_mode,
-                ddtree_budget, ddtree_temp, (int)ddtree_chain_seed, g_fa_window);
+                ddtree_budget, ddtree_temp, (int)ddtree_chain_seed, g_fa_window,
+                (int)g_gpu_ddtree_topk, (int)gpu_ddtree_rollback,
+                (int)gpu_ddtree_prep);
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
@@ -2085,14 +2145,34 @@ int main(int argc, char ** argv) {
                 }
             } else {
                 // DDTree K>1: need real log-probs for best-first tree scoring.
-                // Transfer full logits for positions 1..q_len-1.
-                ggml_backend_tensor_get(sg.logits, draft_logits_buf.data(), 0,
-                                        sizeof(float) * vocab * q_len);
-                extract_draft_topk(draft_logits_buf.data() + (size_t)vocab,
-                                   L, vocab, ddtree_K,
-                                   ddtree_top_log_probs.data(),
-                                   ddtree_top_token_ids.data(),
-                                   ddtree_temp);
+                // Optional CUDA path avoids transferring q_len*vocab logits to
+                // host; it returns only L*K ids/log-probs for positions 1..L.
+                bool topk_done = false;
+                if (g_gpu_ddtree_topk && ddtree_K == 8 && sg.logits && sg.logits->data) {
+                    const float * logits_dev = (const float *)sg.logits->data + (size_t)vocab;
+                    topk_done = dflash27b_cuda_draft_topk_logprobs_f32(
+                        logits_dev, L, vocab, ddtree_K, ddtree_temp,
+                        ddtree_top_log_probs.data(),
+                        ddtree_top_token_ids.data(),
+                        nullptr);
+                    static bool warned_topk_fallback = false;
+                    if (!topk_done && !warned_topk_fallback) {
+                        std::fprintf(stderr,
+                                     "[ddtree] GPU top-K failed; falling back to CPU logits copy\n");
+                        warned_topk_fallback = true;
+                    }
+                }
+                if (!topk_done) {
+                    // CPU fallback unchanged: transfer full logits for
+                    // positions 1..q_len-1 and extract top-K on host.
+                    ggml_backend_tensor_get(sg.logits, draft_logits_buf.data(), 0,
+                                            sizeof(float) * vocab * q_len);
+                    extract_draft_topk(draft_logits_buf.data() + (size_t)vocab,
+                                       L, vocab, ddtree_K,
+                                       ddtree_top_log_probs.data(),
+                                       ddtree_top_token_ids.data(),
+                                       ddtree_temp);
+                }
             }
         }
         auto T_draft_logits = sync_us();
@@ -2170,33 +2250,53 @@ int main(int argc, char ** argv) {
             ggml_backend_tensor_set(sg.inp_embed, tree_embed.data(), 0,
                                     sizeof(float) * hidden * N);
 
-            // M-RoPE axis-major positions: committed + depth_of_node.
-            // Slot 0 = root = depth 0 → position `committed`.
-            std::vector<int32_t> pos4(4 * N);
-            for (int i = 0; i < N; i++) {
-                int p = committed + (i == 0 ? 0 : tree.depths[i - 1]);
-                pos4[0 * N + i] = p;
-                pos4[1 * N + i] = p;
-                pos4[2 * N + i] = p;
-                pos4[3 * N + i] = 0;
-            }
-            ggml_backend_tensor_set(sg.positions, pos4.data(), 0, sizeof(int32_t) * 4 * N);
-
-            // Ancestor-only attention mask (f16).
             const int tree_win_start = (g_fa_window > 0 && committed > g_fa_window)
                                            ? (committed - g_fa_window) : 0;
-            build_tree_mask(tree, /*past_length=*/committed, mask_buf, tree_win_start);
-            ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
-                                    sizeof(uint16_t) * mask_buf.size());
+            bool prep_done = false;
+            if (gpu_ddtree_prep && sg.positions && sg.positions->data &&
+                sg.parent_ids && sg.parent_ids->data &&
+                sg.attn_mask && sg.attn_mask->data) {
+                const int kv_pad = (int)sg.attn_mask->ne[0];
+                const int q_pad  = (int)sg.attn_mask->ne[1];
+                prep_done = dflash27b_prepare_ddtree_verify_inputs(
+                    committed, committed, tree_win_start, N, kv_pad, q_pad,
+                    tree.depths.data(), tree.parents.data(),
+                    sg.positions->data, sg.parent_ids->data, sg.attn_mask->data,
+                    nullptr);
+                static bool warned_prep_fallback = false;
+                if (!prep_done && !warned_prep_fallback) {
+                    std::fprintf(stderr,
+                                 "[ddtree] GPU verify prep failed; falling back to CPU tensor uploads\n");
+                    warned_prep_fallback = true;
+                }
+            }
+            if (!prep_done) {
+                // M-RoPE axis-major positions: committed + depth_of_node.
+                // Slot 0 = root = depth 0 -> position `committed`.
+                std::vector<int32_t> pos4(4 * N);
+                for (int i = 0; i < N; i++) {
+                    int p = committed + (i == 0 ? 0 : tree.depths[i - 1]);
+                    pos4[0 * N + i] = p;
+                    pos4[1 * N + i] = p;
+                    pos4[2 * N + i] = p;
+                    pos4[3 * N + i] = 0;
+                }
+                ggml_backend_tensor_set(sg.positions, pos4.data(), 0, sizeof(int32_t) * 4 * N);
 
-            // parent_ids for tree-mode DeltaNet kernel.
-            // Slot 0 (root): -1 (reload initial state — matches kernel's skip
-            // at t==0). Slots 1..N-1: the tree's parent index in the flat array.
-            std::vector<int32_t> parent_ids(N);
-            parent_ids[0] = -1;
-            for (int i = 1; i < N; i++) parent_ids[i] = (int32_t)tree.parents[i];
-            ggml_backend_tensor_set(sg.parent_ids, parent_ids.data(), 0,
-                                    sizeof(int32_t) * N);
+                // Ancestor-only attention mask (f16).
+                build_tree_mask(tree, /*past_length=*/committed, mask_buf, tree_win_start);
+                ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                        sizeof(uint16_t) * mask_buf.size());
+
+                // parent_ids for tree-mode DeltaNet kernel.
+                // Slot 0 (root): -1 (reload initial state; matches kernel's
+                // skip at t==0). Slots 1..N-1: tree parent in flat order.
+                std::vector<int32_t> parent_ids(N);
+                parent_ids[0] = -1;
+                for (int i = 1; i < N; i++) parent_ids[i] = (int32_t)tree.parents[i];
+                ggml_backend_tensor_set(sg.parent_ids, parent_ids.data(), 0,
+                                        sizeof(int32_t) * N);
+            }
 
             T_verify_set = sync_us();
             tt_verify_set += std::chrono::duration<double, std::micro>(T_verify_set - T_verify_build).count();
@@ -2294,6 +2394,13 @@ int main(int argc, char ** argv) {
             {
                 const int n_delta = (int)sg.delta_captures.size();
                 cudaStream_t stream = nullptr;
+                bool use_gpu_ddtree_rollback =
+                    gpu_ddtree_rollback && commit_n > 1 &&
+                    dflash27b_prepare_ddtree_accepted(accepted.data(), commit_n, stream);
+                if (gpu_ddtree_rollback && commit_n > 1 && !use_gpu_ddtree_rollback) {
+                    std::fprintf(stderr,
+                                 "ddtree gpu rollback accepted[] upload failed; using memcpy fallback\n");
+                }
                 for (int il = 0; il < n_delta; il++) {
                     const DeltaNetCapture & cap = sg.delta_captures[il];
                     if (!cap.ssm_intermediate_states || !cap.conv_input) {
@@ -2383,17 +2490,29 @@ int main(int argc, char ** argv) {
                     const int    fc_in = (int)cache.target_feat->ne[0];  // 5*hidden
                     const size_t col_stride = cache.target_feat->nb[1];
                     const int    tcap = cache.target_feat_cap;
-                    for (int d = 1; d < commit_n; d++) {
-                        const int src_dfs = accepted[d];
-                        if (src_dfs == d) continue;
-                        const int    src_slot = (committed + src_dfs) % tcap;
-                        const int    dst_slot = (committed + d)       % tcap;
-                        const size_t src_off  = (size_t)src_slot * col_stride;
-                        const size_t dst_off  = (size_t)dst_slot * col_stride;
-                        cudaMemcpyAsync((char *)cache.target_feat->data + dst_off,
-                                        (const char *)cache.target_feat->data + src_off,
-                                        (size_t)fc_in * elt,
-                                        cudaMemcpyDeviceToDevice, stream);
+                    if (use_gpu_ddtree_rollback) {
+                        dflash27b_launch_ddtree_compact_target_feat(
+                            cache.target_feat->data, committed, commit_n, tcap,
+                            col_stride, (size_t)fc_in * elt, stream);
+                        cudaError_t ce = cudaGetLastError();
+                        if (ce != cudaSuccess) {
+                            std::fprintf(stderr, "ddtree target_feat compact kernel: %s\n",
+                                         cudaGetErrorString(ce));
+                            return 1;
+                        }
+                    } else {
+                        for (int d = 1; d < commit_n; d++) {
+                            const int src_dfs = accepted[d];
+                            if (src_dfs == d) continue;
+                            const int    src_slot = (committed + src_dfs) % tcap;
+                            const int    dst_slot = (committed + d)       % tcap;
+                            const size_t src_off  = (size_t)src_slot * col_stride;
+                            const size_t dst_off  = (size_t)dst_slot * col_stride;
+                            cudaMemcpyAsync((char *)cache.target_feat->data + dst_off,
+                                            (const char *)cache.target_feat->data + src_off,
+                                            (size_t)fc_in * elt,
+                                            cudaMemcpyDeviceToDevice, stream);
+                        }
                     }
                 }
 
@@ -2406,31 +2525,51 @@ int main(int argc, char ** argv) {
                 // DFS slot accepted[d]. d==0 is always the root (DFS slot 0),
                 // trivially aligned. For d>=1, copy if accepted[d] != d.
                 const int n_full_attn = (int)cache.attn_k.size();
-                for (int d = 0; d < commit_n; d++) {
-                    const int src_dfs = accepted[d];
-                    const int dst_slot = d;
-                    if (src_dfs == dst_slot) continue;  // already aligned
+                if (use_gpu_ddtree_rollback) {
                     for (int l = 0; l < n_full_attn; l++) {
-                        // Each slot: head_dim * n_kv floats in f16 per tensor.
                         ggml_tensor * ck = cache.attn_k[l];
                         ggml_tensor * cv = cache.attn_v[l];
-                        const size_t slot_bytes = ck->nb[1];  // stride between slots
-                        const size_t src_off = (size_t)(committed + src_dfs) * slot_bytes;
-                        const size_t dst_off = (size_t)(committed + dst_slot) * slot_bytes;
-                        // Per-head-kv layout: shape [head_dim, max_ctx, n_head_kv].
-                        // nb[2] is distance between heads; we copy one slot's
-                        // slice per head. For simplicity, do a 2D copy across
-                        // the head dimension.
-                        const int n_kv = (int)ck->ne[2];
-                        for (int h = 0; h < n_kv; h++) {
-                            const size_t head_src = src_off + (size_t)h * ck->nb[2];
-                            const size_t head_dst = dst_off + (size_t)h * ck->nb[2];
-                            cudaMemcpyAsync((char *)ck->data + head_dst,
-                                            (const char *)ck->data + head_src,
-                                            slot_bytes, cudaMemcpyDeviceToDevice, stream);
-                            cudaMemcpyAsync((char *)cv->data + head_dst,
-                                            (const char *)cv->data + head_src,
-                                            slot_bytes, cudaMemcpyDeviceToDevice, stream);
+                        dflash27b_launch_ddtree_compact_kv_pair(
+                            ck->data, cv->data, committed, commit_n,
+                            (int)ck->ne[2], (int)cv->ne[2],
+                            ck->nb[1], cv->nb[1],
+                            ck->nb[2], cv->nb[2],
+                            ck->nb[1], cv->nb[1],
+                            stream);
+                    }
+                    cudaError_t ce = cudaGetLastError();
+                    if (ce != cudaSuccess) {
+                        std::fprintf(stderr, "ddtree KV compact kernel: %s\n",
+                                     cudaGetErrorString(ce));
+                        return 1;
+                    }
+                } else {
+                    for (int d = 0; d < commit_n; d++) {
+                        const int src_dfs = accepted[d];
+                        const int dst_slot = d;
+                        if (src_dfs == dst_slot) continue;  // already aligned
+                        for (int l = 0; l < n_full_attn; l++) {
+                            // Each slot: head_dim * n_kv floats in f16 per tensor.
+                            ggml_tensor * ck = cache.attn_k[l];
+                            ggml_tensor * cv = cache.attn_v[l];
+                            const size_t slot_bytes = ck->nb[1];  // stride between slots
+                            const size_t src_off = (size_t)(committed + src_dfs) * slot_bytes;
+                            const size_t dst_off = (size_t)(committed + dst_slot) * slot_bytes;
+                            // Per-head-kv layout: shape [head_dim, max_ctx, n_head_kv].
+                            // nb[2] is distance between heads; we copy one slot's
+                            // slice per head. For simplicity, do a 2D copy across
+                            // the head dimension.
+                            const int n_kv = (int)ck->ne[2];
+                            for (int h = 0; h < n_kv; h++) {
+                                const size_t head_src = src_off + (size_t)h * ck->nb[2];
+                                const size_t head_dst = dst_off + (size_t)h * ck->nb[2];
+                                cudaMemcpyAsync((char *)ck->data + head_dst,
+                                                (const char *)ck->data + head_src,
+                                                slot_bytes, cudaMemcpyDeviceToDevice, stream);
+                                cudaMemcpyAsync((char *)cv->data + head_dst,
+                                                (const char *)cv->data + head_src,
+                                                slot_bytes, cudaMemcpyDeviceToDevice, stream);
+                            }
                         }
                     }
                 }

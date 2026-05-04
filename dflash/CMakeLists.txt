@@ -67,6 +67,7 @@ add_library(dflash27b STATIC
     src/kv_cache.cpp
     src/kv_quant.cpp
     src/f16_convert.cu
+    src/ddtree_topk.cu
     src/delta_net_chunked.cpp
 )
 # FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+). On Turing (sm_75)

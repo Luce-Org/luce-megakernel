@@ -40,6 +40,28 @@ void launch_compute_block_score_bf16(
     int s_M_b, int s_M_m, int s_M_n, int s_M_h,
     cudaStream_t stream);
 
+void launch_block_select(
+    const float * score,
+    int B, int M, int N, int H,
+    int attention_sink, int window, int last_n_full, float alpha,
+    int s_b, int s_m, int s_n, int s_h,
+    int idx_s_b, int idx_s_m, int idx_s_n, int idx_s_h,
+    int cnt_s_b, int cnt_s_m, int cnt_s_h,
+    int32_t * idx_out, int32_t * cnt_out,
+    cudaStream_t stream);
+
+void launch_compute_block_select_bf16(
+    const void * Q, const void * mean_K, float sm_scale,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int head_dim, int block_size,
+    int attention_sink, int window, int last_n_full, float alpha,
+    int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
+    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
+    int idx_s_b, int idx_s_m, int idx_s_n, int idx_s_h,
+    int cnt_s_b, int cnt_s_m, int cnt_s_h,
+    int32_t * idx_out, int32_t * cnt_out,
+    cudaStream_t stream);
+
 void launch_sparse_flash_forward_bf16(
     const void * Q, const void * K, const void * V, void * O,
     const int32_t * block_index, const int32_t * counts,
@@ -149,6 +171,42 @@ int main() {
         s_S_b, s_S_m, s_S_n, s_S_h, 0);
     CK(cudaDeviceSynchronize());
     std::printf("[fp-test] kernel 2 (compute_block_score): launch ok\n");
+
+    // Kernel 3b prototype: fused score+select should match the existing
+    // score materialization followed by GPU block_select.
+    int32_t *dIdx_ref, *dCnt_ref, *dIdx_fused, *dCnt_fused;
+    CK(cudaMalloc(&dIdx_ref, B * M * M * H * sizeof(int32_t)));
+    CK(cudaMalloc(&dCnt_ref, B * M * H * sizeof(int32_t)));
+    CK(cudaMalloc(&dIdx_fused, B * M * M * H * sizeof(int32_t)));
+    CK(cudaMalloc(&dCnt_fused, B * M * H * sizeof(int32_t)));
+    launch_block_select(
+        dS, B, M, M, H,
+        1, 1, 1, 0.12f,
+        s_S_b, s_S_m, s_S_n, s_S_h,
+        s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+        s_cnt_b, s_cnt_m, s_cnt_h,
+        dIdx_ref, dCnt_ref, 0);
+    launch_compute_block_select_bf16(
+        dQ, dmK, scale,
+        B, H, Hk, S, D, BLOCK,
+        1, 1, 1, 0.12f,
+        s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+        s_mK_b, s_mK_m, s_mK_h, s_mK_d,
+        s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+        s_cnt_b, s_cnt_m, s_cnt_h,
+        dIdx_fused, dCnt_fused, 0);
+    CK(cudaDeviceSynchronize());
+    std::vector<int32_t> idx_ref(B * M * M * H), cnt_ref(B * M * H);
+    std::vector<int32_t> idx_fused(B * M * M * H), cnt_fused(B * M * H);
+    CK(cudaMemcpy(idx_ref.data(), dIdx_ref, idx_ref.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(cnt_ref.data(), dCnt_ref, cnt_ref.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(idx_fused.data(), dIdx_fused, idx_fused.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(cnt_fused.data(), dCnt_fused, cnt_fused.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    bool select_match = (idx_ref == idx_fused) && (cnt_ref == cnt_fused);
+    std::printf("[fp-test] kernel 3b (fused score+select): %s\n",
+                select_match ? "PASS" : "FAIL");
+    if (!select_match) return 1;
+    cudaFree(dIdx_ref); cudaFree(dCnt_ref); cudaFree(dIdx_fused); cudaFree(dCnt_fused);
 
     // ── Kernel 4: sparse_flash_forward (full selection = dense FA) ──
     // Set indices to [0, 1, ..., M-1] for each (b, q_block, h), counts=M
