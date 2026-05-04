@@ -34,9 +34,7 @@
 #include "internal.h"
 #include "flashprefill.h"
 
-#if DFLASH27B_MIN_SM >= 80
-#include <cuda_runtime.h>
-#endif
+#include "device_runtime.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -47,6 +45,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -54,13 +53,46 @@ namespace dflash27b {
 
 namespace {
 
-constexpr int CHUNK_S    = 4096;
 constexpr int FA_WINDOW  = 512;
+
+int chunk_s_ff() {
+    if (const char * e = std::getenv("DFLASH_FP_CHUNK_S")) {
+        int v = std::atoi(e);
+        if (v >= 1024) return v;
+    }
+#if defined(DFLASH27B_USE_HIP)
+    return 1024;
+#else
+    return 4096;
+#endif
+}
 
 struct PersBuf {
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     ggml_tensor *         t   = nullptr;
+};
+
+struct HipChunkGraphB {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+
+    ggml_tensor * h_in     = nullptr;
+    ggml_tensor * attn_in  = nullptr;
+    ggml_tensor * h_after  = nullptr;
+    ggml_tensor * hf       = nullptr;
+    ggml_tensor * gate     = nullptr;
+    ggml_tensor * up       = nullptr;
+    ggml_tensor * gu       = nullptr;
+    ggml_tensor * ffn_out  = nullptr;
+    ggml_tensor * h_next   = nullptr;
+
+    ggml_cgraph * gf_proj_add = nullptr;
+    ggml_cgraph * gf_gate     = nullptr;
+    ggml_cgraph * gf_up       = nullptr;
+    ggml_cgraph * gf_mul      = nullptr;
+    ggml_cgraph * gf_down     = nullptr;
+    ggml_cgraph * gf_add_out  = nullptr;
 };
 
 bool make_pers(ggml_backend_t backend, ggml_type type, int n_dim,
@@ -84,6 +116,108 @@ void free_pers(PersBuf & p) {
     if (p.ctx) { ggml_free(p.ctx); p.ctx = nullptr; }
     p.t = nullptr;
 }
+
+void free_hip_chunk_graph_b(HipChunkGraphB & g) {
+    if (g.buf) {
+        ggml_backend_buffer_free(g.buf);
+        g.buf = nullptr;
+    }
+    if (g.ctx) {
+        ggml_free(g.ctx);
+        g.ctx = nullptr;
+    }
+    g = {};
+}
+
+#if defined(DFLASH27B_USE_HIP)
+bool build_hip_chunk_graph_b(const Qwen3DrafterLayer & L,
+                             ggml_backend_t backend,
+                             int hidden,
+                             int q_dim,
+                             int chunk,
+                             float eps,
+                             HipChunkGraphB & out) {
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 128
+                  + ggml_graph_overhead_custom(1024, false) * 6
+                  + 256 * 1024;
+    ip.no_alloc = true;
+    out.ctx = ggml_init(ip);
+    if (!out.ctx) return false;
+
+    out.h_in = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, hidden, chunk);
+    out.attn_in = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, q_dim, chunk);
+    ggml_set_input(out.h_in);
+    ggml_set_input(out.attn_in);
+
+    ggml_tensor * attn_proj = ggml_mul_mat(out.ctx, L.wo, out.attn_in);
+    out.h_after = ggml_add(out.ctx, out.h_in, attn_proj);
+    ggml_set_output(out.h_after);
+    out.gf_proj_add = ggml_new_graph_custom(out.ctx, 1024, false);
+    ggml_build_forward_expand(out.gf_proj_add, out.h_after);
+
+    out.hf = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, hidden, chunk);
+    ggml_set_input(out.hf);
+
+    out.gate = ggml_mul_mat(out.ctx, L.ffn_gate, out.hf);
+    out.gate = ggml_silu(out.ctx, out.gate);
+    ggml_set_output(out.gate);
+    out.gf_gate = ggml_new_graph_custom(out.ctx, 1024, false);
+    ggml_build_forward_expand(out.gf_gate, out.gate);
+
+    out.up = ggml_mul_mat(out.ctx, L.ffn_up, out.hf);
+    ggml_set_output(out.up);
+    out.gf_up = ggml_new_graph_custom(out.ctx, 1024, false);
+    ggml_build_forward_expand(out.gf_up, out.up);
+
+    out.gu = ggml_mul(out.ctx, out.gate, out.up);
+    ggml_set_output(out.gu);
+    out.gf_mul = ggml_new_graph_custom(out.ctx, 1024, false);
+    ggml_build_forward_expand(out.gf_mul, out.gu);
+
+    out.ffn_out = ggml_mul_mat(out.ctx, L.ffn_down, out.gu);
+    ggml_set_output(out.ffn_out);
+    out.gf_down = ggml_new_graph_custom(out.ctx, 1024, false);
+    ggml_build_forward_expand(out.gf_down, out.ffn_out);
+
+    out.h_next = ggml_add(out.ctx, out.h_after, out.ffn_out);
+    ggml_set_output(out.h_next);
+    out.gf_add_out = ggml_new_graph_custom(out.ctx, 1024, false);
+    ggml_build_forward_expand(out.gf_add_out, out.h_next);
+
+    out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
+    if (!out.buf) {
+        return false;
+    }
+
+    return true;
+}
+
+void warm_hip_chunk_graph_b_once(ggml_backend_t backend, HipChunkGraphB & out) {
+    static bool warmed = false;
+    if (warmed) {
+        return;
+    }
+
+    struct ggml_tensor * warm_tensors[] = {
+        out.h_in, out.attn_in, out.h_after, out.hf, out.gate, out.up, out.gu, out.ffn_out, out.h_next,
+    };
+    for (ggml_tensor * t : warm_tensors) {
+        cudaError_t e = cudaMemset(t->data, 0, ggml_nbytes(t));
+        if (e != cudaSuccess) {
+            return;
+        }
+    }
+
+    ggml_backend_graph_compute(backend, out.gf_proj_add);
+    ggml_backend_graph_compute(backend, out.gf_gate);
+    ggml_backend_graph_compute(backend, out.gf_up);
+    ggml_backend_graph_compute(backend, out.gf_mul);
+    ggml_backend_graph_compute(backend, out.gf_down);
+    ggml_backend_graph_compute(backend, out.gf_add_out);
+    warmed = true;
+}
+#endif
 
 inline uint16_t f32_to_f16(float f) {
     uint32_t bits;
@@ -230,18 +364,26 @@ bool forward_qwen3_0p6b_drafter(
         if (v > 0.0f && v < 1.0f) fp_cfg.alpha = v;
     }
     auto t_total_start = std::chrono::steady_clock::now();
-    double t_compute_a = 0.0, t_compute_b = 0.0, t_fp = 0.0;
+    double t_a_setup = 0.0, t_a_alloc = 0.0, t_compute_a = 0.0;
+    double t_b_warm = 0.0, t_b_setup = 0.0, t_b_alloc = 0.0, t_b_copy_in = 0.0, t_b_norm = 0.0, t_compute_b = 0.0, t_b_copy_out = 0.0;
+    double t_fp = 0.0;
 
     for (int il = 0; il < w.n_layer; ++il) {
         const auto & L = w.layers[il];
+        const bool debug_first_layer = (il == 0 && std::getenv("DFLASH_FP_DEBUG_LAYER0") != nullptr);
 
         // ── Graph A (chunked): norm + Q/K/V proj + RoPE + copy to persistent K_curr/V_curr/Q_buf ──
         // ggml-cuda RoPE/element-wise kernels hit `invalid configuration argument` when
         // an op operates over more than ~65K rows in y/z. Chunk loop keeps every per-row
         // ggml op under that cap; FP CUDA kernel still runs once over full S below.
-        constexpr int CHUNK_S = 32768;
-        for (int cs = 0; cs < S; cs += CHUNK_S) {
-            const int cl = std::min(CHUNK_S, S - cs);
+        const int chunk_s_ff_v = chunk_s_ff();
+        for (int cs = 0; cs < S; cs += chunk_s_ff_v) {
+            const int cl = std::min(chunk_s_ff_v, S - cs);
+            if (debug_first_layer) {
+                std::fprintf(stderr, "[qwen3-0.6b-fp dbg] layer0 chunk A start cs=%d cl=%d\n", cs, cl);
+                std::fflush(stderr);
+            }
+            auto tA_setup0 = std::chrono::steady_clock::now();
 
             ggml_init_params ipA{};
             ipA.mem_size = ggml_tensor_overhead() * 64
@@ -309,15 +451,29 @@ bool forward_qwen3_0p6b_drafter(
                     ggml_cpy(gA, Q_tail_local, Q_last_v[il].t));
             }
 
+            auto tA_setup1 = std::chrono::steady_clock::now();
+            t_a_setup += std::chrono::duration<double>(tA_setup1 - tA_setup0).count();
+
+            auto tA_alloc0 = std::chrono::steady_clock::now();
             if (!ggml_gallocr_alloc_graph(galloc, gfA)) {
                 set_last_error("graph A alloc failed at layer " + std::to_string(il));
                 ggml_free(gA); ggml_gallocr_free(galloc); cleanup_all(); return false;
             }
+            auto tA_alloc1 = std::chrono::steady_clock::now();
+            t_a_alloc += std::chrono::duration<double>(tA_alloc1 - tA_alloc0).count();
             auto tA0 = std::chrono::steady_clock::now();
             ggml_backend_graph_compute(w.backend, gfA);
             ggml_backend_synchronize(w.backend);
             auto tA1 = std::chrono::steady_clock::now();
             t_compute_a += std::chrono::duration<double>(tA1 - tA0).count();
+            if (debug_first_layer) {
+                std::fprintf(stderr,
+                             "[qwen3-0.6b-fp dbg] layer0 chunk A done setup=%.3fs alloc=%.3fs compute=%.3fs\n",
+                             std::chrono::duration<double>(tA_setup1 - tA_setup0).count(),
+                             std::chrono::duration<double>(tA_alloc1 - tA_alloc0).count(),
+                             std::chrono::duration<double>(tA1 - tA0).count());
+                std::fflush(stderr);
+            }
             ggml_free(gA);
         }
 
@@ -369,57 +525,211 @@ bool forward_qwen3_0p6b_drafter(
         }
         auto tF1 = std::chrono::steady_clock::now();
         t_fp += std::chrono::duration<double>(tF1 - tF0).count();
+        if (debug_first_layer) {
+            std::fprintf(stderr, "[qwen3-0.6b-fp dbg] layer0 FP done compute=%.3fs\n",
+                         std::chrono::duration<double>(tF1 - tF0).count());
+            std::fflush(stderr);
+        }
 
-        // ── Graph B (chunked): o_proj + residual + ffn + write hidden_buf ──
-        for (int cs = 0; cs < S; cs += CHUNK_S) {
-            const int cl = std::min(CHUNK_S, S - cs);
+        // ── Graph B (chunked, reusable): o_proj + residual + ffn + write hidden_buf ──
+#if defined(DFLASH27B_USE_HIP)
+        auto tB_setup0 = std::chrono::steady_clock::now();
+        HipChunkGraphB gb{};
+        if (!build_hip_chunk_graph_b(L, w.backend, hidden, D * H, chunk_s_ff_v, eps, gb)) {
+            set_last_error("graph B reusable build failed at layer " + std::to_string(il));
+            ggml_gallocr_free(galloc); cleanup_all(); return false;
+        }
+        std::vector<float> ffn_norm_cpu((size_t)hidden);
+        ggml_backend_tensor_get(L.ffn_norm, ffn_norm_cpu.data(), 0, ffn_norm_cpu.size() * sizeof(float));
+        std::vector<float> h_after_cpu((size_t)hidden * chunk_s_ff_v);
+        std::vector<float> hf_cpu((size_t)hidden * chunk_s_ff_v);
+        auto tB_setup1 = std::chrono::steady_clock::now();
+        t_b_setup += std::chrono::duration<double>(tB_setup1 - tB_setup0).count();
+        if (debug_first_layer) {
+            std::fprintf(stderr,
+                         "[qwen3-0.6b-fp dbg] layer0 graph B reusable setup+alloc done setup=%.3fs\n",
+                         std::chrono::duration<double>(tB_setup1 - tB_setup0).count());
+            std::fflush(stderr);
+        }
 
+        auto tB_warm0 = std::chrono::steady_clock::now();
+        warm_hip_chunk_graph_b_once(w.backend, gb);
+        auto tB_warm1 = std::chrono::steady_clock::now();
+        t_b_warm += std::chrono::duration<double>(tB_warm1 - tB_warm0).count();
+        if (debug_first_layer) {
+            std::fprintf(stderr,
+                         "[qwen3-0.6b-fp dbg] layer0 graph B warmup=%.3fs\n",
+                         std::chrono::duration<double>(tB_warm1 - tB_warm0).count());
+            std::fflush(stderr);
+        }
+
+        for (int cs = 0; cs < S; cs += chunk_s_ff_v) {
+            const int cl = std::min(chunk_s_ff_v, S - cs);
+            if (debug_first_layer) {
+                std::fprintf(stderr, "[qwen3-0.6b-fp dbg] layer0 chunk B start cs=%d cl=%d\n", cs, cl);
+                std::fflush(stderr);
+            }
+
+            const size_t h_esz = ggml_element_size(hidden_buf.t);
+            const size_t a_esz = ggml_element_size(attn_out_buf.t);
+            const size_t h_bytes = (size_t)hidden * cl * sizeof(float);
+            const size_t a_bytes = (size_t)(D * H) * cl * a_esz;
+            const char * h_src = (const char *)hidden_buf.t->data + (size_t)cs * hidden * h_esz;
+            const char * a_src = (const char *)attn_out_buf.t->data + (size_t)cs * (D * H) * a_esz;
+
+            auto tB_copy_in0 = std::chrono::steady_clock::now();
+            cudaError_t copy_h_in_e = cudaMemcpy(gb.h_in->data, h_src, h_bytes, cudaMemcpyDeviceToDevice);
+            if (copy_h_in_e != cudaSuccess) {
+                set_last_error(std::string("graph B hidden copy-in failed at layer ") + std::to_string(il) + ": " + cudaGetErrorString(copy_h_in_e));
+                free_hip_chunk_graph_b(gb);
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
+            cudaError_t copy_a_in_e = cudaMemcpy(gb.attn_in->data, a_src, a_bytes, cudaMemcpyDeviceToDevice);
+            if (copy_a_in_e != cudaSuccess) {
+                set_last_error(std::string("graph B attn copy-in failed at layer ") + std::to_string(il) + ": " + cudaGetErrorString(copy_a_in_e));
+                free_hip_chunk_graph_b(gb);
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
+            auto tB_copy_in1 = std::chrono::steady_clock::now();
+            t_b_copy_in += std::chrono::duration<double>(tB_copy_in1 - tB_copy_in0).count();
+            if (debug_first_layer) {
+                std::fprintf(stderr,
+                             "[qwen3-0.6b-fp dbg] layer0 chunk B copy-in done copy=%.3fs\n",
+                             std::chrono::duration<double>(tB_copy_in1 - tB_copy_in0).count());
+                std::fflush(stderr);
+            }
+
+            if (debug_first_layer && cs == 6144) {
+                std::vector<float> h_dbg((size_t)hidden * cl);
+                ggml_backend_tensor_get(gb.h_in, h_dbg.data(), 0, h_dbg.size() * sizeof(float));
+                float h_min = std::numeric_limits<float>::infinity();
+                float h_max = -std::numeric_limits<float>::infinity();
+                size_t h_nonfinite = 0;
+                for (float v : h_dbg) {
+                    if (!std::isfinite(v)) {
+                        ++h_nonfinite;
+                        continue;
+                    }
+                    h_min = std::min(h_min, v);
+                    h_max = std::max(h_max, v);
+                }
+                std::fprintf(stderr,
+                             "[qwen3-0.6b-fp dbg] layer0 chunk6144 h_in stats min=%g max=%g nonfinite=%zu/%zu\n",
+                             h_min, h_max, h_nonfinite, h_dbg.size());
+                std::fflush(stderr);
+            }
+
+            auto tB_norm0 = std::chrono::steady_clock::now();
+            ggml_backend_tensor_get(gb.h_after, h_after_cpu.data(), 0, h_bytes);
+            for (int tok_idx = 0; tok_idx < cl; ++tok_idx) {
+                const size_t base = (size_t)tok_idx * hidden;
+                double sumsq = 0.0;
+                for (int i = 0; i < hidden; ++i) {
+                    const float v = h_after_cpu[base + i];
+                    sumsq += (double) v * (double) v;
+                }
+                const float inv = 1.0f / std::sqrt((float)(sumsq / hidden) + eps);
+                for (int i = 0; i < hidden; ++i) {
+                    hf_cpu[base + i] = h_after_cpu[base + i] * inv * ffn_norm_cpu[(size_t)i];
+                }
+            }
+            ggml_backend_tensor_set(gb.hf, hf_cpu.data(), 0, h_bytes);
+            auto tB_norm1 = std::chrono::steady_clock::now();
+            t_b_norm += std::chrono::duration<double>(tB_norm1 - tB_norm0).count();
+
+            auto tB0 = std::chrono::steady_clock::now();
+            double proj_s = 0, gate_s = 0, up_s = 0, mul_s = 0, down_s = 0, add_s = 0;
+            auto one = [&](ggml_cgraph * gf, double & acc) {
+                auto ts0 = std::chrono::steady_clock::now();
+                ggml_backend_graph_compute(w.backend, gf);
+                auto ts1 = std::chrono::steady_clock::now();
+                acc = std::chrono::duration<double>(ts1 - ts0).count();
+            };
+            one(gb.gf_proj_add, proj_s);
+            one(gb.gf_gate, gate_s);
+            one(gb.gf_up, up_s);
+            one(gb.gf_mul, mul_s);
+            one(gb.gf_down, down_s);
+            one(gb.gf_add_out, add_s);
+            auto tB1 = std::chrono::steady_clock::now();
+            t_compute_b += std::chrono::duration<double>(tB1 - tB0).count();
+
+            auto tB_copy_out0 = std::chrono::steady_clock::now();
+            cudaError_t copy_out_e = cudaMemcpy((char *)hidden_buf.t->data + (size_t)cs * hidden * h_esz,
+                                                gb.h_next->data,
+                                                h_bytes,
+                                                cudaMemcpyDeviceToDevice);
+            if (copy_out_e != cudaSuccess) {
+                set_last_error(std::string("graph B copy-out failed at layer ") + std::to_string(il) + ": " + cudaGetErrorString(copy_out_e));
+                free_hip_chunk_graph_b(gb);
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
+            auto tB_copy_out1 = std::chrono::steady_clock::now();
+            t_b_copy_out += std::chrono::duration<double>(tB_copy_out1 - tB_copy_out0).count();
+            if (debug_first_layer) {
+                std::fprintf(stderr,
+                             "[qwen3-0.6b-fp dbg] layer0 chunk B compute-done compute=%.3fs copy-out=%.3fs [proj=%.3f norm_cpu=%.3f gate=%.3f up=%.3f mul=%.3f down=%.3f add=%.3f]\n",
+                             std::chrono::duration<double>(tB1 - tB0).count(),
+                             std::chrono::duration<double>(tB_copy_out1 - tB_copy_out0).count(),
+                             proj_s, std::chrono::duration<double>(tB_norm1 - tB_norm0).count(), gate_s, up_s, mul_s, down_s, add_s);
+                std::fflush(stderr);
+            }
+            if (debug_first_layer) {
+                std::fprintf(stderr,
+                             "[qwen3-0.6b-fp dbg] layer0 chunk B done copy-in=%.3fs compute=%.3fs copy-out=%.3fs\n",
+                             std::chrono::duration<double>(tB_copy_in1 - tB_copy_in0).count(),
+                             std::chrono::duration<double>(tB1 - tB0).count(),
+                             std::chrono::duration<double>(tB_copy_out1 - tB_copy_out0).count());
+                std::fflush(stderr);
+            }
+        }
+        free_hip_chunk_graph_b(gb);
+#else
+        // Non-HIP path keeps the existing graph-B implementation.
+        for (int cs = 0; cs < S; cs += chunk_s_ff_v) {
+            const int cl = std::min(chunk_s_ff_v, S - cs);
             ggml_init_params ipB{};
-            ipB.mem_size = ggml_tensor_overhead() * 64
-                           + ggml_graph_overhead_custom(2048, false)
-                           + 64 * 1024;
+            ipB.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(2048, false) + 64 * 1024;
             ipB.no_alloc = true;
             ggml_context * gB = ggml_init(ipB);
             if (!gB) { set_last_error("graph B init failed"); cleanup_all(); ggml_gallocr_free(galloc); return false; }
             ggml_cgraph * gfB = ggml_new_graph_custom(gB, 2048, false);
-
             const size_t h_esz = ggml_element_size(hidden_buf.t);
-            ggml_tensor * h_full = ggml_view_2d(gB, hidden_buf.t,
-                                                hidden, cl,
-                                                hidden * h_esz,
-                                                (size_t)cs * hidden * h_esz);
-
+            ggml_tensor * h_src = ggml_view_2d(gB, hidden_buf.t, hidden, cl, hidden * h_esz, (size_t)cs * hidden * h_esz);
+            ggml_tensor * h_in = ggml_new_tensor_2d(gB, GGML_TYPE_F32, hidden, cl);
+            ggml_set_input(h_in);
             const size_t a_esz = ggml_element_size(attn_out_buf.t);
-            ggml_tensor * attn_chunk = ggml_view_2d(gB, attn_out_buf.t,
-                                                    D * H, cl,
-                                                    a_esz * D * H,
-                                                    (size_t)cs * a_esz * D * H);
-            ggml_tensor * attn_proj = ggml_mul_mat(gB, L.wo, attn_chunk);
-            ggml_tensor * h_after  = ggml_add(gB, h_full, attn_proj);
+            ggml_tensor * attn_in = ggml_view_2d(gB, attn_out_buf.t, D * H, cl, a_esz * D * H, (size_t)cs * a_esz * D * H);
+            ggml_tensor * attn_proj = ggml_mul_mat(gB, L.wo, attn_in);
+            ggml_tensor * h_after  = ggml_add(gB, h_in, attn_proj);
             ggml_tensor * hf = ggml_rms_norm(gB, h_after, eps);
             hf = ggml_mul(gB, hf, L.ffn_norm);
             ggml_tensor * gate_t = ggml_mul_mat(gB, L.ffn_gate, hf);
             gate_t = ggml_silu(gB, gate_t);
-            ggml_tensor * up_t   = ggml_mul_mat(gB, L.ffn_up,   hf);
+            ggml_tensor * up_t   = ggml_mul_mat(gB, L.ffn_up, hf);
             ggml_tensor * gu     = ggml_mul(gB, gate_t, up_t);
             ggml_tensor * ffn_out = ggml_mul_mat(gB, L.ffn_down, gu);
             ggml_tensor * h_next = ggml_add(gB, h_after, ffn_out);
-            ggml_build_forward_expand(gfB, ggml_cpy(gB, h_next, h_full));
-
-            if (!ggml_gallocr_alloc_graph(galloc, gfB)) {
-                set_last_error("graph B alloc failed at layer " + std::to_string(il));
-                ggml_free(gB); ggml_gallocr_free(galloc); cleanup_all(); return false;
-            }
-            auto tB0 = std::chrono::steady_clock::now();
+            ggml_set_output(h_next);
+            ggml_build_forward_expand(gfB, h_next);
+            ggml_backend_buffer_t gB_buf = ggml_backend_alloc_ctx_tensors(gB, w.backend);
+            if (!gB_buf) { set_last_error("graph B ctx allocation failed at layer " + std::to_string(il)); ggml_free(gB); ggml_gallocr_free(galloc); cleanup_all(); return false; }
+            ggml_backend_tensor_copy(h_src, h_in);
             ggml_backend_graph_compute(w.backend, gfB);
-            auto tB1 = std::chrono::steady_clock::now();
-            t_compute_b += std::chrono::duration<double>(tB1 - tB0).count();
+            ggml_backend_tensor_copy(h_next, h_src);
+            ggml_backend_buffer_free(gB_buf);
             ggml_free(gB);
         }
+#endif
 
         if (il == 0 || il == w.n_layer - 1) {
-            std::fprintf(stderr, "[qwen3-0.6b-fp] layer %d/%d done (A=%.3fs FP=%.3fs B=%.3fs)\n",
-                         il + 1, w.n_layer, t_compute_a, t_fp, t_compute_b);
+            std::fprintf(stderr,
+                         "[qwen3-0.6b-fp] layer %d/%d done "
+                         "(A_setup=%.3fs A_alloc=%.3fs A_compute=%.3fs FP=%.3fs "
+                         "B_warm=%.3fs B_setup=%.3fs B_alloc=%.3fs B_copy_in=%.3fs B_norm=%.3fs B_compute=%.3fs B_copy_out=%.3fs)\n",
+                         il + 1, w.n_layer,
+                         t_a_setup, t_a_alloc, t_compute_a, t_fp,
+                         t_b_warm, t_b_setup, t_b_alloc, t_b_copy_in, t_b_norm, t_compute_b, t_b_copy_out);
             std::fflush(stderr);
         }
     }
@@ -497,9 +807,9 @@ bool forward_qwen3_0p6b_drafter(
     auto t_total_end = std::chrono::steady_clock::now();
     double t_score = std::chrono::duration<double>(t_total_end - t_score_start).count();
     std::fprintf(stderr,
-        "[qwen3-0.6b-fp] forward %.2fs (S=%d, A=%.2fs FP=%.2fs B=%.2fs)  "
+        "[qwen3-0.6b-fp] forward %.2fs (S=%d, A_setup=%.2fs A_alloc=%.2fs A_compute=%.2fs FP=%.2fs B_warm=%.2fs B_setup=%.2fs B_alloc=%.2fs B_copy_in=%.2fs B_norm=%.2fs B_compute=%.2fs B_copy_out=%.2fs)  "
         "tail-score %.2fs  total %.2fs\n",
-        t_fwd, S, t_compute_a, t_fp, t_compute_b, t_score, t_fwd + t_score);
+        t_fwd, S, t_a_setup, t_a_alloc, t_compute_a, t_fp, t_b_warm, t_b_setup, t_b_alloc, t_b_copy_in, t_b_norm, t_compute_b, t_b_copy_out, t_score, t_fwd + t_score);
     std::fflush(stderr);
 
     cleanup_all();

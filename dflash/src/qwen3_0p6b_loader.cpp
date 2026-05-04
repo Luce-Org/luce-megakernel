@@ -54,10 +54,19 @@ bool copy_tensor_from_file(gguf_context * gctx, const char * name,
         std::fprintf(stderr, "[qwen3-0.6b] missing tensor: %s\n", name);
         return false;
     }
+    const ggml_type src_type = gguf_get_tensor_type(gctx, idx);
+    const size_t src_bytes = gguf_get_tensor_size(gctx, idx);
+    const size_t dst_bytes = ggml_nbytes(dst);
+    if (src_type != dst->type || src_bytes != dst_bytes) {
+        std::fprintf(stderr,
+                     "[qwen3-0.6b] incompatible tensor %s: src_type=%s src_bytes=%zu dst_type=%s dst_bytes=%zu\n",
+                     name, ggml_type_name(src_type), src_bytes,
+                     ggml_type_name(dst->type), dst_bytes);
+        return false;
+    }
     const size_t off = gguf_get_tensor_offset(gctx, idx);
-    const size_t bytes = ggml_nbytes(dst);
     const uint8_t * src = (const uint8_t *)mmap_base + data_offset + off;
-    ggml_backend_tensor_set(dst, src, 0, bytes);
+    ggml_backend_tensor_set(dst, src, 0, dst_bytes);
     return true;
 }
 

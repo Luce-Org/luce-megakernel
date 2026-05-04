@@ -13,8 +13,7 @@
 // Hardcoded shape: head_dim=128, block_size=128, non-causal. Add new
 // dispatch arms as we support more.
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "device_runtime.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>

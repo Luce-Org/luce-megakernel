@@ -1,7 +1,7 @@
 [project]
 name = "pflash"
-version = "0.3.0"
-description = "Python client + bench harness for the lucebox dflash speculative-prefill daemon"
+version = "0.4.0"
+description = "Prompt-compression tooling for lucebox dflash and ROCm/HIP llama.cpp runs"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "lucebox"}]
@@ -13,11 +13,16 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# Drafter scoring + spec decode happen inside the C++/CUDA daemon. The Python
-# side only needs the HF tokenizers (one for the drafter vocab, one for the
-# target vocab + chat template) to drive the bench harness.
+# The CUDA daemon path only needs tokenizers, but the Strix Halo prompt-
+# compression path uses a small HF model through PyTorch. Keep torch optional so
+# daemon-only users do not have to install it.
 dependencies = [
     "transformers>=4.50",
+]
+
+[project.optional-dependencies]
+accelerators = [
+    "torch>=2.7",
 ]
 
 [project.urls]

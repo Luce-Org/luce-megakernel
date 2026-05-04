@@ -9,8 +9,9 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include "device_runtime.h"
+#include <algorithm>
 #include <vector>
-#include <cuda_runtime.h>
 
 namespace dflash27b {
 namespace flashprefill {
@@ -79,6 +80,44 @@ void block_select_host(
 
 namespace {
 inline int cdiv(int a, int b) { return (a + b - 1) / b; }
+
+struct FlashPrefillScratch {
+    void * dmK = nullptr; size_t dmK_bytes = 0;
+    float * dS = nullptr; size_t dS_bytes = 0;
+    float * dM = nullptr; size_t dM_bytes = 0;
+    int32_t * dIdx = nullptr; size_t dIdx_bytes = 0;
+    int32_t * dCnt = nullptr; size_t dCnt_bytes = 0;
+};
+
+static std::vector<FlashPrefillScratch> g_flashprefill_scratch;
+
+template<typename T>
+static T * ensure_buf(T ** ptr, size_t * cur_bytes, size_t need_bytes) {
+    if (*ptr != nullptr && *cur_bytes >= need_bytes) {
+        return *ptr;
+    }
+    if (*ptr != nullptr) {
+        (void)cudaFree(*ptr);
+        *ptr = nullptr;
+        *cur_bytes = 0;
+    }
+    cudaError_t err = cudaMalloc((void **)ptr, need_bytes);
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "[flashprefill] cudaMalloc failed: %s\n", cudaGetErrorString(err));
+        return nullptr;
+    }
+    *cur_bytes = need_bytes;
+    return *ptr;
+}
+
+static FlashPrefillScratch & scratch_for_current_device() {
+    int device = 0;
+    (void)cudaGetDevice(&device);
+    if ((int)g_flashprefill_scratch.size() <= device) {
+        g_flashprefill_scratch.resize(device + 1);
+    }
+    return g_flashprefill_scratch[(size_t)device];
+}
 }
 
 int flash_prefill_forward_bf16(
@@ -105,16 +144,15 @@ int flash_prefill_forward_bf16(
     int s_idx_b = M * N * H, s_idx_m = N * H, s_idx_n = H, s_idx_h = 1;
     int s_cnt_b = M * H, s_cnt_m = H, s_cnt_h = 1;
 
-    // Allocate scratch on the same device as Q.
-    void * dmK = nullptr;
-    float * dS = nullptr, * dM = nullptr;
-    int32_t * dIdx = nullptr, * dCnt = nullptr;
-    cudaError_t e;
-    if ((e = cudaMalloc(&dmK,  (size_t)B * M * Hk * D * 2)) != cudaSuccess) goto err;  // bf16
-    if ((e = cudaMalloc(&dS,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
-    if ((e = cudaMalloc(&dM,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
-    if ((e = cudaMalloc(&dIdx, (size_t)B * M * N * H * sizeof(int32_t))) != cudaSuccess) goto err;
-    if ((e = cudaMalloc(&dCnt, (size_t)B * M * H * sizeof(int32_t))) != cudaSuccess) goto err;
+    FlashPrefillScratch & sc = scratch_for_current_device();
+    void * dmK = ensure_buf(&sc.dmK, &sc.dmK_bytes, (size_t)B * M * Hk * D * 2); // bf16
+    float * dS = ensure_buf(&sc.dS, &sc.dS_bytes, (size_t)B * M * N * H * sizeof(float));
+    float * dM = ensure_buf(&sc.dM, &sc.dM_bytes, (size_t)B * M * N * H * sizeof(float));
+    int32_t * dIdx = ensure_buf(&sc.dIdx, &sc.dIdx_bytes, (size_t)B * M * N * H * sizeof(int32_t));
+    int32_t * dCnt = ensure_buf(&sc.dCnt, &sc.dCnt_bytes, (size_t)B * M * H * sizeof(int32_t));
+    if (!dmK || !dS || !dM || !dIdx || !dCnt) {
+        return -1;
+    }
 
     static const bool prof = (std::getenv("DFLASH_FP_PROFILE") != nullptr);
     cudaEvent_t pE[5];
@@ -192,17 +230,7 @@ int flash_prefill_forward_bf16(
             S, n_q_heads, n_k_heads, t1, t2, t3, t4);
         for (int i=0;i<5;i++) cudaEventDestroy(pE[i]);
     }
-    cudaFree(dmK); cudaFree(dS); cudaFree(dM); cudaFree(dIdx); cudaFree(dCnt);
     return 0;
-
-err:
-    if (dmK)  cudaFree(dmK);
-    if (dS)   cudaFree(dS);
-    if (dM)   cudaFree(dM);
-    if (dIdx) cudaFree(dIdx);
-    if (dCnt) cudaFree(dCnt);
-    std::fprintf(stderr, "[flashprefill] cudaMalloc failed: %s\n", cudaGetErrorString(e));
-    return -1;
 }
 
 } // namespace flashprefill

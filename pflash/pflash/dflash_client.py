@@ -9,6 +9,7 @@ import time
 from typing import Optional
 
 from . import config
+from .platform import query_gpu_memory_mib
 
 log = logging.getLogger(__name__)
 
@@ -64,16 +65,27 @@ class DflashClient:
 
     def _wait_until_loaded(self, timeout: float = 60.0, vram_mib: int = 18000):
         boot = time.time()
+        telemetry_seen = False
         while time.time() - boot < timeout:
             time.sleep(1)
+            if self.proc.poll() is not None:
+                raise RuntimeError(
+                    "dflash daemon exited before weights finished loading. Check the daemon's stderr."
+                )
             try:
-                vram = int(subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=memory.used",
-                     "--format=csv,noheader,nounits"]).decode().splitlines()[0])
+                vram = query_gpu_memory_mib()
+                if vram is None:
+                    continue
+                telemetry_seen = True
                 if vram > vram_mib:
                     return
             except Exception:
                 pass
+            if not telemetry_seen and time.time() - boot >= min(timeout, 5.0):
+                log.warning(
+                    "no GPU memory telemetry detected; assuming daemon boot succeeded because the process is still alive"
+                )
+                return
         raise RuntimeError(
             f"dflash daemon failed to load target weights within {timeout:.0f}s "
             f"(expected VRAM > {vram_mib} MiB). Check the daemon's stderr.")
@@ -95,17 +107,18 @@ class DflashClient:
     def park_target(self):   self._send("park target\n")
     def unpark_target(self): self._send("unpark target\n")
 
-    def compress(self, prompt_ids: list[int], keep_ratio: float, drafter_gguf: str) -> list[int]:
+    def compress(self, prompt_ids: list[int], keep_ratio: float, drafter_gguf: str,
+                 drafter_arch: str = "qwen3-0.6b") -> list[int]:
         """C++ drafter score+compress via daemon. Returns compressed token ids.
 
-        Daemon command: compress <bin> <keep_x1000> <drafter_gguf>
+        Daemon command: compress <bin> <keep_x1000> <drafter_gguf> <drafter_arch>
         """
         fd, path = tempfile.mkstemp(suffix=".bin")
         with os.fdopen(fd, "wb") as f:
             for t in prompt_ids:
                 f.write(struct.pack("<i", int(t)))
         keep_x1000 = int(round(keep_ratio * 1000))
-        self.proc.stdin.write(f"compress {path} {keep_x1000} {drafter_gguf}\n".encode())
+        self.proc.stdin.write(f"compress {path} {keep_x1000} {drafter_gguf} {drafter_arch}\n".encode())
         self.proc.stdin.flush()
         toks = []
         while True:

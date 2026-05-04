@@ -26,9 +26,11 @@
 //   - score shape: [B, M, N, n_q_heads]   (M = N = ceil(S/BLOCK))
 
 #include <cstdint>
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include <cstdlib>
+#include "device_runtime.h"
+#if !defined(DFLASH27B_USE_HIP)
 #include <mma.h>
+#endif
 
 namespace dflash27b {
 namespace flashprefill {
@@ -37,6 +39,7 @@ namespace flashprefill {
 // 16-byte (uint4) async global → shared copy. Issued by every thread that
 // participates in the cooperative load. wait_all() drains all outstanding
 // transfers; commit_group()/wait_group(N) supports multi-stage pipelines.
+#if !defined(DFLASH27B_USE_HIP)
 __device__ inline void cp_async16(void * smem_ptr, const void * gmem_ptr) {
     unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
@@ -48,6 +51,7 @@ __device__ inline void cp_async_commit() {
 __device__ inline void cp_async_wait_all() {
     asm volatile("cp.async.wait_all;\n");
 }
+#endif
 
 
 // ---- Kernel 1: compute_mean_vector ----
@@ -268,6 +272,7 @@ extern "C" void launch_compute_block_score_bf16(
 // QK / softmax / PV reduction reading from shared mem. This avoids
 // re-loading K/V from HBM Q_TILE times per row, which was the dominant
 // cost of the v1 scalar kernel.
+#if !defined(DFLASH27B_USE_HIP)
 template <int Q_TILE, int K_TILE, int BLOCK, int D_HEAD>
 __global__ void sparse_flash_forward_kernel_bf16(
     const __nv_bfloat16 * __restrict__ Q,
@@ -587,6 +592,256 @@ __global__ void sparse_flash_forward_kernel_bf16(
         }
     }
 }
+#else
+// HIP tiled prototype: exact selected-block attention with wave-parallel query
+// rows and shared-memory tiled K/V loads. Not used by the default launcher yet.
+template <int Q_ROWS, int K_TILE, int BLOCK, int D_HEAD, int LANES>
+__global__ void sparse_flash_forward_kernel_ref_bf16(
+    const __nv_bfloat16 * __restrict__ Q,
+    const __nv_bfloat16 * __restrict__ K,
+    const __nv_bfloat16 * __restrict__ V,
+    __nv_bfloat16       * __restrict__ O,
+    const int32_t       * __restrict__ block_index,
+    const int32_t       * __restrict__ counts,
+    float scale,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int M_blocks,
+    int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
+    int s_K_b, int s_K_n, int s_K_h, int s_K_d,
+    int s_V_b, int s_V_n, int s_V_h, int s_V_d,
+    int s_O_b, int s_O_n, int s_O_h, int s_O_d,
+    int s_idx_b, int s_idx_m, int s_idx_n, int s_idx_h,
+    int s_cnt_b, int s_cnt_m, int s_cnt_h)
+{
+    const int q_tile_idx = blockIdx.x;
+    const int zh = blockIdx.y;
+    const int b  = zh / n_q_heads;
+    const int qh = zh % n_q_heads;
+    if (b >= batch) return;
+
+    const int tid = threadIdx.x;
+    const int wave = tid / LANES;
+    const int lane = tid - wave * LANES;
+    if (wave >= Q_ROWS) return;
+
+    const int q_global = q_tile_idx * Q_ROWS + wave;
+    const bool active_q = q_global < seq_len;
+    const int q_eff = active_q ? q_global : (seq_len - 1);
+    const int q_tile_last = min(q_tile_idx * Q_ROWS + Q_ROWS - 1, seq_len - 1);
+
+    const int kh = qh * n_k_heads / n_q_heads;
+    const int q_block_idx = q_eff / BLOCK;
+    const int hi = counts[(size_t)b * s_cnt_b + (size_t)q_block_idx * s_cnt_m + (size_t)qh * s_cnt_h];
+
+    const __nv_bfloat16 * Qp = Q + (size_t)b * s_Q_b + (size_t)q_eff * s_Q_n + (size_t)qh * s_Q_h;
+    __nv_bfloat16 * Op = O + (size_t)b * s_O_b + (size_t)q_eff * s_O_n + (size_t)qh * s_O_h;
+
+    extern __shared__ unsigned char raw_smem[];
+    __nv_bfloat16 * K_sh = reinterpret_cast<__nv_bfloat16 *>(raw_smem);
+    __nv_bfloat16 * V_sh = K_sh + (size_t)K_TILE * D_HEAD;
+    float * dots_sh = reinterpret_cast<float *>(V_sh + (size_t)K_TILE * D_HEAD);
+    float * bcast_sh = dots_sh + (size_t)Q_ROWS * K_TILE;
+
+    constexpr int D_PER_LANE = D_HEAD / LANES;
+    float q_local[D_PER_LANE];
+    float acc_local[D_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < D_PER_LANE; ++i) {
+        const int d = lane + i * LANES;
+        q_local[i] = __bfloat162float(Qp[(size_t)d * s_Q_d]);
+        acc_local[i] = 0.0f;
+    }
+
+    float m_old = -INFINITY;
+    float l_old = 0.0f;
+
+    auto warp_sum = [&](float v) {
+        for (int off = LANES / 2; off > 0; off >>= 1) {
+            v += __shfl_xor(v, off, LANES);
+        }
+        return v;
+    };
+
+    for (int it = 0; it < hi; ++it) {
+        const int blk = block_index[(size_t)b * s_idx_b + (size_t)q_block_idx * s_idx_m
+                                    + (size_t)it * s_idx_n + (size_t)qh * s_idx_h];
+        if (blk < 0 || blk >= M_blocks) continue;
+
+        int k_lo = blk * BLOCK;
+        int k_hi = k_lo + BLOCK;
+        if (k_hi > seq_len) k_hi = seq_len;
+        if (blk == q_block_idx && k_hi > q_eff + 1) k_hi = q_eff + 1;
+        if (k_lo >= k_hi) continue;
+
+        for (int tile_start = k_lo; tile_start < k_hi; tile_start += K_TILE) {
+            const int tile_len = min(K_TILE, k_hi - tile_start);
+            int load_hi = blk * BLOCK + BLOCK;
+            if (load_hi > seq_len) load_hi = seq_len;
+            if (blk == q_block_idx && load_hi > q_tile_last + 1) load_hi = q_tile_last + 1;
+            const int load_len = min(K_TILE, max(0, load_hi - tile_start));
+
+            for (int idx = tid; idx < load_len * D_HEAD; idx += blockDim.x) {
+                const int kk = idx / D_HEAD;
+                const int dd = idx - kk * D_HEAD;
+                const int pos = tile_start + kk;
+                const __nv_bfloat16 * Kp_g = K + (size_t)b * s_K_b + (size_t)pos * s_K_n + (size_t)kh * s_K_h;
+                const __nv_bfloat16 * Vp_g = V + (size_t)b * s_V_b + (size_t)pos * s_V_n + (size_t)kh * s_V_h;
+                K_sh[idx] = Kp_g[(size_t)dd * s_K_d];
+                V_sh[idx] = Vp_g[(size_t)dd * s_V_d];
+            }
+            __syncthreads();
+
+            float m_blk = -INFINITY;
+            for (int kk = 0; kk < tile_len; ++kk) {
+                float partial = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < D_PER_LANE; ++i) {
+                    const int d = lane + i * LANES;
+                    partial += q_local[i] * __bfloat162float(K_sh[(size_t)kk * D_HEAD + d]);
+                }
+                float dot = warp_sum(partial);
+                if (lane == 0) {
+                    dot *= scale;
+                    dots_sh[wave * K_TILE + kk] = dot;
+                    m_blk = fmaxf(m_blk, dot);
+                }
+            }
+            if (lane == 0) {
+                for (int kk = 0; kk < tile_len; ++kk) {
+                    m_blk = fmaxf(m_blk, dots_sh[wave * K_TILE + kk]);
+                }
+            }
+            if (lane == 0) bcast_sh[wave] = m_blk;
+            __syncthreads();
+            m_blk = bcast_sh[wave];
+
+            const float m_new = fmaxf(m_old, m_blk);
+            const float alpha = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+            #pragma unroll
+            for (int i = 0; i < D_PER_LANE; ++i) {
+                acc_local[i] *= alpha;
+            }
+
+            float local_l = 0.0f;
+            for (int kk = lane; kk < tile_len; kk += LANES) {
+                local_l += expf(dots_sh[wave * K_TILE + kk] - m_new);
+            }
+            float l_sum = warp_sum(local_l);
+            if (lane == 0) bcast_sh[Q_ROWS + wave] = l_sum;
+            __syncthreads();
+            l_sum = bcast_sh[Q_ROWS + wave];
+
+            for (int kk = 0; kk < tile_len; ++kk) {
+                const float p = expf(dots_sh[wave * K_TILE + kk] - m_new);
+                #pragma unroll
+                for (int i = 0; i < D_PER_LANE; ++i) {
+                    const int d = lane + i * LANES;
+                    acc_local[i] += p * __bfloat162float(V_sh[(size_t)kk * D_HEAD + d]);
+                }
+            }
+
+            m_old = m_new;
+            l_old = alpha * l_old + l_sum;
+            __syncthreads();
+        }
+    }
+
+    const float l_rec = (l_old > 0.0f) ? (1.0f / l_old) : 1.0f;
+    #pragma unroll
+    for (int i = 0; i < D_PER_LANE; ++i) {
+        const int d = lane + i * LANES;
+        if (active_q) {
+            Op[(size_t)d * s_O_d] = __float2bfloat16(acc_local[i] * l_rec);
+        }
+    }
+}
+
+// Conservative HIP fallback: one CTA computes one query row. This avoids the
+// fragile cross-lane bookkeeping in the tiled prototype and gives ROCm a
+// numerically exact baseline while the fast MFMA/rocWMMA path is still pending.
+template <int BLOCK, int D_HEAD>
+__global__ void sparse_flash_forward_kernel_row_bf16(
+    const __nv_bfloat16 * __restrict__ Q,
+    const __nv_bfloat16 * __restrict__ K,
+    const __nv_bfloat16 * __restrict__ V,
+    __nv_bfloat16       * __restrict__ O,
+    const int32_t       * __restrict__ block_index,
+    const int32_t       * __restrict__ counts,
+    float scale,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int M_blocks,
+    int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
+    int s_K_b, int s_K_n, int s_K_h, int s_K_d,
+    int s_V_b, int s_V_n, int s_V_h, int s_V_d,
+    int s_O_b, int s_O_n, int s_O_h, int s_O_d,
+    int s_idx_b, int s_idx_m, int s_idx_n, int s_idx_h,
+    int s_cnt_b, int s_cnt_m, int s_cnt_h)
+{
+    const int q_global = blockIdx.x;
+    const int zh = blockIdx.y;
+    const int b  = zh / n_q_heads;
+    const int qh = zh % n_q_heads;
+    const int d = threadIdx.x;
+    if (b >= batch || q_global >= seq_len || d >= D_HEAD) return;
+
+    const int kh = qh * n_k_heads / n_q_heads;
+    const int q_block_idx = q_global / BLOCK;
+    const int hi = counts[(size_t)b * s_cnt_b + (size_t)q_block_idx * s_cnt_m + (size_t)qh * s_cnt_h];
+
+    const __nv_bfloat16 * Qp = Q + (size_t)b * s_Q_b + (size_t)q_global * s_Q_n + (size_t)qh * s_Q_h;
+    __nv_bfloat16 * Op = O + (size_t)b * s_O_b + (size_t)q_global * s_O_n + (size_t)qh * s_O_h;
+
+    extern __shared__ float smem[];
+    float * red = smem;          // D_HEAD floats
+    float * scalars = red + D_HEAD; // alpha, p, l_rec
+
+    const float qd = __bfloat162float(Qp[(size_t)d * s_Q_d]);
+    float acc = 0.0f;
+    float m_old = -INFINITY;
+    float l_old = 0.0f;
+
+    for (int it = 0; it < hi; ++it) {
+        const int blk = block_index[(size_t)b * s_idx_b + (size_t)q_block_idx * s_idx_m
+                                    + (size_t)it * s_idx_n + (size_t)qh * s_idx_h];
+        if (blk < 0 || blk >= M_blocks) continue;
+
+        int k_lo = blk * BLOCK;
+        int k_hi = k_lo + BLOCK;
+        if (k_hi > seq_len) k_hi = seq_len;
+        if (blk == q_block_idx && k_hi > q_global + 1) k_hi = q_global + 1;
+
+        for (int pos = k_lo; pos < k_hi; ++pos) {
+            const __nv_bfloat16 * Kp_g = K + (size_t)b * s_K_b + (size_t)pos * s_K_n + (size_t)kh * s_K_h;
+            red[d] = qd * __bfloat162float(Kp_g[(size_t)d * s_K_d]);
+            __syncthreads();
+
+            for (int stride = D_HEAD / 2; stride > 0; stride >>= 1) {
+                if (d < stride) red[d] += red[d + stride];
+                __syncthreads();
+            }
+
+            if (d == 0) {
+                const float dot = red[0] * scale;
+                const float m_new = fmaxf(m_old, dot);
+                const float alpha = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+                const float p = expf(dot - m_new);
+                m_old = m_new;
+                l_old = alpha * l_old + p;
+                scalars[0] = alpha;
+                scalars[1] = p;
+            }
+            __syncthreads();
+
+            const __nv_bfloat16 * Vp_g = V + (size_t)b * s_V_b + (size_t)pos * s_V_n + (size_t)kh * s_V_h;
+            acc = acc * scalars[0] + scalars[1] * __bfloat162float(Vp_g[(size_t)d * s_V_d]);
+        }
+    }
+
+    if (d == 0) scalars[2] = (l_old > 0.0f) ? (1.0f / l_old) : 1.0f;
+    __syncthreads();
+    Op[(size_t)d * s_O_d] = __float2bfloat16(acc * scalars[2]);
+}
+#endif
 // ---- Kernel 4-TC: tensor-core sparse_flash_forward (WMMA)  [SCAFFOLD] ----
 //
 // FlashAttention-2 style with NVIDIA WMMA fragments. Scaffolding only —
@@ -617,7 +872,45 @@ extern "C" void launch_sparse_flash_forward_bf16(
     const int M = (seq_len + block_size - 1) / block_size;
     const int q_tiles = (seq_len + q_tile - 1) / q_tile;
     dim3 grid(q_tiles, batch * n_q_heads, 1);
-    dim3 block(q_tile, 1, 1);
+#if defined(DFLASH27B_USE_HIP)
+    if (q_tile == 64 && block_size == 128 && head_dim == 128) {
+        if (std::getenv("DFLASH_FP_HIP_ROW") == nullptr) {
+            constexpr int HIP_WAVE = 32;
+            constexpr int HIP_Q_ROWS = 4;
+            constexpr int HIP_K_TILE = 32;
+            dim3 tiled_grid((seq_len + HIP_Q_ROWS - 1) / HIP_Q_ROWS, batch * n_q_heads, 1);
+            dim3 tiled_block(HIP_WAVE * HIP_Q_ROWS, 1, 1);
+            size_t tiled_smem = sizeof(__nv_bfloat16) * HIP_K_TILE * head_dim * 2
+                              + sizeof(float) * HIP_Q_ROWS * (HIP_K_TILE + 2);
+            sparse_flash_forward_kernel_ref_bf16<HIP_Q_ROWS, HIP_K_TILE, 128, 128, HIP_WAVE><<<tiled_grid, tiled_block, tiled_smem, stream>>>(
+                (const __nv_bfloat16 *)Q, (const __nv_bfloat16 *)K,
+                (const __nv_bfloat16 *)V, (__nv_bfloat16 *)O,
+                block_index, counts, scale,
+                batch, n_q_heads, n_k_heads, seq_len, M,
+                s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+                s_K_b, s_K_n, s_K_h, s_K_d,
+                s_V_b, s_V_n, s_V_h, s_V_d,
+                s_O_b, s_O_n, s_O_h, s_O_d,
+                s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+                s_cnt_b, s_cnt_m, s_cnt_h);
+        } else {
+            dim3 row_grid(seq_len, batch * n_q_heads, 1);
+            dim3 row_block(128, 1, 1);
+            size_t smem_bytes = sizeof(float) * (head_dim + 3);
+            sparse_flash_forward_kernel_row_bf16<128, 128><<<row_grid, row_block, smem_bytes, stream>>>(
+                (const __nv_bfloat16 *)Q, (const __nv_bfloat16 *)K,
+                (const __nv_bfloat16 *)V, (__nv_bfloat16 *)O,
+                block_index, counts, scale,
+                batch, n_q_heads, n_k_heads, seq_len, M,
+                s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+                s_K_b, s_K_n, s_K_h, s_K_d,
+                s_V_b, s_V_n, s_V_h, s_V_d,
+                s_O_b, s_O_n, s_O_h, s_O_d,
+                s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+                s_cnt_b, s_cnt_m, s_cnt_h);
+        }
+    }
+#else
     if (q_tile == 64 && block_size == 128 && head_dim == 128) {
         // FA-2 register-resident layout @ Q_TILE=64 (4 warps, 128 threads), 2 CTAs/SM.
         constexpr int Q_TILE = 64, K_TILE = 64, BLOCK = 128, D_HEAD = 128;
@@ -642,6 +935,7 @@ extern "C" void launch_sparse_flash_forward_bf16(
             s_idx_b, s_idx_m, s_idx_n, s_idx_h,
             s_cnt_b, s_cnt_m, s_cnt_h);
     }
+#endif
 }
 
 
@@ -689,7 +983,7 @@ __global__ void block_select_kernel(
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, off));
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, off, 32));
     const float max_score = local_max;
     const float thresh = max_score * alpha;
 

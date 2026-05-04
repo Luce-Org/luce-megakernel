@@ -23,15 +23,17 @@
 #include "dflash_graph.h"
 #include "qwen3_drafter.h"
 
+#include "device_runtime.h"
+
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
-#include <cuda_runtime.h>
-
 // ggml-cuda dequantize: Q8_0/F16/BF16 → F32. Replaces the custom
 // f16_convert.cu kernels with ggml's built-in converter dispatch.
+// On HIP, device_runtime.h aliases cudaStream_t → hipStream_t, and ggml-hip
+// (built from the same convert.cu source) exports the same symbol name.
 using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
@@ -2709,10 +2711,11 @@ int main(int argc, char ** argv) {
             }
 
             // ── Compress command (pflash speculative prefill) ───────────────
-            // Format: "compress <src_bin_path> <keep_ratio_x1000> <drafter_gguf>"
+            // Format: "compress <src_bin_path> <keep_ratio_x1000> <drafter_gguf> [drafter_arch]"
             //   src_bin_path:   int32 token IDs file (drafter vocab)
             //   keep_ratio_x1000: integer keep ratio × 1000 (e.g. 20 → 0.020)
-            //   drafter_gguf:   path to Qwen3-0.6B GGUF (loaded lazily once)
+            //   drafter_gguf:   path to drafter GGUF (loaded lazily once)
+            //   drafter_arch:   qwen3-0.6b (default) or qwen35-0.8b
             // Output: stream of int32 compressed token IDs, terminated by -1.
             // Drafter coexists with target+draft via libllama in the same
             // ggml allocator — no park/unpark needed for compression itself.
@@ -2720,11 +2723,17 @@ int main(int argc, char ** argv) {
                 char ppath[1024];
                 int  keep_x1000 = 0;
                 char drafter_path[1024];
-                int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s",
-                                    ppath, &keep_x1000, drafter_path);
-                if (n != 3) {
+                char arch_name[64] = "qwen3-0.6b";
+                int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s %63s",
+                                    ppath, &keep_x1000, drafter_path, arch_name);
+                if (n < 3) {
                     std::fprintf(stderr,
-                                 "[compress] bad args, need: <bin> <keep_x1000> <drafter_gguf>\n");
+                                 "[compress] bad args, need: <bin> <keep_x1000> <drafter_gguf> [drafter_arch]\n");
+                    stream_emit(-1); continue;
+                }
+                dflash27b::DrafterArch drafter_arch;
+                if (!dflash27b::parse_drafter_arch(arch_name, drafter_arch)) {
+                    std::fprintf(stderr, "[compress] bad drafter_arch: %s\n", arch_name);
                     stream_emit(-1); continue;
                 }
                 auto src_ids = read_int32_file(ppath);
@@ -2751,16 +2760,21 @@ int main(int argc, char ** argv) {
                 }
 
                 if (!drafter_loaded) {
-                    if (!dflash27b::load_drafter(drafter_path, /*gpu_layers=*/999, drafter_ctx)) {
+                    if (!dflash27b::load_drafter(drafter_path, /*gpu_layers=*/999, drafter_arch, drafter_ctx)) {
                         std::fprintf(stderr, "[compress] load_drafter failed: %s\n",
                                      dflash27b_last_error());
                         stream_emit(-1); continue;
                     }
                     drafter_loaded = true;
-                    std::printf("[drafter] loaded %s (n_layer=%d n_head=%d n_head_kv=%d)\n",
-                                drafter_path, drafter_ctx.weights.n_layer,
+                    std::printf("[drafter] loaded %s arch=%s (n_layer=%d n_head=%d n_head_kv=%d)\n",
+                                drafter_path, dflash27b::drafter_arch_name(drafter_arch), drafter_ctx.weights.n_layer,
                                 drafter_ctx.weights.n_head, drafter_ctx.weights.n_head_kv);
                     std::fflush(stdout);
+                } else if (drafter_ctx.arch != drafter_arch) {
+                    std::fprintf(stderr, "[compress] requested arch=%s but loaded arch=%s\n",
+                                 dflash27b::drafter_arch_name(drafter_arch),
+                                 dflash27b::drafter_arch_name(drafter_ctx.arch));
+                    stream_emit(-1); continue;
                 }
 
                 float keep = (float)keep_x1000 / 1000.0f;

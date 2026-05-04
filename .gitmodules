@@ -1,7 +1,7 @@
 [submodule "dflash/deps/llama.cpp"]
 	path = dflash/deps/llama.cpp
-	url = https://github.com/Luce-Org/llama.cpp-dflash-ggml.git
-	branch = luce-dflash
+	url = https://github.com/smpurkis/llama.cpp.git
+	branch = master
 [submodule "dflash/deps/Block-Sparse-Attention"]
 	path = dflash/deps/Block-Sparse-Attention
 	url = https://github.com/mit-han-lab/Block-Sparse-Attention.git

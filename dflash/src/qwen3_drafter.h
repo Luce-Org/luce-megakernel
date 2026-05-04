@@ -25,9 +25,18 @@ typedef struct ggml_backend * ggml_backend_t;
 
 namespace dflash27b {
 
+enum class DrafterArch {
+    Qwen3_0p6b,
+    Qwen35_0p8b,
+};
+
+bool parse_drafter_arch(const std::string & name, DrafterArch & out);
+const char * drafter_arch_name(DrafterArch arch);
+
 struct DrafterContext {
     ggml_backend_t        backend = nullptr;   // owned (created in load_drafter)
     Qwen3DrafterWeights   weights;             // BF16 weights on the backend
+    DrafterArch           arch    = DrafterArch::Qwen3_0p6b;
     bool                  loaded  = false;
 };
 
@@ -39,6 +48,8 @@ struct DrafterContext {
 // the GPU since the drafter weights are only ~1.5 GB.
 bool load_drafter(const std::string & gguf_path, int gpu_layers,
                   DrafterContext & out);
+bool load_drafter(const std::string & gguf_path, int gpu_layers,
+                  DrafterArch arch, DrafterContext & out);
 
 void free_drafter(DrafterContext & ctx);
 

@@ -29,6 +29,8 @@ def main():
                     help="draft model used for spec decoding (NOT drafter scorer)")
     ap.add_argument("--drafter-gguf", default="/home/lucebox/lucebox-hub/dflash/models/Qwen3-0.6B-BF16.gguf",
                     help="C++ drafter scorer GGUF (Qwen3-0.6B BF16)")
+    ap.add_argument("--drafter-arch", default="qwen3-0.6b", choices=["qwen3-0.6b", "qwen35-0.8b"],
+                    help="C++ drafter architecture selector")
     ap.add_argument("--target-tokenizer", default="Qwen/Qwen3.6-27B")
     ap.add_argument("--drafter-tokenizer", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--max-ctx", type=int, default=16384,
@@ -131,17 +133,17 @@ def main():
         print(f"[case {i}] src={S} keep={args.keep_ratio}", flush=True)
 
         t0 = time.time()
-        compressed_ids = dflash.compress(ids, args.keep_ratio, args.drafter_gguf)
+        compressed_ids = dflash.compress(ids, args.keep_ratio, args.drafter_gguf, args.drafter_arch)
         t_score = time.time() - t0
         comp = len(compressed_ids)
         print(f"[case {i}] compressed={comp} ratio={S/max(comp,1):.1f}x score_s={t_score:.1f}", flush=True)
 
         # Decode compressed ids with DRAFTER tokenizer, re-encode with TARGET + chat template.
         comp_text = drafter_tok.decode(compressed_ids, skip_special_tokens=True)
-        user_msg = comp_text + "\n\nAnswer the user question based on the above context."
+        user_msg = comp_text + "\n\nAnswer the user question based on the above context. Give only the answer. /no_think"
         chat = target_tok.apply_chat_template(
             [{"role": "user", "content": user_msg}],
-            tokenize=False, add_generation_prompt=True)
+            tokenize=False, add_generation_prompt=True, enable_thinking=False)
         target_ids = target_tok(chat, return_tensors="pt")["input_ids"][0].tolist()
 
         # Free drafter (1.2GB), restore target+spec_draft for target gen.

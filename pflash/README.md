@@ -9,9 +9,9 @@
 <h1 align="center">Luce PFlash</h1>
 
 <p align="center">
-  <strong>Speculative prefill in front of dflash. C++/CUDA only.</strong><br/>
-  A drafter loaded in-process scores token importance; the heavy target only prefills the spans that matter.<br/>
-  Qwen3.6-27B Q4_K_M at 128K on a single RTX 3090: <strong>24.8 s TTFT vs ~257 s llama.cpp</strong> = <strong>~10.4×</strong>, NIAH retrieval preserved.<br/><br/>
+  <strong>Speculative prefill for long prompts.</strong><br/>
+  The original repo ships an in-process CUDA path inside dflash; this branch also adds a Strix Halo path that compresses prompts with a small ROCm/PyTorch drafter and runs the target through llama.cpp HIP.<br/>
+  RTX 3090 reference numbers are still here; Strix Halo support focuses on the prompt-processing speedup half of PFlash.<br/><br/>
   <a href="https://lucebox.com/blog/pflash">Blog post</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a> · <a href="https://lucebox.com">lucebox.com</a>
 </p>
 
@@ -28,7 +28,7 @@ dflash daemon @ 128K        24.8         10.4x     ✓
 dflash daemon @  64K        13.5         10.0x     ✓
 ```
 
-> Long context turns prefill into the dominant latency on quantized 27B targets. Speculative prefill scores token importance with a small drafter, then the heavy target only prefills the spans that matter. Quality preserved on NIAH at every measured context. The whole thing runs as a single C++/CUDA binary: no Python, no Triton, no PyTorch at runtime.
+> Long context turns prefill into the dominant latency on quantized 27B targets. Speculative prefill scores token importance with a small drafter, then the heavy target only prefills the spans that matter. Quality preserved on NIAH at every measured context. On the original 3090 path, the whole thing runs as a single C++/CUDA binary: no Python, no Triton, no PyTorch at runtime.
 
 ## The gap we filled
 
@@ -56,6 +56,8 @@ NIAH single-needle, RTX 3090 24 GB, Qwen3.6-27B Q4_K_M target, Qwen3-0.6B drafte
 Decode after prefill: ~74 tok/s (dflash spec decode + DDTree). The pipeline is the dflash binary on its own — no Python in the inference loop.
 
 ## Quick start
+
+### RTX 3090 / original CUDA path
 
 PFlash is the algorithm. The implementation lives in [`../dflash/`](../dflash/) as part of the dflash daemon. The `pflash/` directory in this repo only contains the Python tooling for **benchmarking** (NIAH case generation, bench harness around the daemon stdin protocol). Production deploys hit the dflash daemon directly.
 
@@ -92,6 +94,52 @@ python tests/bench_niah_cpp.py \
   --drafter-gguf ../dflash/models/Qwen3-0.6B-BF16.gguf \
   --cases  /tmp/niah_128k.jsonl --keep-ratio 0.05 --n-gen 256
 ```
+
+### Strix Halo / ROCm path
+
+The CUDA daemon is still NVIDIA-only. For Strix Halo (`gfx1151`) the supported path in this branch is:
+
+1. score and compress the long prompt with a small HuggingFace drafter through PyTorch on ROCm
+2. run the compressed prompt on `llama.cpp` built with HIP
+3. compare TTFT against the uncompressed baseline
+
+AMD's ROCm docs for Ryzen APUs call out Strix Halo specifically: ROCm 7.2.1+ supports Ryzen AI Max APUs, RDNA3.5 APUs use `gfx1151`, and Linux needs the newer KFD fixes present in kernel `6.18.4+`. This machine is already on `6.18.7`, which clears the kernel requirement.
+
+```bash
+# 1. install ROCm PyTorch in your venv (example index URL; pick the wheel that
+#    matches your ROCm release)
+cd lucebox-hub/pflash
+python -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
+pip install -e .[accelerators]
+
+# 2. build llama.cpp for HIP from the vendored submodule
+cd ../dflash/deps/llama.cpp
+cmake -B build-hip -S . -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_HIP=ON \
+  -DAMDGPU_TARGETS=gfx1151
+cmake --build build-hip --target llama-cli llama-bench -j
+
+# 3. generate a long-context NIAH case
+cd ../../../pflash
+python tests/niah_gen.py --n 1 --ctx 131072 --out /tmp/niah_128k.jsonl
+
+# 4. run baseline vs compressed prompt through llama-cli on the Strix Halo iGPU
+python tests/bench_niah_llama.py \
+  --cases /tmp/niah_128k.jsonl \
+  --llama-cli ../dflash/deps/llama.cpp/build-hip/bin/llama-cli \
+  --model /path/to/Qwen3.6-27B-Q4_K_M.gguf \
+  --ctx-size 32768 \
+  --keep-ratio 0.05 \
+  --n-gpu-layers all \
+  --flash-attn on
+```
+
+Useful Strix Halo tuning from AMD's docs:
+
+- Keep BIOS-reserved VRAM small and expand shared GPU memory through TTM/GTT instead.
+- ROCm's helper utility is `amd-ttm`; `amd-ttm --set 100` maps roughly 100 GB of shared GPU-addressable memory on 128 GB systems.
+- ROCm 7.2.1 is the first production Ryzen APU release; if ROCm is missing entirely, a Vulkan llama.cpp build can be used as a stopgap for target generation, but the intended backend here is HIP.
 
 ## OpenAI server flags
 
@@ -219,6 +267,8 @@ What we built:
 - **Qwen3.6-27B Q4_K_M target + Qwen3-0.6B drafter** is the validated pair. Other targets/drafters need keep_ratio + alpha re-calibration.
 - **NIAH single-needle** is the only retrieval task validated end-to-end. Multi-doc QA, long-form code retrieval, etc. still TBD.
 - **sm_80+** required for BSA (RTX 3090 sm_86 is the reference). On sm_75 (Turing) the build auto-disables BSA and falls back to the WMMA path; expect a slower drafter forward at long ctx.
+- **Strix Halo path in this branch** ports the prompt-compression stage, not the dflash decoder. It uses ROCm/PyTorch for the drafter scorer and `llama.cpp` HIP for the target model, so it accelerates prefill/TTFT without depending on the CUDA-only daemon.
+- **Approximate Strix Halo compressor is deprecated for global-attention tasks.** On the 20-case hard common-words/global-evidence set, null scored 66.7%, exact ROCm scored 67.3%, and approximate scored 0.0% at the same ~10x compression. Future ROCm work should compare null vs exact and treat approximate results as historical diagnostics only.
 
 ## Citation
 

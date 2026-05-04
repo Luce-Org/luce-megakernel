@@ -20,6 +20,8 @@
   We don't wait for better silicon. We rewrite the software.
 </p>
 
+> **Strix Halo / ROCm compatibility branch:** this branch adds AMD Strix Halo (`gfx1151`) support for the pflash/dflash long-context compression path, including ROCm PyTorch tooling, HIP `llama.cpp`, and a HIP exact sparse-forward path for the Qwen3 drafter.
+
 ---
 
 ## Inside the box
@@ -163,6 +165,8 @@ cmake --build build --target test_dflash -j
 
 [Full writeup →](dflash/README.md) · [Benchmarks →](dflash/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash27b)
 
+> **Strix Halo / Ryzen AI MAX+ 395 path in this branch:** `dflash` now has a HIP build for the main target + speculative-decode runtime on `gfx1151`. Verified locally with ROCm 7.2 on Qwen3.6-27B Q4_K_M + the matched DFlash draft. The old in-process PFlash `compress` daemon command is still CUDA-only; use the ROCm `pflash/` path from this branch for prompt compression.
+
 > **Qwen3.6-27B (supported, experimental draft):** same `qwen35` architecture, so the 3.6 Q4_K_M GGUF loads as a drop-in target. With z-lab's matched [Qwen3.6-27B-DFlash](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) draft (still under training, 2026-04-26 snapshot), HumanEval lands at ~78 tok/s (AL 5.05); the 3.5 draft gets ~74 tok/s. 3.5↔3.5 reference is 129.5 tok/s. AL should improve as z-lab finishes training the draft. Details in [dflash/README.md](dflash/README.md#qwen36-27b-target-experimental).
 
 ---
@@ -218,6 +222,8 @@ DFLASH_FP_PROFILE=1     # log mean / score / select / forward stage timings
 
 [Full writeup →](pflash/README.md) · [Daemon-side build / tunables →](dflash/docs/SPEC_PREFILL.md) · [Blog post →](https://lucebox.com/blog/pflash)
 
+> **Strix Halo / Ryzen AI MAX+ 395 path in this branch:** the CUDA daemon is still NVIDIA-only, but `pflash/` now includes a ROCm/HIP route for the prompt-compression half of PFlash. A small drafter scores long prompts through PyTorch on ROCm, then the compressed prompt runs through `llama.cpp` built with `GGML_HIP=ON`. See [pflash/README.md](pflash/README.md#strix-halo--rocm-path).
+
 ---
 
 ## Why this exists
@@ -240,6 +246,13 @@ All experiments in this repo are built, tuned, and benchmarked on NVIDIA RTX 309
 - **DGX Spark / GB10** (sm_121, compute capability 12.1): supported, CUDA 12.9+.
 - **Jetson AGX Thor** (sm_110): supported, CUDA 13+.
 - **Turing** (sm_75, RTX 2080): supported, CUDA 12+.
+
+For the Strix Halo port in this branch, the relevant stack is different:
+
+- **Ryzen AI MAX+ 395 / Strix Halo** (`gfx1151`, RDNA3.5 APU): supported for the `pflash/` prompt-compression path via ROCm 7.2.1+ and `llama.cpp` HIP.
+- **Ryzen AI MAX+ 395 / Strix Halo** (`gfx1151`, RDNA3.5 APU): supported for the `dflash/` target generate + speculative decode path via ROCm 7.2 HIP in this branch.
+- AMD's ROCm docs require the newer KFD fixes present in Ubuntu 24.04 HWE `6.17.0-19.19~24.04.2+` or generic Linux `6.18.4+` for Ryzen AI Max APUs.
+- Shared-memory tuning matters on Strix Halo. AMD recommends keeping BIOS VRAM small and increasing TTM/GTT instead of reserving large dedicated carve-outs.
 
 PyTorch 2.0+. `dflash/` needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops); multi-arch build is automatic (see [Running on other GPUs](#running-on-other-gpus-4090-5090-dgx-spark--gb10-jetson-agx-thor)).
 

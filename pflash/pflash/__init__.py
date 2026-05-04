@@ -1,12 +1,27 @@
-"""pflash, speculative-prefill harness around the dflash C++/CUDA daemon.
+"""pflash helpers for prompt-compression experiments.
 
-The daemon does the work — drafter forward, FlashPrefill scoring (BSA), and
-spec-decode generation are all in-process C++/CUDA. This Python package is
-just a thin client over the daemon's stdin/stdout protocol so reproduction
-benches and external tooling can drive it.
+Two execution paths live here:
+
+- the original dflash daemon client for the CUDA-only in-process runtime
+- a backend-agnostic prompt compressor + llama.cpp CLI runner for ROCm/HIP
+  targets such as Strix Halo
 """
-from .dflash_client import DflashClient
-from . import config
 
-__version__ = "0.3.0"
-__all__ = ["DflashClient", "config"]
+from . import config
+from .dflash_client import DflashClient
+from .llama_cli import LlamaCliRunner, LlamaRunResult
+from .platform import AcceleratorInfo, detect_accelerator, query_gpu_memory_mib
+from .prompt_compressor import CompressionResult, PromptCompressor
+
+__version__ = "0.4.0"
+__all__ = [
+    "AcceleratorInfo",
+    "CompressionResult",
+    "DflashClient",
+    "LlamaCliRunner",
+    "LlamaRunResult",
+    "PromptCompressor",
+    "config",
+    "detect_accelerator",
+    "query_gpu_memory_mib",
+]

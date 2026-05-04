@@ -16,8 +16,7 @@
 #include <cmath>
 #include <vector>
 #include <random>
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "device_runtime.h"
 
 #include "../src/flashprefill.h"
 
@@ -137,6 +136,7 @@ int main() {
     }
     std::printf("[fp-test] kernel 1 (compute_mean_vector): max diff = %.5f %s\n",
                 max_diff_mean, max_diff_mean < 1e-2f ? "PASS" : "FAIL");
+    if (max_diff_mean >= 1e-2f) return 1;
 
     // ── Kernel 2: compute_block_score ──
     float scale = 1.0f / std::sqrt((float)D);
@@ -176,6 +176,7 @@ int main() {
     cudaError_t le = cudaDeviceSynchronize();
     std::printf("[fp-test] kernel 4 (sparse_flash_forward): launch %s\n",
                 le == cudaSuccess ? "ok" : cudaGetErrorString(le));
+    if (le != cudaSuccess) return 1;
 
     // Numerical check kernel 4: compare GPU sparse output to CPU dense
     // attention reference (full mask, fully causal). Should match within bf16
@@ -184,6 +185,9 @@ int main() {
     CK(cudaMemcpy(O_h.data(), dO, O_h.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
 
     float max_diff_attn = 0.0f;
+    float max_abs_gpu = 0.0f;
+    int bad_q = -1, bad_h = -1, bad_d = -1;
+    float bad_ref = 0.0f, bad_gpu = 0.0f;
     for (int q = 0; q < S; ++q) {
         for (int h = 0; h < H; ++h) {
             int hk = h * Hk / H;
@@ -212,13 +216,23 @@ int main() {
                     ref += p[j] * b2f(V[j * Hk * D + hk * D + d]);
                 }
                 float gpu = b2f(O_h[q * H * D + h * D + d]);
+                max_abs_gpu = std::fmax(max_abs_gpu, std::fabs(gpu));
                 float diff = std::fabs(ref - gpu);
-                if (diff > max_diff_attn) max_diff_attn = diff;
+                if (diff > max_diff_attn) {
+                    max_diff_attn = diff;
+                    bad_q = q;
+                    bad_h = h;
+                    bad_d = d;
+                    bad_ref = ref;
+                    bad_gpu = gpu;
+                }
             }
         }
     }
-    std::printf("[fp-test] kernel 4 (sparse_flash_forward) numerics: max diff = %.5f %s\n",
-                max_diff_attn, max_diff_attn < 5e-2f ? "PASS" : "FAIL");
+    std::printf("[fp-test] kernel 4 (sparse_flash_forward) numerics: max diff = %.5f max|gpu| = %.5f at q=%d h=%d d=%d ref=%.5f gpu=%.5f %s\n",
+                max_diff_attn, max_abs_gpu, bad_q, bad_h, bad_d, bad_ref, bad_gpu,
+                max_diff_attn < 5e-2f ? "PASS" : "FAIL");
+    if (max_diff_attn >= 5e-2f) return 1;
 
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
     cudaFree(dmK); cudaFree(dS); cudaFree(dM); cudaFree(dIdx); cudaFree(dCnt);

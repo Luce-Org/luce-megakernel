@@ -170,6 +170,8 @@ Numbers will move once a Qwen3.6-matched DFlash draft lands; swap it in via `DFL
 
 ## Quick start
 
+### NVIDIA / original CUDA path
+
 ```bash
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
 cd lucebox-hub/dflash
@@ -222,6 +224,55 @@ DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
 
 **Requirements:** NVIDIA sm_75+ GPU (2080 Ti, 3090, A10, A40, 4090) or Jetson AGX Thor sm_110, CUDA 12+ (CUDA 13+ required for Thor), 22+ GB VRAM, ~80 GB disk. On Turing (SM 7.5), BF16 draft weights are auto-converted to FP16 at load time for tensor core acceleration.
 
+### Strix Halo / ROCm HIP path
+
+This branch adds a HIP build for the main DFlash decode runtime on AMD RDNA3.5 APUs such as Ryzen AI MAX+ 395 (`gfx1151`). Verified on the Strix Halo machine backing this session with ROCm 7.2.
+
+What works in the HIP build:
+
+- `test_generate` target inference on `Qwen3.6-27B-Q4_K_M.gguf`
+- `test_dflash` speculative decode with the matched `Qwen3.6-27B-DFlash` draft
+- tree-state rollback / KV copy path on HIP
+
+What does not yet work in the HIP build:
+
+- the old in-process `compress` daemon command for PFlash
+- the custom C++/CUDA FlashPrefill drafter kernels and BSA path
+
+Use the ROCm `pflash/` Python path from this branch for prompt compression on Strix Halo, then use the HIP `dflash` binary for decode.
+
+```bash
+cd lucebox-hub/dflash
+git submodule update --init --recursive
+
+ROCM_PATH=/opt/rocm cmake -B build-hip -S . \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DDFLASH27B_USE_HIP=ON \
+  -DGPU_TARGETS=gfx1151 \
+  -DCMAKE_PREFIX_PATH=/opt/rocm \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+  -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
+  -DDFLASH27B_ENABLE_BSA=OFF
+cmake --build build-hip --target test_generate test_dflash -j
+
+# target + draft
+../pflash/.venv/bin/python -c "from huggingface_hub import hf_hub_download; hf_hub_download('unsloth/Qwen3.6-27B-GGUF', 'Qwen3.6-27B-Q4_K_M.gguf', local_dir='models')"
+../pflash/.venv/bin/python -c "from huggingface_hub import hf_hub_download; hf_hub_download('z-lab/Qwen3.6-27B-DFlash', 'model.safetensors', local_dir='models/draft')"
+
+# tiny prompt smoke test
+../pflash/.venv/bin/python scripts/tokenize_prompt.py \
+  --model Qwen/Qwen3.6-27B \
+  --out /tmp/dflash_prompt.bin \
+  --prompt "Write one short sentence about Strix Halo."
+
+./build-hip/test_generate \
+  models/Qwen3.6-27B-Q4_K_M.gguf /tmp/dflash_prompt.bin 4 /tmp/out.bin
+
+./build-hip/test_dflash \
+  models/Qwen3.6-27B-Q4_K_M.gguf models/draft/model.safetensors \
+  /tmp/dflash_prompt.bin 4 /tmp/out_spec.bin
+```
+
 ## How it works
 
 **Block-diffusion draft.** Each step, the draft sees `[last_target_token, MASK×15]` plus the last 5 captured target hidden states. It denoises the masks in a single forward, producing 16 candidate tokens conditioned on real target features. Structurally stronger than chain EAGLE: every position conditions on the same captured context, not its own noisy predictions.
@@ -262,7 +313,8 @@ Research proof-of-concept, not production.
 - **Batch size 1**, single-user local inference target (Ollama / LM Studio use case)
 - **One model pair**: Qwen3.5-27B Q4_K_M target + z-lab DFlash BF16 draft. Does not generalize without rewriting the graph builders.
 - **Optional sampling**: `temperature`, `top_p`, `top_k`, `seed`, and `frequency_penalty` are honored on the OpenAI endpoint. The DDTree verify skeleton stays argmax (preserves accept rate); only the *committed* token at each verify step is drawn from a small CPU sampler chain (rep-pen → top-k → top-p → temp → multinomial). `temperature=0` (default) keeps the path bit-exact greedy. Full Leviathan-style rejection sampling on the tree is still a future addition.
-- **CUDA sm_86+ / sm_110 Thor** only. No Metal, ROCm, multi-GPU.
+- **CUDA sm_86+ / sm_110 Thor** is the original reference path.
+- **ROCm / HIP on `gfx1151` Strix Halo** works for target generate + DFlash decode, but not for the in-process PFlash `compress` path (use the separate `pflash/` ROCm path for prompt compression).
 - **Q4_K_M target** costs ~30 points of per-position accept vs the paper's BF16. Q5_K_M / Q6_K would recover most of it, if they fit.
 
 Correctness: `test_vs_oracle` validates the draft graph at cos sim 0.999812 vs the PyTorch reference. The target graph matches llama.cpp's `models/qwen35.cpp` semantically and produces bit-identical output to `test_generate` in autoregressive mode.

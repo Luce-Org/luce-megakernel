@@ -25,14 +25,94 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 namespace dflash27b {
 
+namespace {
+
+static int env_int(const char * name, int fallback) {
+    if (const char * v = std::getenv(name)) {
+        int x = std::atoi(v);
+        if (x >= 0) return x;
+    }
+    return fallback;
+}
+
+static void force_chunk_neighborhood(std::vector<uint8_t> & forced, int n_chunks,
+                                     int chunk, int radius) {
+    int lo = std::max(0, chunk - radius);
+    int hi = std::min(n_chunks - 1, chunk + radius);
+    for (int c = lo; c <= hi; ++c) forced[(size_t)c] = 1;
+}
+
+#if defined(DFLASH27B_USE_HIP)
+bool prewarm_drafter_once(const Qwen3DrafterWeights & w) {
+    static bool warmed = false;
+    if (warmed || std::getenv("DFLASH_FP_SKIP_PREWARM")) {
+        return true;
+    }
+
+    const int warm_tokens = 1024;
+    const int n_lookahead = 8;
+    std::vector<int32_t> ids((size_t)warm_tokens, 0);
+    std::vector<float> running_max;
+
+    auto t0 = std::chrono::steady_clock::now();
+    bool ok = forward_qwen3_0p6b_drafter(w, ids, n_lookahead, running_max);
+    auto t1 = std::chrono::steady_clock::now();
+    if (!ok) {
+        return false;
+    }
+
+    std::fprintf(stderr, "[drafter] HIP prewarm %.2fs (%d tokens)\n",
+                 std::chrono::duration<double>(t1 - t0).count(), warm_tokens);
+    std::fflush(stderr);
+    warmed = true;
+    return true;
+}
+#endif
+
+} // namespace
+
+bool parse_drafter_arch(const std::string & name, DrafterArch & out) {
+    if (name == "qwen3-0.6b" || name == "qwen3_0p6b" || name == "qwen3") {
+        out = DrafterArch::Qwen3_0p6b;
+        return true;
+    }
+    if (name == "qwen35-0.8b" || name == "qwen3.5-0.8b" || name == "qwen35_0p8b" || name == "qwen35") {
+        out = DrafterArch::Qwen35_0p8b;
+        return true;
+    }
+    return false;
+}
+
+const char * drafter_arch_name(DrafterArch arch) {
+    switch (arch) {
+        case DrafterArch::Qwen3_0p6b: return "qwen3-0.6b";
+        case DrafterArch::Qwen35_0p8b: return "qwen35-0.8b";
+    }
+    return "unknown";
+}
+
 bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
                   DrafterContext & out) {
+    return load_drafter(gguf_path, /*gpu_layers=*/999, DrafterArch::Qwen3_0p6b, out);
+}
+
+bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
+                  DrafterArch arch, DrafterContext & out) {
     if (out.loaded) {
         set_last_error("drafter already loaded");
+        return false;
+    }
+
+    if (arch == DrafterArch::Qwen35_0p8b) {
+        set_last_error(
+            "qwen35-0.8b exact drafter is not implemented yet: Qwen3.5 uses a hybrid "
+            "Gated DeltaNet + gated-attention architecture with fused/quantized GGUF tensors, "
+            "not the Qwen3-0.6B BF16 transformer layout");
         return false;
     }
 
@@ -61,13 +141,22 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
     }
 
     out.loaded = true;
+    out.arch = arch;
     std::fprintf(stderr,
-        "[drafter] loaded Qwen3-0.6B BF16: n_layer=%d n_head=%d n_kv=%d "
+        "[drafter] loaded %s BF16: n_layer=%d n_head=%d n_kv=%d "
         "n_embd=%d n_ff=%d head_dim=%d vocab=%d\n",
+        drafter_arch_name(arch),
         out.weights.n_layer, out.weights.n_head, out.weights.n_head_kv,
         out.weights.n_embd, out.weights.n_ff, out.weights.head_dim,
         out.weights.n_vocab);
     std::fflush(stderr);
+
+#if defined(DFLASH27B_USE_HIP)
+    if (!prewarm_drafter_once(out.weights)) {
+        return false;
+    }
+#endif
+
     return true;
 }
 
@@ -145,14 +234,68 @@ std::vector<int32_t> drafter_score_and_compress(
         m /= std::max(1, e_ - s_);
         chunk_means.push_back({m, c});
     }
-    std::partial_sort(chunk_means.begin(),
-                      chunk_means.begin() + n_keep,
-                      chunk_means.end(),
+    std::sort(chunk_means.begin(), chunk_means.end(),
                       [](auto a, auto b) { return a.first > b.first; });
+
+    // Retrieval tasks often repeat a rare key in the final query and in the
+    // needle span. Exact scores alone can keep the query while dropping the
+    // neighboring answer chunk, so force a small token-only anchor neighborhood.
+    const int head_chunks = env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8);
+    const int tail_chunks = env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24);
+    const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
+    const int anchor_radius = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS", 2);
+    const int max_anchor_hits = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", 8);
+    std::vector<uint8_t> selected_mask((size_t)n_chunks, 0);
+    std::vector<uint8_t> forced((size_t)n_chunks, 0);
+    for (int c = 0; c < std::min(n_chunks, head_chunks); ++c) forced[(size_t)c] = 1;
+    for (int c = std::max(0, n_chunks - tail_chunks); c < n_chunks; ++c) forced[(size_t)c] = 1;
+
+    const int q0 = std::max(0, S - query_tokens);
+    constexpr int NGRAM = 4;
+    for (int q = q0; q + NGRAM <= S; ++q) {
+        int hits = 0;
+        int hit_pos[8];
+        const int search_end = std::max(0, q0 - NGRAM);
+        for (int p = 0; p <= search_end && hits <= max_anchor_hits; ++p) {
+            bool same = true;
+            for (int k = 0; k < NGRAM; ++k) {
+                if (ids[(size_t)p + k] != ids[(size_t)q + k]) { same = false; break; }
+            }
+            if (same) {
+                if (hits < 8) hit_pos[hits] = p;
+                ++hits;
+            }
+        }
+        if (hits > 0 && hits <= max_anchor_hits) {
+            for (int i = 0; i < hits && i < 8; ++i) {
+                force_chunk_neighborhood(forced, n_chunks, hit_pos[i] / chunk_size, anchor_radius);
+            }
+        }
+    }
+
+    int selected_count = 0;
+    int forced_count = 0;
+    for (int c = 0; c < n_chunks; ++c) {
+        if (forced[(size_t)c]) {
+            selected_mask[(size_t)c] = 1;
+            ++selected_count;
+            ++forced_count;
+        }
+    }
+    for (const auto & cm : chunk_means) {
+        if (selected_count >= n_keep) break;
+        int c = cm.second;
+        if (!selected_mask[(size_t)c]) {
+            selected_mask[(size_t)c] = 1;
+            ++selected_count;
+        }
+    }
+
     std::vector<int> selected;
-    selected.reserve((size_t)n_keep);
-    for (int i = 0; i < n_keep; ++i) selected.push_back(chunk_means[i].second);
-    std::sort(selected.begin(), selected.end());
+    selected.reserve((size_t)selected_count);
+    for (int c = 0; c < n_chunks; ++c) {
+        if (selected_mask[(size_t)c]) selected.push_back(c);
+    }
 
     std::vector<int32_t> out;
     out.reserve((size_t)n_keep * chunk_size + 16);
@@ -175,9 +318,9 @@ std::vector<int32_t> drafter_score_and_compress(
 
     auto t2 = std::chrono::steady_clock::now();
     std::fprintf(stderr,
-        "[drafter] score_and_compress total %.2fs S=%d kept=%zu (%d/%d chunks)\n",
+        "[drafter] score_and_compress total %.2fs S=%d kept=%zu (%d/%d chunks, forced=%d)\n",
         std::chrono::duration<double>(t2 - t0).count(),
-        S, out.size(), n_keep, n_chunks);
+        S, out.size(), (int)selected.size(), n_chunks, forced_count);
     std::fflush(stderr);
 
     return out;
