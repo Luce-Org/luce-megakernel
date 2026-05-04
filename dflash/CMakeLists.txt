@@ -61,6 +61,9 @@ add_library(dflash27b STATIC
     src/qwen35_target_graph.cpp
     src/qwen3_dflash_graph.cpp
     src/qwen3_drafter.cpp
+    src/mega_pflash_native.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../megakernel/prefill.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/../megakernel/mega_pflash_score.cu
     src/qwen3_0p6b_loader.cpp
     src/qwen3_0p6b_graph.cpp
     src/flashprefill_q8.cpp
@@ -143,7 +146,10 @@ if(DFLASH27B_ENABLE_BSA AND NOT EXISTS
     set(DFLASH27B_ENABLE_BSA OFF)
 endif()
 if(DFLASH27B_ENABLE_BSA)
-    target_sources(dflash27b PRIVATE src/bsa_fwd_inst.cu src/bsa_launcher.cu)
+    target_sources(dflash27b PRIVATE
+        src/bsa_fwd_inst.cu
+        src/bsa_fwd_hdim256_inst.cu
+        src/bsa_launcher.cu)
 endif()
 
 target_include_directories(dflash27b
@@ -151,6 +157,7 @@ target_include_directories(dflash27b
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../megakernel
         ${CUDAToolkit_INCLUDE_DIRS}
 )
 if(DFLASH27B_ENABLE_BSA)
@@ -167,7 +174,10 @@ target_link_libraries(dflash27b
         ggml
         ggml-cuda
         ggml-base
+        CUDA::cublas
 )
+
+target_compile_definitions(dflash27b PRIVATE TARGET_SM=${_dflash27b_min_sm})
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
      target_compile_options(dflash27b PRIVATE
@@ -224,6 +234,16 @@ if(DFLASH27B_TESTS)
         add_executable(smoke_qwen3_0p6b_forward test/smoke_qwen3_0p6b_forward.cpp)
         target_include_directories(smoke_qwen3_0p6b_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(smoke_qwen3_0p6b_forward PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_mega_pflash_native.cpp")
+        add_executable(smoke_mega_pflash_native test/smoke_mega_pflash_native.cpp)
+        target_include_directories(smoke_mega_pflash_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(smoke_mega_pflash_native PRIVATE dflash27b ggml ggml-cuda CUDA::cudart)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_bsa_hdim256.cpp")
+        add_executable(smoke_bsa_hdim256 test/smoke_bsa_hdim256.cpp)
+        target_include_directories(smoke_bsa_hdim256 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(smoke_bsa_hdim256 PRIVATE dflash27b CUDA::cudart)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_vs_oracle.cpp")
         add_executable(test_vs_oracle test/test_vs_oracle.cpp)

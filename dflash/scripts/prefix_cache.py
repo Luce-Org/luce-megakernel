@@ -110,7 +110,10 @@ class DaemonStdoutBus:
 
             if not matched:
                 # Log line — suppress very noisy prefixes.
-                if decoded and not any(decoded.startswith(p) for p in self._SUPPRESS_PREFIXES):
+                show_timing = os.environ.get("DFLASH_SERVER_SHOW_TIMING", "0") != "0"
+                suppressed = False if show_timing else any(
+                    decoded.startswith(p) for p in self._SUPPRESS_PREFIXES)
+                if decoded and not suppressed:
                     print(f"  [daemon] {decoded}", flush=True)
 
     async def await_reply(self, prefix: str, timeout: float = 10.0) -> str:

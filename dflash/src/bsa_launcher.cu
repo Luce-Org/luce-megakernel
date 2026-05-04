@@ -3,15 +3,15 @@
 //
 // Maps our (counts[B,M,H], indices[B,M,N,H]) FlashPrefill selection format
 // to the BSA blockmask layout, fills `Flash_fwd_params`, then dispatches
-// `run_mha_fwd_block_<bf16, 128, false>`.
+// `run_mha_fwd_block_<bf16, 128|256, false>`.
 //
 // All scratch (blockmask, head_mask_type, softmax_lse) is held in a single
 // process-lifetime cache (`BsaCache`) that grows on demand and can be freed
 // explicitly via dflash_bsa_free_persistent() before the daemon swaps to
 // the target-gen path that needs full VRAM.
 //
-// Hardcoded shape: head_dim=128, block_size=128, non-causal. Add new
-// dispatch arms as we support more.
+// Supported shape: head_dim=128 for legacy Qwen3-0.6B PFlash and head_dim=256
+// for Qwen3.5-0.8B Mega PFlash FA layers. Block size is 128, non-causal.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -34,7 +34,6 @@ namespace flashprefill {
 
 namespace {
 
-constexpr int kSupportedHeadDim   = 128;
 constexpr int kSupportedBlockSize = 128;
 constexpr int kConvertThreads     = 64;
 constexpr float kLog2E            = 1.4426950408889634f;
@@ -151,9 +150,9 @@ extern "C" int launch_bsa_sparse_flash_forward_bf16(
     int s_cnt_b, int s_cnt_m, int s_cnt_h,
     cudaStream_t stream)
 {
-    if (head_dim != kSupportedHeadDim) {
-        std::fprintf(stderr, "[bsa] unsupported head_dim=%d (only %d)\n",
-                     head_dim, kSupportedHeadDim);
+    if (head_dim != 128 && head_dim != 256) {
+        std::fprintf(stderr, "[bsa] unsupported head_dim=%d (only 128 or 256)\n",
+                     head_dim);
         return -1;
     }
     if (block_size != kSupportedBlockSize) {
@@ -263,9 +262,15 @@ extern "C" int launch_bsa_sparse_flash_forward_bf16(
         params.alibi_slopes_batch_stride = 0;
         params.p_dropout             = 1.f;  // 1.0 = no dropout
 
-        FLASH_NAMESPACE::run_mha_fwd_block_<cutlass::bfloat16_t,
-                                            kSupportedHeadDim,
-                                            /*Is_causal=*/false>(params, stream);
+        if (head_dim == 256) {
+            FLASH_NAMESPACE::run_mha_fwd_block_<cutlass::bfloat16_t,
+                                                256,
+                                                /*Is_causal=*/false>(params, stream);
+        } else {
+            FLASH_NAMESPACE::run_mha_fwd_block_<cutlass::bfloat16_t,
+                                                128,
+                                                /*Is_causal=*/false>(params, stream);
+        }
     }
 
     return 0;

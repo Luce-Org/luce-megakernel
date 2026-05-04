@@ -211,7 +211,9 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
 
     @app.on_event("startup")
     async def _startup():
+        ready = asyncio.create_task(bus.await_reply("[daemon] ready", timeout=300.0))
         bus.start(asyncio.get_running_loop())
+        await ready
         await prefix_cache.startup_sync()
 
     # FIX 4: /health endpoint — Open WebUI and many clients ping this before
@@ -265,7 +267,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
             return prompt_bin, prompt_ids
         if not prefill_cfg.should_compress(len(prompt_ids)):
             return prompt_bin, prompt_ids
-        if drafter_tokenizer is None:
+        if prefill_cfg.backend == "daemon" and drafter_tokenizer is None:
             return prompt_bin, prompt_ids
 
         last_user_idx = next((i for i in range(len(msgs) - 1, -1, -1)
@@ -810,9 +812,11 @@ def main():
         if ids: stop_ids.add(ids[0])
 
     drafter_tokenizer = None
-    if prefill_cfg.enabled:
+    if prefill_cfg.enabled and prefill_cfg.backend == "daemon":
         drafter_tokenizer = AutoTokenizer.from_pretrained(
             prefill_cfg.drafter_tokenizer_id, trust_remote_code=True)
+    elif prefill_cfg.enabled and prefill_cfg.backend == "mega-native":
+        drafter_tokenizer = tokenizer
 
     app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
                     tokenizer, stop_ids,
@@ -831,7 +835,7 @@ def main():
     print(f"  tokenizer = {tokenizer_id}")
     if prefill_cfg.enabled:
         print(f"  pflash    = {prefill_cfg.mode} · threshold={prefill_cfg.threshold} "
-              f"keep={prefill_cfg.keep_ratio} drafter={prefill_cfg.drafter_gguf}")
+              f"keep={prefill_cfg.keep_ratio} backend={prefill_cfg.backend}")
     else:
         print("  pflash    = off")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

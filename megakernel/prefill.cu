@@ -1,0 +1,1943 @@
+/**
+ * BF16 Prefill: cuBLAS bf16 GEMM + standalone recurrence kernel.
+ * Weights bf16, activations bf16, state f32. No quantization, no conversion.
+ */
+
+#include "half_type.h"
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#if TARGET_SM >= 80
+#include <mma.h>
+#endif
+#include <cstdlib>
+
+#ifdef DFLASH27B_HAVE_BSA
+#include "flashprefill.h"
+#endif
+
+constexpr int HIDDEN = 1024;
+constexpr int INTER = 3584;
+constexpr int VOCAB = 248320;
+constexpr float RMS_EPS = 1e-6f;
+
+constexpr int FA_Q_HEADS = 8;
+constexpr int FA_KV_HEADS = 2;
+constexpr int FA_HEAD_DIM = 256;
+constexpr int FA_GQA = FA_Q_HEADS / FA_KV_HEADS;
+constexpr int FA_Q_SIZE = FA_Q_HEADS * FA_HEAD_DIM;
+constexpr int FA_QPROJ_SIZE = FA_Q_SIZE * 2;
+constexpr int FA_KV_SIZE = FA_KV_HEADS * FA_HEAD_DIM;
+constexpr int FA_ROT_DIM = 64;
+constexpr float FA_ROPE_THETA = 10000000.0f;
+
+constexpr int DN_HEADS = 16;
+constexpr int DN_KEY = 128;
+constexpr int DN_VAL = 128;
+constexpr int DN_CONV_K = 4;
+constexpr int DN_QK_SIZE = DN_HEADS * DN_KEY;
+constexpr int DN_V_SIZE = DN_HEADS * DN_VAL;
+constexpr int DN_CONV_CH = DN_QK_SIZE * 2 + DN_V_SIZE;
+
+constexpr int NUM_LAYERS = 24;
+constexpr int LAYER_TYPE[24] = {0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1};
+
+struct PFLayerWeights { int layer_type; int _pad[3]; void *ptrs[14]; };
+
+__device__ __forceinline__ float pf_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o); return v;
+}
+__device__ __forceinline__ float pf_warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, o)); return v;
+}
+__device__ __forceinline__ float pf_silu(float x) { return x / (1.0f + expf(-x)); }
+
+static void cublas_bf16_gemm(cublasHandle_t h,
+    const half_t *A, const half_t *B, half_t *C,
+    int S, int N, int K);
+
+static void cublas_bf16_qk_scores(cublasHandle_t h,
+    const half_t *q, int q_stride,
+    const half_t *k, int k_stride,
+    float *scores, int rows, int key_count, int dim);
+
+static void cublas_bf16_probs_v(cublasHandle_t h,
+    const half_t *probs, int prob_stride,
+    const half_t *v, int v_stride,
+    float *out, int rows, int key_count, int dim);
+
+// Embedding
+__global__ void pf_embed(const int *ids, const half_t *embed, half_t *out, int S) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= S * HIDDEN) return;
+    out[idx] = embed[ids[idx / HIDDEN] * HIDDEN + idx % HIDDEN];
+}
+
+// Batched RMSNorm: bf16 in → bf16 out, saves bf16 residual
+__global__ void pf_rmsnorm(const half_t *in, const half_t *w,
+    half_t *out, half_t *res, int S, int D) {
+    int s = blockIdx.x; if (s >= S) return;
+    int tid = threadIdx.x, wid = tid/32, lid = tid%32;
+    __shared__ float smem[32];
+    const half_t *ri = in + s*D;
+    half_t *ro = out + s*D, *rr = res + s*D;
+    float sq = 0;
+    for (int i = tid; i < D; i += blockDim.x) { float v = H2F(ri[i]); rr[i] = ri[i]; sq += v*v; }
+    sq = pf_warp_sum(sq); if(lid==0) smem[wid]=sq; __syncthreads();
+    if(wid==0){float v=(lid<blockDim.x/32)?smem[lid]:0;v=pf_warp_sum(v);if(lid==0)smem[0]=rsqrtf(v/D+RMS_EPS);}
+    __syncthreads(); float rstd = smem[0];
+    for (int i = tid; i < D; i += blockDim.x) {
+        float v = H2F(ri[i]) * rstd * (1.0f + H2F(w[i]));
+        ro[i] = F2H(v);
+    }
+}
+
+// bf16 matvec for tiny projections (beta/alpha)
+__global__ void pf_bf16_matvec(const half_t *in, const half_t *w, float *out, int S, int K, int N) {
+    int idx = blockIdx.x; if (idx >= S * N) return;
+    int s = idx / N, n = idx % N, lid = threadIdx.x;
+    const half_t *ir = in + s*K, *wr = w + n*K;
+    float sum = 0;
+    for (int k = lid; k < K; k += 32) sum += H2F(ir[k]) * H2F(wr[k]);
+    sum = pf_warp_sum(sum);
+    if (lid == 0) out[idx] = sum;
+}
+
+// bf16 result + bf16 residual → bf16 output
+__global__ void pf_add_residual_bf16(const half_t *a, const half_t *b, half_t *out, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) out[i] = F2H(H2F(a[i]) + H2F(b[i]));
+}
+
+// SiLU(gate) * up — bf16 inputs → bf16 output
+__global__ void pf_silu_mul_bf16(const half_t *gate, const half_t *up, half_t *out, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) { float g = H2F(gate[i]); out[i] = F2H(pf_silu(g) * H2F(up[i])); }
+}
+
+// ===== Standalone DeltaNet recurrence (state-in-registers, bf16 I/O, f32 state) =====
+__global__ void __launch_bounds__(512, 1)
+pf_deltanet_recurrence(
+    const half_t *qkv_proj, const half_t *z_proj,
+    const float *beta_proj, const float *alpha_proj,
+    const half_t *conv_w, const half_t *a_log,
+    const half_t *dt_bias, const half_t *norm_w,
+    float *state, float *conv_buf, half_t *output, int S)
+{
+    int h = blockIdx.x; if (h >= DN_HEADS) return;
+    int tid = threadIdx.x, wid = tid/32, lid = tid%32;
+    constexpr int NWARPS = 16;
+    constexpr float Q_SCALE = 1.0f / 11.313708498984761f;
+
+    float a_log_val = H2F(a_log[h]);
+    float dt_b = H2F(dt_bias[h]);
+
+    __shared__ float s_q[DN_KEY], s_k[DN_KEY], s_v[DN_VAL];
+    __shared__ float s_beta, s_decay;
+    __shared__ float s_gnorm[NWARPS];
+
+    float *my_state = state + h * DN_KEY * DN_VAL;
+
+    // Load state into registers
+    constexpr int CPW = DN_VAL / NWARPS;  // 8
+    constexpr int RPL = DN_KEY / 32;       // 4
+    float sreg[CPW * RPL];  // 32 floats
+
+    for (int jj = 0; jj < CPW; jj++) {
+        int j = wid * CPW + jj;
+        for (int ii = 0; ii < RPL; ii++)
+            sreg[jj*RPL+ii] = my_state[j*DN_KEY + lid+ii*32];
+    }
+
+    for (int t = 0; t < S; t++) {
+        // Conv1d + SiLU (read bf16 proj, write f32 to shared)
+        for (int c = tid; c < DN_KEY; c += 512) {
+            int ch = h*DN_KEY + c;
+            float h0=conv_buf[ch*DN_CONV_K+1],h1=conv_buf[ch*DN_CONV_K+2],h2=conv_buf[ch*DN_CONV_K+3];
+            conv_buf[ch*DN_CONV_K]=h0;conv_buf[ch*DN_CONV_K+1]=h1;conv_buf[ch*DN_CONV_K+2]=h2;
+            conv_buf[ch*DN_CONV_K+3]=H2F(qkv_proj[t*DN_CONV_CH+ch]);
+            float co=0;for(int k=0;k<DN_CONV_K;k++)co+=conv_buf[ch*DN_CONV_K+k]*H2F(conv_w[ch*DN_CONV_K+k]);
+            s_q[c]=pf_silu(co);
+        }
+        for (int c = tid; c < DN_KEY; c += 512) {
+            int ch = DN_QK_SIZE + h*DN_KEY + c;
+            float h0=conv_buf[ch*DN_CONV_K+1],h1=conv_buf[ch*DN_CONV_K+2],h2=conv_buf[ch*DN_CONV_K+3];
+            conv_buf[ch*DN_CONV_K]=h0;conv_buf[ch*DN_CONV_K+1]=h1;conv_buf[ch*DN_CONV_K+2]=h2;
+            conv_buf[ch*DN_CONV_K+3]=H2F(qkv_proj[t*DN_CONV_CH+ch]);
+            float co=0;for(int k=0;k<DN_CONV_K;k++)co+=conv_buf[ch*DN_CONV_K+k]*H2F(conv_w[ch*DN_CONV_K+k]);
+            s_k[c]=pf_silu(co);
+        }
+        for (int c = tid; c < DN_VAL; c += 512) {
+            int ch = 2*DN_QK_SIZE + h*DN_VAL + c;
+            float h0=conv_buf[ch*DN_CONV_K+1],h1=conv_buf[ch*DN_CONV_K+2],h2=conv_buf[ch*DN_CONV_K+3];
+            conv_buf[ch*DN_CONV_K]=h0;conv_buf[ch*DN_CONV_K+1]=h1;conv_buf[ch*DN_CONV_K+2]=h2;
+            conv_buf[ch*DN_CONV_K+3]=H2F(qkv_proj[t*DN_CONV_CH+ch]);
+            float co=0;for(int k=0;k<DN_CONV_K;k++)co+=conv_buf[ch*DN_CONV_K+k]*H2F(conv_w[ch*DN_CONV_K+k]);
+            s_v[c]=pf_silu(co);
+        }
+        __syncthreads();
+
+        // L2 normalize
+        if(wid==0){float sq=0;for(int i=lid;i<DN_KEY;i+=32)sq+=s_q[i]*s_q[i];sq=pf_warp_sum(sq);float n=rsqrtf(sq+1e-6f)*Q_SCALE;n=__shfl_sync(0xffffffff,n,0);for(int i=lid;i<DN_KEY;i+=32)s_q[i]*=n;}
+        if(wid==1){float sq=0;for(int i=lid;i<DN_KEY;i+=32)sq+=s_k[i]*s_k[i];sq=pf_warp_sum(sq);float n=rsqrtf(sq+1e-6f);n=__shfl_sync(0xffffffff,n,0);for(int i=lid;i<DN_KEY;i+=32)s_k[i]*=n;}
+        __syncthreads();
+
+        if(tid==0){s_beta=1.f/(1.f+expf(-beta_proj[t*DN_HEADS+h]));float x=alpha_proj[t*DN_HEADS+h]+dt_b;float sp=(x>20.f)?x:logf(1.f+expf(x));s_decay=expf(-expf(a_log_val)*sp);}
+        __syncthreads();
+        float beta = s_beta, decay = s_decay;
+        half_t *out_h = output + t * DN_V_SIZE + h * DN_VAL;
+
+        // State-in-registers recurrence
+        for (int jj = 0; jj < CPW; jj++) {
+            int j = wid * CPW + jj;
+            float kv = 0;
+            for (int ii = 0; ii < RPL; ii++) kv += sreg[jj*RPL+ii] * s_k[lid+ii*32];
+            kv = pf_warp_sum(kv); kv = __shfl_sync(0xffffffff, kv, 0);
+            float delta = (s_v[j] - decay * kv) * beta;
+            float attn = 0;
+            for (int ii = 0; ii < RPL; ii++) {
+                sreg[jj*RPL+ii] = decay * sreg[jj*RPL+ii] + s_k[lid+ii*32] * delta;
+                attn += sreg[jj*RPL+ii] * s_q[lid+ii*32];
+            }
+            attn = pf_warp_sum(attn);
+            if (lid == 0) out_h[j] = F2H(attn);
+        }
+        __syncthreads();
+
+        // Gated RMSNorm → bf16 output
+        const half_t *z_h = z_proj + t*DN_V_SIZE + h*DN_VAL;
+        float sq2=0;for(int i=tid;i<DN_VAL;i+=512){float v=H2F(out_h[i]);sq2+=v*v;}
+        sq2=pf_warp_sum(sq2);if(lid==0)s_gnorm[wid]=sq2;__syncthreads();
+        if(wid==0){float v=(lid<NWARPS)?s_gnorm[lid]:0;v=pf_warp_sum(v);if(lid==0)s_gnorm[0]=rsqrtf(v/DN_VAL+RMS_EPS);}
+        __syncthreads();float rstd=s_gnorm[0];
+        for(int i=tid;i<DN_VAL;i+=512){
+            float n=H2F(out_h[i])*rstd*H2F(norm_w[i]);
+            out_h[i]=F2H(n*pf_silu(H2F(z_h[i])));
+        }
+        __syncthreads();
+    }
+
+    // Write state back
+    for (int jj = 0; jj < CPW; jj++) {
+        int j = wid * CPW + jj;
+        for (int ii = 0; ii < RPL; ii++)
+            my_state[j*DN_KEY + lid+ii*32] = sreg[jj*RPL+ii];
+    }
+}
+
+// ===== QK norm + RoPE + KV cache =====
+__global__ void pf_qk_norm_rope(
+    half_t *q, half_t *k, const half_t *v,
+    const half_t *qnw, const half_t *knw,
+    half_t *k_cache, half_t *v_cache, int S, int max_seq)
+{
+    int idx = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    int lid = threadIdx.x % 32;
+    int total_q = S * FA_Q_HEADS, total_k = S * FA_KV_HEADS;
+    if (idx < total_q) {
+        int pos = idx / FA_Q_HEADS, head = idx % FA_Q_HEADS;
+        half_t *qh = q + pos * FA_QPROJ_SIZE + head * FA_HEAD_DIM * 2;
+        float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(qh[i]); ss += v*v; }
+        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = __shfl_sync(0xffffffff,sc,0);
+        for (int i = lid; i < FA_HEAD_DIM; i += 32) {
+            float normed = H2F(qh[i])*sc*(1.f+H2F(qnw[i]));
+            if (i < FA_ROT_DIM) {
+                float fe=float(2*(i%(FA_ROT_DIM/2)))/FA_ROT_DIM; float freq=float(pos)/powf(FA_ROPE_THETA,fe);
+                float cv=cosf(freq),sv=sinf(freq); int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
+                float pv=H2F(qh[p])*sc*(1.f+H2F(qnw[p]));
+                qh[i]=F2H((i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv));
+            } else qh[i]=F2H(normed);
+        }
+    }
+    int kidx = idx - total_q;
+    if (idx >= total_q && kidx < total_k) {
+        int pos = kidx / FA_KV_HEADS, head = kidx % FA_KV_HEADS;
+        half_t *kh = k + pos*FA_KV_SIZE + head*FA_HEAD_DIM;
+        const half_t *vh = v + pos*FA_KV_SIZE + head*FA_HEAD_DIM;
+        half_t *kc = k_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
+        half_t *vc = v_cache ? (v_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM) : nullptr;
+        float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(kh[i]); ss += v*v; }
+        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = __shfl_sync(0xffffffff,sc,0);
+        for (int i = lid; i < FA_HEAD_DIM; i += 32) {
+            float normed = H2F(kh[i])*sc*(1.f+H2F(knw[i])); float fk;
+            if (i < FA_ROT_DIM) {
+                float fe=float(2*(i%(FA_ROT_DIM/2)))/FA_ROT_DIM; float freq=float(pos)/powf(FA_ROPE_THETA,fe);
+                float cv=cosf(freq),sv=sinf(freq); int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
+                float pv=H2F(kh[p])*sc*(1.f+H2F(knw[p]));
+                fk=(i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv);
+            } else fk=normed;
+            kh[i]=F2H(fk); kc[i]=F2H(fk); if (vc) vc[i]=vh[i];
+        }
+    }
+}
+
+// ===== Causal attention (bf16 Q/K/V, f32 accumulation, bf16 output) =====
+__global__ void pf_causal_attn(const half_t *q, const half_t *k,
+    const half_t *v, half_t *out, int S)
+{
+    int idx = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    int lid = threadIdx.x % 32;
+    if (idx >= S * FA_Q_HEADS) return;
+    int pos = idx / FA_Q_HEADS, qh = idx % FA_Q_HEADS, kvh = qh / FA_GQA;
+    float scale = 1.0f / sqrtf(float(FA_HEAD_DIM));
+    constexpr int EPL = FA_HEAD_DIM / 32;
+    const half_t *qv = q + pos*FA_QPROJ_SIZE + qh*FA_HEAD_DIM*2;
+    const half_t *gv = qv + FA_HEAD_DIM;
+    half_t *ov = out + pos*FA_Q_SIZE + qh*FA_HEAD_DIM;
+    float ql[EPL]; for(int e=0;e<EPL;e++) ql[e]=H2F(qv[lid*EPL+e]);
+    float oa[EPL]={}; float mx=-1e30f, se=0;
+    for (int kp = 0; kp <= pos; kp++) {
+        const half_t *kv=k+kp*FA_KV_SIZE+kvh*FA_HEAD_DIM;
+        const half_t *vv=v+kp*FA_KV_SIZE+kvh*FA_HEAD_DIM;
+        float sc=0; for(int e=0;e<EPL;e++) sc+=ql[e]*H2F(kv[lid*EPL+e]);
+        sc=pf_warp_sum(sc)*scale; sc=__shfl_sync(0xffffffff,sc,0);
+        float om=mx; mx=fmaxf(mx,sc); float ed=expf(om-mx); se=se*ed+expf(sc-mx);
+        float wt=expf(sc-mx); for(int e=0;e<EPL;e++) oa[e]=oa[e]*ed+wt*H2F(vv[lid*EPL+e]);
+    }
+    float rs=1.f/se;
+    for(int e=0;e<EPL;e++){int i=lid*EPL+e;float g=1.f/(1.f+expf(-H2F(gv[i])));ov[i]=F2H(oa[e]*rs*g);}
+}
+
+// Final norm
+__global__ void pf_final_norm(const half_t *hidden, const half_t *w,
+    half_t *normed, half_t *hidden_out, int S) {
+    int tid=threadIdx.x, wid=tid/32, lid=tid%32;
+    __shared__ float smem[16];
+    const half_t *row = hidden + (S-1)*HIDDEN;
+    float sq=0; for(int i=tid;i<HIDDEN;i+=blockDim.x){float v=H2F(row[i]);sq+=v*v;}
+    sq=pf_warp_sum(sq);if(lid==0)smem[wid]=sq;__syncthreads();
+    if(wid==0){float v=(lid<blockDim.x/32)?smem[lid]:0;v=pf_warp_sum(v);if(lid==0)smem[0]=rsqrtf(v/HIDDEN+RMS_EPS);}
+    __syncthreads();float rstd=smem[0];
+    for(int i=tid;i<HIDDEN;i+=blockDim.x){
+        float v=H2F(row[i]);
+        normed[i]=F2H(v*rstd*(1.f+H2F(w[i])));
+        hidden_out[i]=row[i];
+    }
+}
+
+// LM head: bf16 weight × bf16 hidden
+__global__ void pf_lm_head(const half_t *hidden, const half_t *w,
+    float *bmv, int *bmi, int N) {
+    __shared__ half_t s_h[HIDDEN];
+    for(int i=threadIdx.x;i<HIDDEN;i+=blockDim.x) s_h[i]=hidden[i];
+    __syncthreads();
+    int wid=threadIdx.x/32, lid=threadIdx.x%32, nw=blockDim.x/32;
+    int rpb=(N+gridDim.x-1)/gridDim.x, rs=blockIdx.x*rpb, re=min(rs+rpb,N);
+    float lm=-1e30f; int li=-1;
+    for(int m=rs+wid;m<re;m+=nw){const half_t *wr=w+m*HIDDEN;float s=0;
+        for(int k=lid*8;k<HIDDEN;k+=32*8){for(int i=0;i<8;i++)s+=H2F(wr[k+i])*H2F(s_h[k+i]);}
+        s=pf_warp_sum(s);if(lid==0&&s>lm){lm=s;li=m;}}
+    lm=__shfl_sync(0xffffffff,lm,0);li=__shfl_sync(0xffffffff,li,0);
+    __shared__ float wm[32]; __shared__ int wi[32];
+    if(lid==0){wm[wid]=lm;wi[wid]=li;}__syncthreads();
+    if(wid==0){float mv=(lid<nw)?wm[lid]:-1e30f;int mi=(lid<nw)?wi[lid]:-1;
+        for(int o=16;o>0;o>>=1){float ov=__shfl_down_sync(0xffffffff,mv,o);int oi=__shfl_down_sync(0xffffffff,mi,o);if(ov>mv){mv=ov;mi=oi;}}
+        if(lid==0){bmv[blockIdx.x]=mv;bmi[blockIdx.x]=mi;}}
+}
+__global__ void pf_lm_reduce(const float *bmv, const int *bmi, int *out, int nb) {
+    int tid=threadIdx.x; float best=-1e30f; int bi=-1;
+    for(int i=tid;i<nb;i+=blockDim.x){float v=bmv[i];if(v>best){best=v;bi=bmi[i];}}
+    __shared__ float sv[256]; __shared__ int si[256];
+    sv[tid]=best;si[tid]=bi;__syncthreads();
+    for(int s=blockDim.x/2;s>0;s>>=1){if(tid<s&&sv[tid+s]>sv[tid]){sv[tid]=sv[tid+s];si[tid]=si[tid+s];}__syncthreads();}
+    if(tid==0)*out=si[0];
+}
+
+// ===== V3: Chunk-parallel DeltaNet — phase 1 (intra-chunk, parallel) =====
+// Launch: <<<dim3(N_CHUNKS, DN_HEADS), CHUNK_BLOCK>>>
+// Per (chunk n, head h):
+//   1. Load K[n, :, h, :], V[n, :, h, :] from f32 qkv_pre into shared.
+//   2. Compute β_eff = sigmoid(beta_proj), g = -exp(a_log) * softplus(alpha_proj + dt_bias) for each position.
+//   3. cs = cumsum(g). Write to global.
+//   4. Build M[i,j] = β_eff[i] * exp(cs[i]-cs[j]) * (K[i]·K[j]) strict lower tri.
+//   5. Initialize U = β * V, W = β * exp(cs) * K.
+//   6. Forward substitute: u[i] = U[i] - Σ_{s<i} M[i,s] * u[s], same for w.
+//   7. Write u, w to global.
+// All math in f32. Output u_intra/w_intra are f32 [N, C, H, D].
+constexpr int DN_CHUNK_C = 8;       // chunk size (last chunk may be partial)
+constexpr int DN_CHUNK_BLOCK = 128; // threads per block
+
+__global__ void pf_dn_chunk_phase1(
+    const float *qkv_pre,        // [S, DN_CONV_CH] f32
+    const float *beta_proj,      // [S, DN_HEADS] f32
+    const float *alpha_proj,     // [S, DN_HEADS] f32
+    const half_t *a_log,
+    const half_t *dt_bias,
+    float *u_out,                // [N, C, DN_HEADS, DN_VAL]
+    float *w_out,                // [N, C, DN_HEADS, DN_KEY]
+    float *cs_out,               // [N, C, DN_HEADS]
+    int S)
+{
+    int n = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    int t_start = n * DN_CHUNK_C;
+
+    // Alias buffers: K and w share storage, V and u share storage. After K is used for
+    // building M and initializing w, we overwrite it with w. Same for V → u.
+    __shared__ float s_K_w[DN_CHUNK_C * DN_KEY];
+    __shared__ float s_V_u[DN_CHUNK_C * DN_VAL];
+    __shared__ float s_beta[DN_CHUNK_C];
+    __shared__ float s_cs[DN_CHUNK_C];
+    __shared__ float s_M[DN_CHUNK_C * DN_CHUNK_C];
+    float *s_K = s_K_w;
+    float *s_V = s_V_u;
+    float *s_u = s_V_u;
+    float *s_w = s_K_w;
+
+    float a_log_val = H2F(a_log[h]);
+    float dt_b = H2F(dt_bias[h]);
+
+    // Load K and V chunks
+    for (int ci = tid; ci < DN_CHUNK_C * DN_KEY; ci += DN_CHUNK_BLOCK) {
+        int c = ci / DN_KEY;
+        int d = ci % DN_KEY;
+        int t = t_start + c;
+        s_K[ci] = (t < S) ? qkv_pre[t * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY + d] : 0.f;
+    }
+    for (int ci = tid; ci < DN_CHUNK_C * DN_VAL; ci += DN_CHUNK_BLOCK) {
+        int c = ci / DN_VAL;
+        int d = ci % DN_VAL;
+        int t = t_start + c;
+        s_V[ci] = (t < S) ? qkv_pre[t * DN_CONV_CH + 2 * DN_QK_SIZE + h * DN_VAL + d] : 0.f;
+    }
+
+    // Compute beta_eff and g per chunk position (1 thread per position, C=8)
+    if (tid < DN_CHUNK_C) {
+        int t = t_start + tid;
+        if (t < S) {
+            s_beta[tid] = 1.f / (1.f + expf(-beta_proj[t * DN_HEADS + h]));
+            float x = alpha_proj[t * DN_HEADS + h] + dt_b;
+            float sp = (x > 20.f) ? x : logf(1.f + expf(x));
+            s_cs[tid] = -expf(a_log_val) * sp;
+        } else {
+            s_beta[tid] = 0.f;
+            s_cs[tid] = 0.f;
+        }
+    }
+    __syncthreads();
+
+    // Cumulative sum of g -> cs (sequential, thread 0, C small)
+    if (tid == 0) {
+        for (int i = 1; i < DN_CHUNK_C; i++) s_cs[i] += s_cs[i - 1];
+        for (int i = 0; i < DN_CHUNK_C; i++) {
+            int t = t_start + i;
+            if (t < S) cs_out[(n * DN_CHUNK_C + i) * DN_HEADS + h] = s_cs[i];
+        }
+    }
+    __syncthreads();
+
+    // Compute M[i,j] for strict lower tri (j < i). Each thread handles one or more (i, j).
+    for (int ij = tid; ij < DN_CHUNK_C * DN_CHUNK_C; ij += DN_CHUNK_BLOCK) {
+        int i = ij / DN_CHUNK_C;
+        int j = ij % DN_CHUNK_C;
+        float val = 0.f;
+        if (j < i) {
+            float kk = 0.f;
+            #pragma unroll
+            for (int d = 0; d < DN_KEY; d++) {
+                kk += s_K[i * DN_KEY + d] * s_K[j * DN_KEY + d];
+            }
+            val = s_beta[i] * expf(s_cs[i] - s_cs[j]) * kk;
+        }
+        s_M[ij] = val;
+    }
+    __syncthreads();
+
+    // Initialize u = β * V, w = β * exp(cs) * K
+    for (int ci = tid; ci < DN_CHUNK_C * DN_VAL; ci += DN_CHUNK_BLOCK) {
+        int c = ci / DN_VAL;
+        s_u[ci] = s_beta[c] * s_V[ci];
+    }
+    for (int ci = tid; ci < DN_CHUNK_C * DN_KEY; ci += DN_CHUNK_BLOCK) {
+        int c = ci / DN_KEY;
+        s_w[ci] = s_beta[c] * expf(s_cs[c]) * s_K[ci];
+    }
+    __syncthreads();
+
+    // Forward substitute: u[i] -= Σ_{s<i} M[i,s] u[s]; same for w
+    #pragma unroll
+    for (int i = 1; i < DN_CHUNK_C; i++) {
+        for (int d = tid; d < DN_VAL; d += DN_CHUNK_BLOCK) {
+            float acc = 0.f;
+            for (int s = 0; s < i; s++) {
+                acc += s_M[i * DN_CHUNK_C + s] * s_u[s * DN_VAL + d];
+            }
+            s_u[i * DN_VAL + d] -= acc;
+        }
+        for (int d = tid; d < DN_KEY; d += DN_CHUNK_BLOCK) {
+            float acc = 0.f;
+            for (int s = 0; s < i; s++) {
+                acc += s_M[i * DN_CHUNK_C + s] * s_w[s * DN_KEY + d];
+            }
+            s_w[i * DN_KEY + d] -= acc;
+        }
+        __syncthreads();
+    }
+
+    // Write u and w to global, layout [N, C, H, D]
+    for (int ci = tid; ci < DN_CHUNK_C * DN_VAL; ci += DN_CHUNK_BLOCK) {
+        int c = ci / DN_VAL;
+        int d = ci % DN_VAL;
+        int t = t_start + c;
+        if (t < S) {
+            u_out[((n * DN_CHUNK_C + c) * DN_HEADS + h) * DN_VAL + d] = s_u[ci];
+        }
+    }
+    for (int ci = tid; ci < DN_CHUNK_C * DN_KEY; ci += DN_CHUNK_BLOCK) {
+        int c = ci / DN_KEY;
+        int d = ci % DN_KEY;
+        int t = t_start + c;
+        if (t < S) {
+            w_out[((n * DN_CHUNK_C + c) * DN_HEADS + h) * DN_KEY + d] = s_w[ci];
+        }
+    }
+}
+
+// ===== V3: Chunk-parallel DeltaNet — phase 2 (inter-chunk, sequential per head) =====
+// Launch: <<<dim3(DN_HEADS, J_SPLITS), PHASE2_BLOCK>>>
+// Each block owns 1 head and a slice of DN_VAL rows (j). State slice in shared memory.
+// Sequential loop over N chunks.
+//
+// Two variants compiled into the binary:
+//   pf_dn_chunk_phase2       — scalar FP32 reference (always-correct baseline)
+//   pf_dn_chunk_phase2_wmma  — WMMA m16n16k16 d-compute (Phase 2 of Path B)
+// Runtime dispatcher in the orchestrator picks based on
+// MEGAKERNEL_DN_PHASE2_WMMA_RUNTIME env var (default 1 -> WMMA).
+constexpr int DN_PHASE2_J_SPLITS = 4;                      // split DN_VAL across this many blocks per head
+constexpr int DN_PHASE2_J_PER_BLOCK = DN_VAL / DN_PHASE2_J_SPLITS;   // 32
+constexpr int DN_PHASE2_BLOCK = 128;                       // threads per block
+
+// ===== Scalar FP32 phase2 (reference path) =====
+__global__ void __launch_bounds__(DN_PHASE2_BLOCK, 1)
+pf_dn_chunk_phase2(
+    const float *u_in,           // [N, C, H, Dv]
+    const float *w_in,           // [N, C, H, Dk]
+    const float *cs_in,          // [N*C, H]
+    const float *qkv_pre,        // [S, DN_CONV_CH]   (we need Q and K here, K is shared with phase1)
+    float *state,                // [H, Dv, Dk] f32 — persistent across decode too
+    half_t *output,       // [S, Dv*H] bf16 (raw, before gated rmsnorm)
+    int S, int N)
+{
+    int h = blockIdx.x;
+    int js = blockIdx.y;
+    int tid = threadIdx.x;
+    int j_start = js * DN_PHASE2_J_PER_BLOCK;
+
+    // Dynamic shared memory layout (+1 stride padding on Dk dim to avoid 32-way bank conflicts)
+    constexpr int DK_S = DN_KEY + 1;   // 129
+    extern __shared__ float smem[];
+    float *s_state = smem;
+    float *s_u     = s_state + DN_PHASE2_J_PER_BLOCK * DK_S;
+    float *s_w     = s_u     + DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK;
+    float *s_Q     = s_w     + DN_CHUNK_C * DK_S;
+    float *s_K     = s_Q     + DN_CHUNK_C * DK_S;
+    float *s_d     = s_K     + DN_CHUNK_C * DK_S;
+    float *s_qkt   = s_d     + DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK;
+    float *s_cs    = s_qkt   + DN_CHUNK_C * DN_CHUNK_C;
+    float *s_decay_rem_buf = s_cs + DN_CHUNK_C;
+    // (s_decay_total kept as a single __shared__ scalar below)
+
+    // Load state slice for this head and j-range from global (pack into padded stride DK_S)
+    for (int ji = tid; ji < DN_PHASE2_J_PER_BLOCK * DN_KEY; ji += DN_PHASE2_BLOCK) {
+        int j = ji / DN_KEY;
+        int i = ji % DN_KEY;
+        s_state[j * DK_S + i] = state[((h * DN_VAL) + (j_start + j)) * DN_KEY + i];
+    }
+    __syncthreads();
+
+    for (int n = 0; n < N; n++) {
+        int t_start = n * DN_CHUNK_C;
+
+        // Load u[n, :, h, j_start : j_start+J_per] -> s_u  [C, J_per]
+        for (int ci = tid; ci < DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK; ci += DN_PHASE2_BLOCK) {
+            int c = ci / DN_PHASE2_J_PER_BLOCK;
+            int j = ci % DN_PHASE2_J_PER_BLOCK;
+            int t = t_start + c;
+            if (t < S) {
+                s_u[ci] = u_in[((n * DN_CHUNK_C + c) * DN_HEADS + h) * DN_VAL + j_start + j];
+            } else {
+                s_u[ci] = 0.f;
+            }
+        }
+        // Load w[n, :, h, :] → s_w with padded stride DK_S
+        for (int ci = tid; ci < DN_CHUNK_C * DN_KEY; ci += DN_PHASE2_BLOCK) {
+            int c = ci / DN_KEY;
+            int d = ci % DN_KEY;
+            int t = t_start + c;
+            if (t < S) {
+                s_w[c * DK_S + d] = w_in[((n * DN_CHUNK_C + c) * DN_HEADS + h) * DN_KEY + d];
+            } else {
+                s_w[c * DK_S + d] = 0.f;
+            }
+        }
+        // Load Q and K from qkv_pre → s_Q, s_K with padded stride DK_S
+        for (int ci = tid; ci < DN_CHUNK_C * DN_KEY; ci += DN_PHASE2_BLOCK) {
+            int c = ci / DN_KEY;
+            int d = ci % DN_KEY;
+            int t = t_start + c;
+            if (t < S) {
+                s_Q[c * DK_S + d] = qkv_pre[t * DN_CONV_CH + h * DN_KEY + d];
+                s_K[c * DK_S + d] = qkv_pre[t * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY + d];
+            } else {
+                s_Q[c * DK_S + d] = 0.f;
+                s_K[c * DK_S + d] = 0.f;
+            }
+        }
+        // Load cs for this chunk [C]
+        if (tid < DN_CHUNK_C) {
+            int t = t_start + tid;
+            s_cs[tid] = (t < S) ? cs_in[(n * DN_CHUNK_C + tid) * DN_HEADS + h] : 0.f;
+        }
+        __syncthreads();
+
+        // Compute d and QKt simultaneously (no cross-dependency → no sync needed between)
+        // d[c, j] = u[c, j] - Σ_i w[c, i] * s_state[j, i]
+        for (int ci = tid; ci < DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK; ci += DN_PHASE2_BLOCK) {
+            int c = ci / DN_PHASE2_J_PER_BLOCK;
+            int j = ci % DN_PHASE2_J_PER_BLOCK;
+            float acc = 0.f;
+            #pragma unroll
+            for (int i = 0; i < DN_KEY; i++) {
+                acc += s_w[c * DK_S + i] * s_state[j * DK_S + i];
+            }
+            s_d[ci] = s_u[ci] - acc;
+        }
+        // QKt[c, s] = Q[c] @ K[s] (continues in same threadblock section, no sync between)
+        for (int ij = tid; ij < DN_CHUNK_C * DN_CHUNK_C; ij += DN_PHASE2_BLOCK) {
+            int c = ij / DN_CHUNK_C;
+            int sp = ij % DN_CHUNK_C;
+            float sum = 0.f;
+            #pragma unroll
+            for (int d = 0; d < DN_KEY; d++) {
+                sum += s_Q[c * DK_S + d] * s_K[sp * DK_S + d];
+            }
+            s_qkt[ij] = sum;
+        }
+        __syncthreads();
+
+        // Compute output o[c, j] = o_inter + o_intra
+        //   o_inter[c, j] = exp(cs[c]) * (Q[c] · state[j, :])
+        //   o_intra[c, j] = Σ_{s<=c} (QKt[c,s] * exp(cs[c]-cs[s])) * d[s, j]
+        for (int ci = tid; ci < DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK; ci += DN_PHASE2_BLOCK) {
+            int c = ci / DN_PHASE2_J_PER_BLOCK;
+            int j = ci % DN_PHASE2_J_PER_BLOCK;
+            int t = t_start + c;
+            if (t >= S) continue;
+
+            // o_inter
+            float qs = 0.f;
+            #pragma unroll
+            for (int i = 0; i < DN_KEY; i++) {
+                qs += s_Q[c * DK_S + i] * s_state[j * DK_S + i];
+            }
+            float cs_c = s_cs[c];
+            float o_inter = expf(cs_c) * qs;
+
+            // o_intra: strictly-lower-plus-diag mask, s from 0..c
+            float o_intra = 0.f;
+            for (int sp = 0; sp <= c; sp++) {
+                float l = expf(cs_c - s_cs[sp]);
+                o_intra += s_qkt[c * DN_CHUNK_C + sp] * l * s_d[sp * DN_PHASE2_J_PER_BLOCK + j];
+            }
+
+            float o = o_inter + o_intra;
+            output[t * DN_V_SIZE + h * DN_VAL + j_start + j] = F2H(o);
+        }
+        __syncthreads();
+
+        // Precompute decay_rem[c] = exp(cs_end - cs[c]) and decay_total = exp(cs_end) once.
+        float cs_end = s_cs[DN_CHUNK_C - 1];
+        __shared__ float s_decay_total_static;
+        if (tid < DN_CHUNK_C) s_decay_rem_buf[tid] = expf(cs_end - s_cs[tid]);
+        if (tid == 0) s_decay_total_static = expf(cs_end);
+        __syncthreads();
+        float s_decay_total = s_decay_total_static;
+
+        // Premultiply d_scaled[c, j] = decay_rem[c] * d[c, j] (in-place on s_d is fine since d is done with)
+        for (int ci = tid; ci < DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK; ci += DN_PHASE2_BLOCK) {
+            int c = ci / DN_PHASE2_J_PER_BLOCK;
+            s_d[ci] *= s_decay_rem_buf[c];
+        }
+        __syncthreads();
+
+        // State update: S[j, i] = decay_total * S[j, i] + Σ_c d_scaled[c, j] * K[c, i]
+        for (int ji = tid; ji < DN_PHASE2_J_PER_BLOCK * DN_KEY; ji += DN_PHASE2_BLOCK) {
+            int j = ji / DN_KEY;
+            int i = ji % DN_KEY;
+            int off = j * DK_S + i;
+            float s_val = s_decay_total * s_state[off];
+            #pragma unroll
+            for (int c = 0; c < DN_CHUNK_C; c++) {
+                s_val += s_d[c * DN_PHASE2_J_PER_BLOCK + j] * s_K[c * DK_S + i];
+            }
+            s_state[off] = s_val;
+        }
+        __syncthreads();
+    }
+
+    // Write state slice back to global
+    for (int ji = tid; ji < DN_PHASE2_J_PER_BLOCK * DN_KEY; ji += DN_PHASE2_BLOCK) {
+        int j = ji / DN_KEY;
+        int i = ji % DN_KEY;
+        state[((h * DN_VAL) + (j_start + j)) * DN_KEY + i] = s_state[j * DK_S + i];
+    }
+}
+
+// ===== WMMA phase2 (Path B Phase 2: d-compute on tensor cores) =====
+//
+// Same math, same I/O contract as pf_dn_chunk_phase2 above. The only
+// section that differs is the d-compute inner product (lines marked
+// "WMMA d compute" below); o_inter, o_intra, and the state update stay
+// scalar in this Phase. Bf16 mirrors of s_state and s_w are added to
+// shared memory and refreshed at chunk boundaries.
+//
+// d[c, j] = u[c, j] - Σ_d w[c, d] · state[j, d]
+//   GEMM shape M=DN_CHUNK_C(8 padded to 16) × N=DN_PHASE2_J_PER_BLOCK(32) × K=DN_KEY(128).
+//   Two warps (warp_id<2) each compute one 16×16 N-tile via m16n16k16 fragments
+//   over 8 K-iterations. Output stored in s_wmma_d_tile[16][32], then
+//   subtract-u + write to s_d (same f32 layout as scalar path).
+#if TARGET_SM >= 80
+__global__ void __launch_bounds__(DN_PHASE2_BLOCK, 2)
+pf_dn_chunk_phase2_wmma(
+    const float *u_in,
+    const float *w_in,
+    const float *cs_in,
+    const float *qkv_pre,
+    float *state,
+    half_t *output,
+    int S, int N)
+{
+    using namespace nvcuda::wmma;
+
+    int h = blockIdx.x;
+    int js = blockIdx.y;
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int j_start = js * DN_PHASE2_J_PER_BLOCK;
+
+    // Dynamic shared memory layout (f32 base + bf16 mirrors + WMMA tile).
+    // s_w (f32) was used by the scalar d-compute path; the WMMA d-compute
+    // reads s_w_bf16 only, so s_w f32 is dropped here (saves 4 KB).
+    constexpr int DK_S = DN_KEY + 1;   // 129 (f32 stride, bank-conflict pad)
+    constexpr int DK_B = DN_KEY;       // 128 (bf16 stride; no pad needed for our access pattern)
+    extern __shared__ float smem[];
+    float *s_state = smem;
+    float *s_u     = s_state + DN_PHASE2_J_PER_BLOCK * DK_S;
+    float *s_Q     = s_u     + DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK;
+    float *s_K     = s_Q     + DN_CHUNK_C * DK_S;
+    float *s_d     = s_K     + DN_CHUNK_C * DK_S;
+    float *s_qkt   = s_d     + DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK;
+    float *s_cs    = s_qkt   + DN_CHUNK_C * DN_CHUNK_C;
+    float *s_decay_rem_buf = s_cs + DN_CHUNK_C;
+    float *s_wmma_tile     = s_decay_rem_buf + DN_CHUNK_C;   // [16][32] f32 = 16×32 floats
+                                                             // shared by d-compute (Phase 2) and
+                                                             // o_inter qs (Phase 3); the d output
+                                                             // is consumed before o_inter starts.
+    half_t *s_state_bf16 =
+        reinterpret_cast<half_t *>(s_wmma_tile + 16 * 32);
+    half_t *s_w_bf16     = s_state_bf16 + DN_PHASE2_J_PER_BLOCK * DK_B;
+    half_t *s_Q_bf16     = s_w_bf16     + 16 * DK_B;   // M-padded to 16
+    half_t *s_K_bf16     = s_Q_bf16     + 16 * DK_B;   // M-padded to 16 (Phase 4)
+    // s_d_bf16: column-major-style storage [C-padded × J_per] for matrix_a col_major load.
+    half_t *s_d_bf16     = s_K_bf16     + 16 * DK_B;   // 16 × 32 (Phase 4)
+
+    // Load state slice for this head and j-range from global (f32).
+    for (int ji = tid; ji < DN_PHASE2_J_PER_BLOCK * DN_KEY; ji += DN_PHASE2_BLOCK) {
+        int j = ji / DN_KEY;
+        int i = ji % DN_KEY;
+        s_state[j * DK_S + i] = state[((h * DN_VAL) + (j_start + j)) * DN_KEY + i];
+    }
+    __syncthreads();
+
+    // Initial bf16 mirror of state (refreshed at chunk end after state update).
+    for (int ji = tid; ji < DN_PHASE2_J_PER_BLOCK * DK_B; ji += DN_PHASE2_BLOCK) {
+        int j = ji / DK_B;
+        int i = ji % DK_B;
+        s_state_bf16[j * DK_B + i] = F2H(s_state[j * DK_S + i]);
+    }
+    __syncthreads();
+
+    for (int n = 0; n < N; n++) {
+        int t_start = n * DN_CHUNK_C;
+
+        // Load u[n, :, h, j_start : j_start+J_per] -> s_u  [C, J_per]
+        for (int ci = tid; ci < DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK; ci += DN_PHASE2_BLOCK) {
+            int c = ci / DN_PHASE2_J_PER_BLOCK;
+            int j = ci % DN_PHASE2_J_PER_BLOCK;
+            int t = t_start + c;
+            if (t < S) {
+                s_u[ci] = u_in[((n * DN_CHUNK_C + c) * DN_HEADS + h) * DN_VAL + j_start + j];
+            } else {
+                s_u[ci] = 0.f;
+            }
+        }
+        // Load w[n, :, h, :] → s_w_bf16 directly (WMMA path doesn't need the f32 mirror).
+        for (int ci = tid; ci < DN_CHUNK_C * DN_KEY; ci += DN_PHASE2_BLOCK) {
+            int c = ci / DN_KEY;
+            int d = ci % DN_KEY;
+            int t = t_start + c;
+            float v = (t < S) ? w_in[((n * DN_CHUNK_C + c) * DN_HEADS + h) * DN_KEY + d] : 0.f;
+            s_w_bf16[c * DK_B + d] = F2H(v);
+        }
+        // Pad s_w_bf16 rows DN_CHUNK_C..15 with zero so the WMMA fragment sees
+        // a clean 16×K tile (M=8 → pad to M=16).
+        for (int ci = tid; ci < (16 - DN_CHUNK_C) * DK_B; ci += DN_PHASE2_BLOCK) {
+            int c = (ci / DK_B) + DN_CHUNK_C;
+            int d = ci % DK_B;
+            s_w_bf16[c * DK_B + d] = F2H(0.f);
+        }
+        // Load Q and K from qkv_pre → s_Q, s_K with padded stride DK_S, ALSO mirror Q,K to bf16.
+        for (int ci = tid; ci < DN_CHUNK_C * DN_KEY; ci += DN_PHASE2_BLOCK) {
+            int c = ci / DN_KEY;
+            int d = ci % DN_KEY;
+            int t = t_start + c;
+            float qv, kv;
+            if (t < S) {
+                qv = qkv_pre[t * DN_CONV_CH + h * DN_KEY + d];
+                kv = qkv_pre[t * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY + d];
+            } else {
+                qv = 0.f;
+                kv = 0.f;
+            }
+            s_Q[c * DK_S + d] = qv;
+            s_K[c * DK_S + d] = kv;
+            s_Q_bf16[c * DK_B + d] = F2H(qv);
+            s_K_bf16[c * DK_B + d] = F2H(kv);
+        }
+        // Pad s_Q_bf16 / s_K_bf16 rows DN_CHUNK_C..15 with zero (M-padding for fragment shape).
+        for (int ci = tid; ci < (16 - DN_CHUNK_C) * DK_B; ci += DN_PHASE2_BLOCK) {
+            int c = (ci / DK_B) + DN_CHUNK_C;
+            int d = ci % DK_B;
+            s_Q_bf16[c * DK_B + d] = F2H(0.f);
+            s_K_bf16[c * DK_B + d] = F2H(0.f);
+        }
+        // Load cs for this chunk [C]
+        if (tid < DN_CHUNK_C) {
+            int t = t_start + tid;
+            s_cs[tid] = (t < S) ? cs_in[(n * DN_CHUNK_C + tid) * DN_HEADS + h] : 0.f;
+        }
+        __syncthreads();
+
+        // ─── WMMA d compute ────────────────────────────────────────────────
+        // d[c, j] = u[c, j] - Σ_d w[c, d] · state[j, d]
+        // Treat as GEMM C(M=16, N=16) += A(M=16, K=16) * B(K=16, N=16) over K=128 in 8 tiles.
+        // A = w_bf16  (row_major, ld=DK_B=128, [16, 16] tile)
+        // B = state_bf16 viewed as [K=Dk, N=J_per] col_major (state rows are j, cols are d)
+        //   col_major B[k, n] = ptr[k + n*ld]; we want B[k, n] = state[n, k] = ptr[n*Dk + k]
+        //   so ld = DK_B = 128 and ptr seeks past n_tile*16 columns.
+        // Two warps; warp_id < 2 each handles one 16-wide N-tile (n_tile = warp_id).
+        if (warp_id < 2) {
+            int n_tile = warp_id;
+            fragment<matrix_a, 16, 16, 16, half_t, row_major>     a_w;
+            fragment<matrix_b, 16, 16, 16, half_t, col_major>     b_state;
+            fragment<accumulator, 16, 16, 16, float>                     c_d;
+            fill_fragment(c_d, 0.f);
+            #pragma unroll
+            for (int kk = 0; kk < DN_KEY; kk += 16) {
+                load_matrix_sync(a_w,    s_w_bf16     + kk,                          DK_B);
+                load_matrix_sync(b_state, s_state_bf16 + n_tile * 16 * DK_B + kk,    DK_B);
+                mma_sync(c_d, a_w, b_state, c_d);
+            }
+            // Store this warp's 16×16 N-tile at columns [n_tile*16, n_tile*16+16).
+            store_matrix_sync(s_wmma_tile + n_tile * 16, c_d, /*ldc=*/32, mem_row_major);
+        }
+        __syncthreads();
+
+        // Subtract u and write s_d (same f32 layout as the scalar kernel).
+        for (int ci = tid; ci < DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK; ci += DN_PHASE2_BLOCK) {
+            int c = ci / DN_PHASE2_J_PER_BLOCK;
+            int j = ci % DN_PHASE2_J_PER_BLOCK;
+            s_d[ci] = s_u[ci] - s_wmma_tile[c * 32 + j];
+        }
+        // ─── /WMMA d compute ───────────────────────────────────────────────
+
+        // QKt[c, s] = Q[c] @ K[s] — scalar (M=N=8 too small for WMMA)
+        for (int ij = tid; ij < DN_CHUNK_C * DN_CHUNK_C; ij += DN_PHASE2_BLOCK) {
+            int c = ij / DN_CHUNK_C;
+            int sp = ij % DN_CHUNK_C;
+            float sum = 0.f;
+            #pragma unroll
+            for (int d = 0; d < DN_KEY; d++) {
+                sum += s_Q[c * DK_S + d] * s_K[sp * DK_S + d];
+            }
+            s_qkt[ij] = sum;
+        }
+        __syncthreads();
+
+        // ─── WMMA o_inter qs compute (Phase 3) ─────────────────────────────
+        // qs[c, j] = Σ_d Q[c, d] · state[j, d]  — same shape as d-compute
+        // (M=8 padded to 16, N=32 split as 2 N-tiles of 16, K=128 in 8 K-iters).
+        // Overwrites s_wmma_tile (d-compute output is dead by this point —
+        // s_d was finalized in the subtract-u step, and the QKt sync above
+        // ensures all warps are done reading s_wmma_tile from the d phase).
+        if (warp_id < 2) {
+            int n_tile = warp_id;
+            fragment<matrix_a, 16, 16, 16, half_t, row_major>     a_Q;
+            fragment<matrix_b, 16, 16, 16, half_t, col_major>     b_state;
+            fragment<accumulator, 16, 16, 16, float>                     c_qs;
+            fill_fragment(c_qs, 0.f);
+            #pragma unroll
+            for (int kk = 0; kk < DN_KEY; kk += 16) {
+                load_matrix_sync(a_Q,    s_Q_bf16     + kk,                          DK_B);
+                load_matrix_sync(b_state, s_state_bf16 + n_tile * 16 * DK_B + kk,    DK_B);
+                mma_sync(c_qs, a_Q, b_state, c_qs);
+            }
+            store_matrix_sync(s_wmma_tile + n_tile * 16, c_qs, /*ldc=*/32, mem_row_major);
+        }
+        __syncthreads();
+        // ─── /WMMA o_inter qs compute ──────────────────────────────────────
+
+        // ─── Precompute exp tables (eliminates ~32× redundancy in o-compute) ─
+        // o_inter / o_intra do `expf(cs[c])` and `expf(cs[c] - cs[sp])` per
+        // (c, j) — but the values only depend on (c, sp), not on j. Precompute
+        // 44 unique entries once per chunk into s_qkt's unused upper triangle
+        // and beyond, then look up in the hot loop.
+        //
+        // Layout reuses s_qkt's tail (s_qkt has DN_CHUNK_C * DN_CHUNK_C = 64
+        // entries; we use the upper triangle (sp > c) for s_exp_diff and
+        // place s_exp_cs at the very end via an unused slot — cleaner: use
+        // the diagonal+lower tri positions s_qkt[c, sp] with sp <= c (that's
+        // 36 used slots with QKt's actual data, but QKt's full 64 are loaded
+        // and we read sp <= c only). So s_exp_diff CANNOT collide with s_qkt.
+        // Allocate two private smem arrays via __shared__ inside the kernel
+        // body (they're function-scope statics — safe under __launch_bounds__).
+        __shared__ float s_exp_cs[DN_CHUNK_C];
+        __shared__ float s_exp_diff[DN_CHUNK_C * DN_CHUNK_C];   // s_exp_diff[c*C + sp] for sp <= c
+        if (tid < DN_CHUNK_C) {
+            s_exp_cs[tid] = expf(s_cs[tid]);
+        }
+        if (tid < DN_CHUNK_C * DN_CHUNK_C) {
+            int c = tid / DN_CHUNK_C;
+            int sp = tid % DN_CHUNK_C;
+            s_exp_diff[tid] = (sp <= c) ? expf(s_cs[c] - s_cs[sp]) : 0.f;
+        }
+        __syncthreads();
+
+        // Compute output o[c, j] = o_inter + o_intra. qs in s_wmma_tile, exps tabled.
+        for (int ci = tid; ci < DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK; ci += DN_PHASE2_BLOCK) {
+            int c = ci / DN_PHASE2_J_PER_BLOCK;
+            int j = ci % DN_PHASE2_J_PER_BLOCK;
+            int t = t_start + c;
+            if (t >= S) continue;
+
+            float qs = s_wmma_tile[c * 32 + j];
+            float o_inter = s_exp_cs[c] * qs;
+
+            float o_intra = 0.f;
+            #pragma unroll
+            for (int sp = 0; sp <= c; sp++) {
+                float l = s_exp_diff[c * DN_CHUNK_C + sp];
+                o_intra += s_qkt[c * DN_CHUNK_C + sp] * l * s_d[sp * DN_PHASE2_J_PER_BLOCK + j];
+            }
+
+            float o = o_inter + o_intra;
+            output[t * DN_V_SIZE + h * DN_VAL + j_start + j] = F2H(o);
+        }
+        __syncthreads();
+
+        // Decay precomp + state update (scalar — Phase 4 will WMMA the state update).
+        float cs_end = s_cs[DN_CHUNK_C - 1];
+        __shared__ float s_decay_total_static;
+        if (tid < DN_CHUNK_C) s_decay_rem_buf[tid] = expf(cs_end - s_cs[tid]);
+        if (tid == 0) s_decay_total_static = expf(cs_end);
+        __syncthreads();
+        float s_decay_total = s_decay_total_static;
+
+        for (int ci = tid; ci < DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK; ci += DN_PHASE2_BLOCK) {
+            int c = ci / DN_PHASE2_J_PER_BLOCK;
+            s_d[ci] *= s_decay_rem_buf[c];
+        }
+        __syncthreads();
+
+        // ─── Fill s_d_bf16 (Phase 4 staging) ────────────────────────────────
+        // Layout: s_d_bf16[c * J_per + j] for c in [0, 16), j in [0, J_per).
+        // Rows c in [0, DN_CHUNK_C) = bf16(s_d); rows c in [DN_CHUNK_C, 16) = 0.
+        for (int ci = tid; ci < DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK; ci += DN_PHASE2_BLOCK) {
+            s_d_bf16[ci] = F2H(s_d[ci]);
+        }
+        for (int ci = tid; ci < (16 - DN_CHUNK_C) * DN_PHASE2_J_PER_BLOCK; ci += DN_PHASE2_BLOCK) {
+            s_d_bf16[DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK + ci] = F2H(0.f);
+        }
+        __syncthreads();
+
+        // ─── WMMA state update (Phase 4) ────────────────────────────────────
+        // state[j, i] = γ * state[j, i] + Σ_c d_scaled[c, j] · K[c, i]
+        //
+        // GEMM: C(M=32, N=128) += A(M=32, K=8 padded to 16) · B(K=8 pad 16, N=128)
+        // where A[j, c] = d_scaled[c, j] (i.e., d_scaled^T) and B[c, i] = K[c, i].
+        //
+        // Tiling: M=32 → 2 M-tiles of 16; N=128 → 8 N-tiles of 16; K=16 → 1 K-iter.
+        // 16 tiles total / 4 warps = 4 tiles per warp.
+        //   warp 0: m_tile=0, n_tile in [0..3]
+        //   warp 1: m_tile=0, n_tile in [4..7]
+        //   warp 2: m_tile=1, n_tile in [0..3]
+        //   warp 3: m_tile=1, n_tile in [4..7]
+        //
+        // Accumulator preload: load existing state[m_tile, n_tile] into c_state f32
+        // fragment, then scale all elements by s_decay_total (per-thread element loop
+        // — fragment::x is documented public on Volta+). mma_sync then adds A·B.
+        //
+        // A layout — col_major matrix_a, ld=J_per: A[j_in_tile, c] = ptr[j_in_tile + c*ld]
+        //   we want = s_d_bf16[c*J_per + j] = s_d_bf16[c*32 + (m_tile*16 + j_in_tile)]
+        //   ptr = s_d_bf16 + m_tile*16, ld = J_per (=32). ✓
+        // B layout — row_major matrix_b, ld=DK_B: B[c, i_in_tile] = ptr[c*ld + i_in_tile]
+        //   we want = s_K_bf16[c*DK_B + (n_tile*16 + i_in_tile)]
+        //   ptr = s_K_bf16 + n_tile*16, ld = DK_B (=128). ✓
+        // C layout — row_major accumulator, ld=DK_S:
+        //   ptr = s_state + m_tile*16*DK_S + n_tile*16, ld = DK_S (=129). ✓
+        {
+            int m_tile = warp_id >> 1;             // 0 or 1
+            int n_base = (warp_id & 1) * 4;        // 0 or 4
+            fragment<matrix_a, 16, 16, 16, half_t, col_major> a_d;
+            fragment<matrix_b, 16, 16, 16, half_t, row_major> b_K;
+            load_matrix_sync(a_d, s_d_bf16 + m_tile * 16, /*ld=*/DN_PHASE2_J_PER_BLOCK);
+
+            #pragma unroll
+            for (int nt = 0; nt < 4; nt++) {
+                int n_tile = n_base + nt;
+                fragment<accumulator, 16, 16, 16, float> c_state;
+                load_matrix_sync(c_state,
+                    s_state + m_tile * 16 * DK_S + n_tile * 16,
+                    DK_S, mem_row_major);
+                // Pre-scale by γ so mma_sync(c, a, b, c) implements c = a·b + γ·state.
+                #pragma unroll
+                for (int e = 0; e < c_state.num_elements; e++) {
+                    c_state.x[e] *= s_decay_total;
+                }
+                load_matrix_sync(b_K, s_K_bf16 + n_tile * 16, /*ld=*/DK_B);
+                mma_sync(c_state, a_d, b_K, c_state);
+                store_matrix_sync(
+                    s_state + m_tile * 16 * DK_S + n_tile * 16,
+                    c_state, DK_S, mem_row_major);
+            }
+        }
+        __syncthreads();
+        // Refresh s_state_bf16 mirror for the next chunk's d / o_inter WMMA reads.
+        // Paired conversion via __float22bfloat162_rn: 4096 → 2048 stores per chunk.
+        // s_state_bf16 stride DK_B=128 is 4-byte aligned (bf162 is 4 bytes), and
+        // adjacent (i, i+1) within a row are in the same DK_B row. s_state stride
+        // DK_S=129 floats means &s_state[j*DK_S + i] for even i is 4-byte but not
+        // 8-byte aligned — so we read two scalars and pack rather than load float2.
+        for (int ji = tid; ji < DN_PHASE2_J_PER_BLOCK * (DN_KEY / 2); ji += DN_PHASE2_BLOCK) {
+            int j  = ji / (DN_KEY / 2);
+            int i2 = (ji % (DN_KEY / 2)) * 2;        // 0, 2, 4, ..., 126
+            float v0 = s_state[j * DK_S + i2 + 0];
+            float v1 = s_state[j * DK_S + i2 + 1];
+            __nv_bfloat162 packed = __floats2bfloat162_rn(v0, v1);
+            *reinterpret_cast<__nv_bfloat162 *>(&s_state_bf16[j * DK_B + i2]) = packed;
+        }
+        __syncthreads();
+        // ─── /WMMA state update ─────────────────────────────────────────────
+    }
+
+    // Write state slice back to global.
+    for (int ji = tid; ji < DN_PHASE2_J_PER_BLOCK * DN_KEY; ji += DN_PHASE2_BLOCK) {
+        int j = ji / DN_KEY;
+        int i = ji % DN_KEY;
+        state[((h * DN_VAL) + (j_start + j)) * DN_KEY + i] = s_state[j * DK_S + i];
+    }
+}
+#endif // TARGET_SM >= 80
+
+// ===== V3: Fused QK norm + RoPE + KV cache (single fused QKV buffer) =====
+// The full attention Q/K/V live in one fused buffer with row stride (FA_QPROJ_SIZE + 2*FA_KV_SIZE).
+// Q occupies cols [0, FA_QPROJ_SIZE), K cols [FA_QPROJ_SIZE, FA_QPROJ_SIZE+FA_KV_SIZE), V the rest.
+__global__ void pf_qk_norm_rope_fused(
+    half_t *qkv_fused,
+    const half_t *qnw, const half_t *knw,
+    half_t *k_cache, half_t *v_cache, int S, int max_seq)
+{
+    constexpr int STRIDE = FA_QPROJ_SIZE + 2*FA_KV_SIZE;
+    constexpr int K_COL = FA_QPROJ_SIZE;
+    constexpr int V_COL = FA_QPROJ_SIZE + FA_KV_SIZE;
+    int idx = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    int lid = threadIdx.x % 32;
+    int total_q = S * FA_Q_HEADS, total_k = S * FA_KV_HEADS;
+    if (idx < total_q) {
+        int pos = idx / FA_Q_HEADS, head = idx % FA_Q_HEADS;
+        half_t *qh = qkv_fused + pos * STRIDE + head * FA_HEAD_DIM * 2;
+        float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(qh[i]); ss += v*v; }
+        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = __shfl_sync(0xffffffff,sc,0);
+        for (int i = lid; i < FA_HEAD_DIM; i += 32) {
+            float normed = H2F(qh[i])*sc*(1.f+H2F(qnw[i]));
+            if (i < FA_ROT_DIM) {
+                float fe=float(2*(i%(FA_ROT_DIM/2)))/FA_ROT_DIM; float freq=float(pos)/powf(FA_ROPE_THETA,fe);
+                float cv=cosf(freq),sv=sinf(freq); int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
+                float pv=H2F(qh[p])*sc*(1.f+H2F(qnw[p]));
+                qh[i]=F2H((i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv));
+            } else qh[i]=F2H(normed);
+        }
+    }
+    int kidx = idx - total_q;
+    if (idx >= total_q && kidx < total_k) {
+        int pos = kidx / FA_KV_HEADS, head = kidx % FA_KV_HEADS;
+        half_t *kh = qkv_fused + pos * STRIDE + K_COL + head * FA_HEAD_DIM;
+        const half_t *vh = qkv_fused + pos * STRIDE + V_COL + head * FA_HEAD_DIM;
+        half_t *kc = k_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
+        half_t *vc = v_cache ? (v_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM) : nullptr;
+        float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(kh[i]); ss += v*v; }
+        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = __shfl_sync(0xffffffff,sc,0);
+        for (int i = lid; i < FA_HEAD_DIM; i += 32) {
+            float normed = H2F(kh[i])*sc*(1.f+H2F(knw[i])); float fk;
+            if (i < FA_ROT_DIM) {
+                float fe=float(2*(i%(FA_ROT_DIM/2)))/FA_ROT_DIM; float freq=float(pos)/powf(FA_ROPE_THETA,fe);
+                float cv=cosf(freq),sv=sinf(freq); int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
+                float pv=H2F(kh[p])*sc*(1.f+H2F(knw[p]));
+                fk=(i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv);
+            } else fk=normed;
+            kh[i]=F2H(fk); kc[i]=F2H(fk); if (vc) vc[i]=vh[i];
+        }
+    }
+}
+
+__global__ void pf_capture_fa_q_tail(
+    const half_t *qkv_fused,
+    half_t *q_tail,
+    int fa_layer_idx,
+    int S,
+    int tail_len)
+{
+    constexpr int STRIDE = FA_QPROJ_SIZE + 2*FA_KV_SIZE;
+    int total = tail_len * FA_Q_HEADS * FA_HEAD_DIM;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total || tail_len <= 0 || tail_len > S) return;
+    int d = idx % FA_HEAD_DIM;
+    int h = (idx / FA_HEAD_DIM) % FA_Q_HEADS;
+    int t = idx / (FA_HEAD_DIM * FA_Q_HEADS);
+    int pos = S - tail_len + t;
+    constexpr int Q_TAIL_CAPACITY = 8;
+    q_tail[(size_t)fa_layer_idx * Q_TAIL_CAPACITY * FA_Q_HEADS * FA_HEAD_DIM
+           + (size_t)t * FA_Q_HEADS * FA_HEAD_DIM
+           + (size_t)h * FA_HEAD_DIM
+           + d] = qkv_fused[(size_t)pos * STRIDE + h * FA_HEAD_DIM * 2 + d];
+}
+
+__global__ void pf_pack_fa_qkv_for_flashprefill(
+    const half_t *qkv_fused,
+    half_t *q_pack,
+    half_t *k_pack,
+    half_t *v_pack,
+    int S)
+{
+    constexpr int STRIDE = FA_QPROJ_SIZE + 2*FA_KV_SIZE;
+    constexpr int K_COL = FA_QPROJ_SIZE;
+    constexpr int V_COL = FA_QPROJ_SIZE + FA_KV_SIZE;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int q_total = S * FA_Q_HEADS * FA_HEAD_DIM;
+    int kv_total = S * FA_KV_HEADS * FA_HEAD_DIM;
+    int total = q_total + 2 * kv_total;
+    if (idx >= total) return;
+    if (idx < q_total) {
+        int d = idx % FA_HEAD_DIM;
+        int h = (idx / FA_HEAD_DIM) % FA_Q_HEADS;
+        int pos = idx / (FA_HEAD_DIM * FA_Q_HEADS);
+        q_pack[idx] = qkv_fused[(size_t)pos * STRIDE + h * FA_HEAD_DIM * 2 + d];
+    } else if (idx < q_total + kv_total) {
+        int j = idx - q_total;
+        int d = j % FA_HEAD_DIM;
+        int h = (j / FA_HEAD_DIM) % FA_KV_HEADS;
+        int pos = j / (FA_HEAD_DIM * FA_KV_HEADS);
+        k_pack[j] = qkv_fused[(size_t)pos * STRIDE + K_COL + h * FA_HEAD_DIM + d];
+    } else {
+        int j = idx - q_total - kv_total;
+        int d = j % FA_HEAD_DIM;
+        int h = (j / FA_HEAD_DIM) % FA_KV_HEADS;
+        int pos = j / (FA_HEAD_DIM * FA_KV_HEADS);
+        v_pack[j] = qkv_fused[(size_t)pos * STRIDE + V_COL + h * FA_HEAD_DIM + d];
+    }
+}
+
+__global__ void pf_apply_fa_gate_inplace(
+    const half_t *qkv_fused,
+    half_t *out,
+    int S)
+{
+    constexpr int STRIDE = FA_QPROJ_SIZE + 2*FA_KV_SIZE;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = S * FA_Q_HEADS * FA_HEAD_DIM;
+    if (idx >= total) return;
+    int d = idx % FA_HEAD_DIM;
+    int h = (idx / FA_HEAD_DIM) % FA_Q_HEADS;
+    int pos = idx / (FA_HEAD_DIM * FA_Q_HEADS);
+    const half_t *gate = qkv_fused + (size_t)pos * STRIDE + h * FA_HEAD_DIM * 2 + FA_HEAD_DIM;
+    float g = 1.0f / (1.0f + expf(-H2F(gate[d])));
+    out[idx] = F2H(H2F(out[idx]) * g);
+}
+
+#ifdef DFLASH27B_HAVE_BSA
+static bool pf_flashprefill_bsa_attn(
+    const half_t *qkv_fused,
+    half_t *pack_buf,
+    half_t *out,
+    int S,
+    cudaStream_t stream)
+{
+    if (S <= 0) return false;
+    half_t *q_pack = pack_buf;
+    half_t *k_pack = q_pack + (size_t)S * FA_Q_SIZE;
+    half_t *v_pack = k_pack + (size_t)S * FA_KV_SIZE;
+    const int total = S * (FA_Q_SIZE + 2 * FA_KV_SIZE);
+    pf_pack_fa_qkv_for_flashprefill<<<(total + 255) / 256, 256, 0, stream>>>(
+        qkv_fused, q_pack, k_pack, v_pack, S);
+
+    dflash27b::flashprefill::FlashPrefillConfig cfg;
+    cfg.block_size = 128;
+    if (const char *a = std::getenv("DFLASH_FP_ALPHA")) {
+        float v = (float)std::atof(a);
+        if (v > 0.0f && v < 1.0f) cfg.alpha = v;
+    }
+    int rc = dflash27b::flashprefill::flash_prefill_forward_bf16(
+        q_pack, k_pack, v_pack, out,
+        1, S, FA_Q_HEADS, FA_KV_HEADS, FA_HEAD_DIM,
+        1.0f / sqrtf((float)FA_HEAD_DIM),
+        cfg);
+    if (rc != 0) return false;
+    pf_apply_fa_gate_inplace<<<(S * FA_Q_SIZE + 255) / 256, 256, 0, stream>>>(
+        qkv_fused, out, S);
+    return true;
+}
+#endif
+
+// ===== V3: Causal attention over fused QKV buffer =====
+__global__ void pf_causal_attn_fused(const half_t *qkv_fused, half_t *out, int S)
+{
+    constexpr int STRIDE = FA_QPROJ_SIZE + 2*FA_KV_SIZE;
+    constexpr int K_COL = FA_QPROJ_SIZE;
+    constexpr int V_COL = FA_QPROJ_SIZE + FA_KV_SIZE;
+    int idx = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    int lid = threadIdx.x % 32;
+    if (idx >= S * FA_Q_HEADS) return;
+    int pos = idx / FA_Q_HEADS, qh = idx % FA_Q_HEADS, kvh = qh / FA_GQA;
+    float scale = 1.0f / sqrtf(float(FA_HEAD_DIM));
+    constexpr int EPL = FA_HEAD_DIM / 32;
+    const half_t *qv = qkv_fused + pos*STRIDE + qh*FA_HEAD_DIM*2;
+    const half_t *gv = qv + FA_HEAD_DIM;
+    half_t *ov = out + pos*FA_Q_SIZE + qh*FA_HEAD_DIM;
+    float ql[EPL]; for(int e=0;e<EPL;e++) ql[e]=H2F(qv[lid*EPL+e]);
+    float oa[EPL]={}; float mx=-1e30f, se=0;
+    for (int kp = 0; kp <= pos; kp++) {
+        const half_t *kv=qkv_fused+kp*STRIDE+K_COL+kvh*FA_HEAD_DIM;
+        const half_t *vv=qkv_fused+kp*STRIDE+V_COL+kvh*FA_HEAD_DIM;
+        float sc=0; for(int e=0;e<EPL;e++) sc+=ql[e]*H2F(kv[lid*EPL+e]);
+        sc=pf_warp_sum(sc)*scale; sc=__shfl_sync(0xffffffff,sc,0);
+        float om=mx; mx=fmaxf(mx,sc); float ed=expf(om-mx); se=se*ed+expf(sc-mx);
+        float wt=expf(sc-mx); for(int e=0;e<EPL;e++) oa[e]=oa[e]*ed+wt*H2F(vv[lid*EPL+e]);
+    }
+    float rs=1.f/se;
+    for(int e=0;e<EPL;e++){int i=lid*EPL+e;float g=1.f/(1.f+expf(-H2F(gv[i])));ov[i]=F2H(oa[e]*rs*g);}
+}
+
+__global__ void pf_causal_softmax_to_bf16(
+    const float *scores,
+    half_t *probs,
+    int q_start,
+    int rows,
+    int key_count,
+    int stride)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int tid = threadIdx.x;
+    int wid = tid / 32;
+    int lid = tid % 32;
+    int q_pos = q_start + row;
+    const float scale = 1.0f / sqrtf(float(FA_HEAD_DIM));
+    const float *score_row = scores + row * stride;
+    half_t *prob_row = probs + row * stride;
+
+    float local_max = -3.402823466e+38f;
+    for (int k = tid; k < key_count; k += blockDim.x) {
+        const float score = (k <= q_pos) ? (score_row[k] * scale) : -3.402823466e+38f;
+        local_max = fmaxf(local_max, score);
+    }
+    local_max = pf_warp_max(local_max);
+    __shared__ float warp_vals[32];
+    if (lid == 0) warp_vals[wid] = local_max;
+    __syncthreads();
+    float row_max = -3.402823466e+38f;
+    if (wid == 0) {
+        row_max = (lid < blockDim.x / 32) ? warp_vals[lid] : -3.402823466e+38f;
+        row_max = pf_warp_max(row_max);
+        if (lid == 0) warp_vals[0] = row_max;
+    }
+    __syncthreads();
+    row_max = warp_vals[0];
+
+    float local_sum = 0.0f;
+    for (int k = tid; k < key_count; k += blockDim.x) {
+        if (k <= q_pos) {
+            local_sum += expf(score_row[k] * scale - row_max);
+        }
+    }
+    local_sum = pf_warp_sum(local_sum);
+    if (lid == 0) warp_vals[wid] = local_sum;
+    __syncthreads();
+    float row_sum = 0.0f;
+    if (wid == 0) {
+        row_sum = (lid < blockDim.x / 32) ? warp_vals[lid] : 0.0f;
+        row_sum = pf_warp_sum(row_sum);
+        if (lid == 0) warp_vals[0] = row_sum;
+    }
+    __syncthreads();
+    row_sum = warp_vals[0];
+    const float inv_sum = row_sum > 0.0f ? (1.0f / row_sum) : 0.0f;
+
+    for (int k = tid; k < key_count; k += blockDim.x) {
+        float p = 0.0f;
+        if (k <= q_pos) {
+            p = expf(score_row[k] * scale - row_max) * inv_sum;
+        }
+        prob_row[k] = F2H(p);
+    }
+}
+
+__global__ void pf_apply_attention_gate_bf16_fused(
+    const float *attn,
+    const half_t *qkv_fused,
+    half_t *out,
+    int q_start,
+    int rows,
+    int q_head)
+{
+    constexpr int STRIDE = FA_QPROJ_SIZE + 2*FA_KV_SIZE;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * FA_HEAD_DIM;
+    if (idx >= total) return;
+    int row = idx / FA_HEAD_DIM;
+    int d = idx % FA_HEAD_DIM;
+    const half_t *gate = qkv_fused + (q_start + row) * STRIDE + q_head * FA_HEAD_DIM * 2 + FA_HEAD_DIM;
+    half_t *out_row = out + (q_start + row) * FA_Q_SIZE + q_head * FA_HEAD_DIM;
+    float g = 1.0f / (1.0f + expf(-H2F(gate[d])));
+    out_row[d] = F2H(attn[row * FA_HEAD_DIM + d] * g);
+}
+
+static void pf_causal_attn_fused_tiled_cublas(
+    cublasHandle_t h,
+    const half_t *qkv_fused,
+    half_t *prob_scratch,
+    float *score_scratch,
+    float *attn_scratch,
+    half_t *out,
+    int S,
+    int query_block_tokens,
+    cudaStream_t stream)
+{
+    constexpr int STRIDE = FA_QPROJ_SIZE + 2*FA_KV_SIZE;
+    constexpr int K_COL = FA_QPROJ_SIZE;
+    constexpr int V_COL = FA_QPROJ_SIZE + FA_KV_SIZE;
+    query_block_tokens = max(1, min(query_block_tokens, S));
+
+    for (int qh = 0; qh < FA_Q_HEADS; ++qh) {
+        const int kvh = qh / FA_GQA;
+        const half_t *k_head = qkv_fused + K_COL + kvh * FA_HEAD_DIM;
+        const half_t *v_head = qkv_fused + V_COL + kvh * FA_HEAD_DIM;
+
+        for (int q0 = 0; q0 < S; q0 += query_block_tokens) {
+            const int rows = min(query_block_tokens, S - q0);
+            const int key_count = q0 + rows;
+            const half_t *q_head = qkv_fused + q0 * STRIDE + qh * FA_HEAD_DIM * 2;
+
+            cublas_bf16_qk_scores(h, q_head, STRIDE, k_head, STRIDE, score_scratch, rows, key_count, FA_HEAD_DIM);
+            pf_causal_softmax_to_bf16<<<rows, 512, 0, stream>>>(
+                score_scratch, prob_scratch, q0, rows, key_count, key_count);
+            cublas_bf16_probs_v(h, prob_scratch, key_count, v_head, STRIDE, attn_scratch, rows, key_count, FA_HEAD_DIM);
+            pf_apply_attention_gate_bf16_fused<<<(rows * FA_HEAD_DIM + 255) / 256, 256, 0, stream>>>(
+                attn_scratch, qkv_fused, out, q0, rows, qh);
+        }
+    }
+}
+
+// ===== V3: Fused SiLU(gate)*up from concatenated [S, 2*N] buffer =====
+__global__ void pf_silu_mul_fused(const half_t *fused, half_t *out, int S, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= S * N) return;
+    int s = idx / N;
+    int n = idx % N;
+    float gate_val = H2F(fused[s * 2 * N + n]);
+    float up_val   = H2F(fused[s * 2 * N + N + n]);
+    out[idx] = F2H(pf_silu(gate_val) * up_val);
+}
+
+static void pf_mlp_chunked_fused(
+    cublasHandle_t cublas,
+    const half_t *normalized,
+    const half_t *residual,
+    half_t *hidden,
+    const half_t *gate_up_w,
+    const half_t *down_w,
+    half_t *gate_up_buf,
+    half_t *mlp_buf,
+    int S,
+    int chunk_tokens,
+    cudaStream_t stream)
+{
+    chunk_tokens = max(1, min(chunk_tokens, S));
+    for (int offset = 0; offset < S; offset += chunk_tokens) {
+        const int rows = min(chunk_tokens, S - offset);
+        const half_t *norm_chunk = normalized + static_cast<size_t>(offset) * HIDDEN;
+        const half_t *residual_chunk = residual + static_cast<size_t>(offset) * HIDDEN;
+        half_t *hidden_chunk = hidden + static_cast<size_t>(offset) * HIDDEN;
+
+        cublas_bf16_gemm(cublas, norm_chunk, gate_up_w, gate_up_buf, rows, 2 * INTER, HIDDEN);
+        pf_silu_mul_fused<<<(rows * INTER + 255) / 256, 256, 0, stream>>>(gate_up_buf, mlp_buf, rows, INTER);
+        cublas_bf16_gemm(cublas, mlp_buf, down_w, gate_up_buf, rows, HIDDEN, INTER);
+        pf_add_residual_bf16<<<(rows * HIDDEN + 255) / 256, 256, 0, stream>>>(
+            gate_up_buf, residual_chunk, hidden_chunk, rows * HIDDEN);
+    }
+}
+
+static int pf_mlp_chunk_tokens(int S) {
+    int chunk = 32768;
+    if (const char *e = std::getenv("MEGAKERNEL_MLP_CHUNK_TOKENS")) {
+        int v = std::atoi(e);
+        if (v > 0) chunk = v;
+    }
+    constexpr int PROJ_WORKSPACE_COLS =
+        (DN_CONV_CH > FA_QPROJ_SIZE ? DN_CONV_CH : FA_QPROJ_SIZE) > INTER
+            ? (DN_CONV_CH > FA_QPROJ_SIZE ? DN_CONV_CH : FA_QPROJ_SIZE)
+            : INTER;
+    int workspace_limited = max(1, (int)(((long long)S * PROJ_WORKSPACE_COLS) / (2 * INTER)));
+    return max(1, min(min(chunk, S), workspace_limited));
+}
+
+// ===== V3: Parallel pre-projection of DeltaNet Q/K/V =====
+// Computes conv1d + SiLU for all (t, h, channel) in parallel, plus L2-norm for Q/K.
+// Reads initial conv_buf for t<3. Does NOT update conv_buf — pf_deltanet_update_conv_buf does.
+// Launch: <<<dim3(S, DN_HEADS), 128>>>. Output: f32 qkv_pre[S, DN_CONV_CH] row-major.
+__global__ void pf_deltanet_preproject(
+    const half_t *qkv_proj,   // [S, DN_CONV_CH] bf16
+    const half_t *conv_w,     // [DN_CONV_CH, DN_CONV_K] bf16
+    const float *conv_buf_init,      // [DN_CONV_CH, DN_CONV_K] f32
+    float *qkv_pre,                  // [S, DN_CONV_CH] f32 output
+    int S)
+{
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    if (t >= S) return;
+    int tid = threadIdx.x, wid = tid/32, lid = tid%32;
+    constexpr int NTHREADS = 128;
+    constexpr int NWARPS = NTHREADS / 32;  // 4
+    constexpr float Q_SCALE = 1.0f / 11.313708498984761f;
+
+    __shared__ float s_q[DN_KEY];
+    __shared__ float s_k[DN_KEY];
+    __shared__ float s_v[DN_VAL];
+    __shared__ float smem[NWARPS + 1];
+
+    auto conv1d_silu = [&](int ch) -> float {
+        float val = 0;
+        #pragma unroll
+        for (int k = 0; k < DN_CONV_K; k++) {
+            int src_t = t - (DN_CONV_K - 1) + k;  // t-3, t-2, t-1, t
+            float x;
+            if (src_t >= 0) {
+                x = H2F(qkv_proj[src_t * DN_CONV_CH + ch]);
+            } else {
+                // Initial conv_buf: slot (src_t + DN_CONV_K) holds in(src_t) from caller
+                x = conv_buf_init[ch * DN_CONV_K + (src_t + DN_CONV_K)];
+            }
+            val += x * H2F(conv_w[ch * DN_CONV_K + k]);
+        }
+        return pf_silu(val);
+    };
+
+    // Q conv1d
+    for (int c = tid; c < DN_KEY; c += NTHREADS) {
+        s_q[c] = conv1d_silu(h * DN_KEY + c);
+    }
+    // K conv1d
+    for (int c = tid; c < DN_KEY; c += NTHREADS) {
+        s_k[c] = conv1d_silu(DN_QK_SIZE + h * DN_KEY + c);
+    }
+    // V conv1d
+    for (int c = tid; c < DN_VAL; c += NTHREADS) {
+        s_v[c] = conv1d_silu(2 * DN_QK_SIZE + h * DN_VAL + c);
+    }
+    __syncthreads();
+
+    // L2 norm Q (full-block reduction)
+    float sq = 0;
+    for (int i = tid; i < DN_KEY; i += NTHREADS) sq += s_q[i] * s_q[i];
+    sq = pf_warp_sum(sq);
+    if (lid == 0) smem[wid] = sq;
+    __syncthreads();
+    if (wid == 0) {
+        float v = (lid < NWARPS) ? smem[lid] : 0;
+        v = pf_warp_sum(v);
+        if (lid == 0) smem[NWARPS] = rsqrtf(v + 1e-6f) * Q_SCALE;
+    }
+    __syncthreads();
+    float q_norm = smem[NWARPS];
+    for (int i = tid; i < DN_KEY; i += NTHREADS) s_q[i] *= q_norm;
+
+    // L2 norm K (full-block reduction)
+    float sk = 0;
+    for (int i = tid; i < DN_KEY; i += NTHREADS) sk += s_k[i] * s_k[i];
+    sk = pf_warp_sum(sk);
+    if (lid == 0) smem[wid] = sk;
+    __syncthreads();
+    if (wid == 0) {
+        float v = (lid < NWARPS) ? smem[lid] : 0;
+        v = pf_warp_sum(v);
+        if (lid == 0) smem[NWARPS] = rsqrtf(v + 1e-6f);
+    }
+    __syncthreads();
+    float k_norm = smem[NWARPS];
+    for (int i = tid; i < DN_KEY; i += NTHREADS) s_k[i] *= k_norm;
+    __syncthreads();
+
+    // Write to qkv_pre (f32)
+    float *out_t = qkv_pre + t * DN_CONV_CH;
+    for (int c = tid; c < DN_KEY; c += NTHREADS) out_t[h * DN_KEY + c] = s_q[c];
+    for (int c = tid; c < DN_KEY; c += NTHREADS) out_t[DN_QK_SIZE + h * DN_KEY + c] = s_k[c];
+    for (int c = tid; c < DN_VAL; c += NTHREADS) out_t[2 * DN_QK_SIZE + h * DN_VAL + c] = s_v[c];
+}
+
+// ===== V3: Update conv_buf to final state after prefill =====
+// Final conv_buf at position S is [in(S-4), in(S-3), in(S-2), in(S-1)].
+// Each thread owns one channel; reads all 4 values (from qkv_proj or initial conv_buf) then writes.
+__global__ void pf_deltanet_update_conv_buf(
+    const half_t *qkv_proj, float *conv_buf, int S)
+{
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= DN_CONV_CH) return;
+    float new_cb[DN_CONV_K];
+    #pragma unroll
+    for (int k = 0; k < DN_CONV_K; k++) {
+        int src_t = S - DN_CONV_K + k;  // S-4, S-3, S-2, S-1
+        float v;
+        if (src_t >= 0) {
+            v = H2F(qkv_proj[src_t * DN_CONV_CH + ch]);
+        } else {
+            // Use initial conv_buf: slot (src_t + DN_CONV_K) = in(src_t)
+            v = conv_buf[ch * DN_CONV_K + (src_t + DN_CONV_K)];
+        }
+        new_cb[k] = v;
+    }
+    #pragma unroll
+    for (int k = 0; k < DN_CONV_K; k++) {
+        conv_buf[ch * DN_CONV_K + k] = new_cb[k];
+    }
+}
+
+// ===== V2: Split-j DeltaNet recurrence =====
+// Launch: <<<dim3(DN_HEADS, SPLIT), 128, 0, stream>>>
+// Each block owns J_PER_BLOCK=DN_VAL/SPLIT j-channels of the state.
+// Conv_buf kept in shared memory; block (h,0) writes Q/K back, each block writes own V slice.
+// Gated RMSNorm is pulled out into a separate kernel (pf_deltanet_gated_rmsnorm).
+constexpr int DN_SPLIT = 16;
+constexpr int DN_J_PER_BLOCK = DN_VAL / DN_SPLIT;  // 8
+constexpr int DN_V2_BLOCK = 128;
+constexpr int DN_V2_NWARPS = DN_V2_BLOCK / 32;     // 4
+
+__global__ void __launch_bounds__(DN_V2_BLOCK, 8)
+pf_deltanet_recurrence_split(
+    const float *qkv_pre,            // [S, DN_CONV_CH] f32 (post conv+silu+L2norm)
+    const float *beta_proj, const float *alpha_proj,
+    const half_t *a_log, const half_t *dt_bias,
+    float *state, half_t *output, int S)
+{
+    int h = blockIdx.x;
+    int split_idx = blockIdx.y;
+    int tid = threadIdx.x, wid = tid/32, lid = tid%32;
+    constexpr int CPW = DN_J_PER_BLOCK / DN_V2_NWARPS;
+    constexpr int RPL = DN_KEY / 32;
+    int jstart = split_idx * DN_J_PER_BLOCK;
+
+    float a_log_val = H2F(a_log[h]);
+    float dt_b = H2F(dt_bias[h]);
+
+    __shared__ float s_q[DN_KEY], s_k[DN_KEY];
+    __shared__ float s_v[DN_J_PER_BLOCK];
+    __shared__ float s_beta, s_decay;
+
+    // Load state slice into registers
+    float sreg[CPW * RPL];
+    float *my_state = state + h * DN_KEY * DN_VAL;
+    #pragma unroll
+    for (int jj = 0; jj < CPW; jj++) {
+        int j = jstart + wid * CPW + jj;
+        #pragma unroll
+        for (int ii = 0; ii < RPL; ii++)
+            sreg[jj*RPL+ii] = my_state[j*DN_KEY + lid + ii*32];
+    }
+
+    for (int t = 0; t < S; t++) {
+        const float *qkv_t = qkv_pre + t * DN_CONV_CH;
+        for (int c = tid; c < DN_KEY; c += DN_V2_BLOCK)
+            s_q[c] = qkv_t[h * DN_KEY + c];
+        for (int c = tid; c < DN_KEY; c += DN_V2_BLOCK)
+            s_k[c] = qkv_t[DN_QK_SIZE + h * DN_KEY + c];
+        for (int c = tid; c < DN_J_PER_BLOCK; c += DN_V2_BLOCK)
+            s_v[c] = qkv_t[2 * DN_QK_SIZE + h * DN_VAL + jstart + c];
+
+        if (tid == 0) {
+            s_beta = 1.f/(1.f+expf(-beta_proj[t*DN_HEADS+h]));
+            float x = alpha_proj[t*DN_HEADS+h] + dt_b;
+            float sp = (x > 20.f) ? x : logf(1.f+expf(x));
+            s_decay = expf(-expf(a_log_val)*sp);
+        }
+        __syncthreads();
+        float beta = s_beta, decay = s_decay;
+        half_t *out_h = output + t * DN_V_SIZE + h * DN_VAL;
+
+        #pragma unroll
+        for (int jj = 0; jj < CPW; jj++) {
+            int j_local = wid * CPW + jj;
+            int j = jstart + j_local;
+            float kv = 0;
+            #pragma unroll
+            for (int ii = 0; ii < RPL; ii++) kv += sreg[jj*RPL+ii] * s_k[lid + ii*32];
+            kv = pf_warp_sum(kv);
+            kv = __shfl_sync(0xffffffff, kv, 0);
+            float delta = (s_v[j_local] - decay * kv) * beta;
+            float attn = 0;
+            #pragma unroll
+            for (int ii = 0; ii < RPL; ii++) {
+                sreg[jj*RPL+ii] = decay * sreg[jj*RPL+ii] + s_k[lid + ii*32] * delta;
+                attn += sreg[jj*RPL+ii] * s_q[lid + ii*32];
+            }
+            attn = pf_warp_sum(attn);
+            if (lid == 0) out_h[j] = F2H(attn);
+        }
+        __syncthreads();
+    }
+
+    // Write state slice back
+    #pragma unroll
+    for (int jj = 0; jj < CPW; jj++) {
+        int j = jstart + wid * CPW + jj;
+        #pragma unroll
+        for (int ii = 0; ii < RPL; ii++)
+            my_state[j*DN_KEY + lid + ii*32] = sreg[jj*RPL+ii];
+    }
+}
+
+// ===== V2: Gated RMSNorm pulled out of the recurrence =====
+// Launch: <<<dim3(S, DN_HEADS), 128, 0, stream>>>
+// Reads raw per-head attn output, applies RMSNorm with z-gating, writes back in place.
+__global__ void pf_deltanet_gated_rmsnorm(
+    half_t *out, const half_t *z_proj, const half_t *norm_w, int S)
+{
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    if (t >= S) return;
+    int tid = threadIdx.x, wid = tid/32, lid = tid%32;
+    __shared__ float smem[4];
+    half_t *out_h = out + t * DN_V_SIZE + h * DN_VAL;
+    const half_t *z_h = z_proj + t * DN_V_SIZE + h * DN_VAL;
+
+    float sq = 0;
+    for (int i = tid; i < DN_VAL; i += blockDim.x) {
+        float v = H2F(out_h[i]);
+        sq += v*v;
+    }
+    sq = pf_warp_sum(sq);
+    if (lid == 0) smem[wid] = sq;
+    __syncthreads();
+    if (wid == 0) {
+        float v = (lid < (blockDim.x/32)) ? smem[lid] : 0;
+        v = pf_warp_sum(v);
+        if (lid == 0) smem[0] = rsqrtf(v/DN_VAL + RMS_EPS);
+    }
+    __syncthreads();
+    float rstd = smem[0];
+    for (int i = tid; i < DN_VAL; i += blockDim.x) {
+        float n = H2F(out_h[i]) * rstd * H2F(norm_w[i]);
+        out_h[i] = F2H(n * pf_silu(H2F(z_h[i])));
+    }
+}
+
+// ===== cuBLAS bf16 GEMM =====
+static void cublas_bf16_gemm(cublasHandle_t h,
+    const half_t *A, const half_t *B, half_t *C,
+    int S, int N, int K) {
+    float alpha = 1.0f, beta_val = 0.0f;
+    cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, N, S, K,
+        &alpha, B, CUBLAS_HALF_T, K, A, CUBLAS_HALF_T, K,
+        &beta_val, C, CUBLAS_HALF_T, N,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+static void cublas_bf16_qk_scores(cublasHandle_t h,
+    const half_t *q, int q_stride,
+    const half_t *k, int k_stride,
+    float *scores, int rows, int key_count, int dim) {
+    float alpha = 1.0f, beta_val = 0.0f;
+    cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, key_count, rows, dim,
+        &alpha, k, CUBLAS_HALF_T, k_stride, q, CUBLAS_HALF_T, q_stride,
+        &beta_val, scores, CUDA_R_32F, key_count,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+static void cublas_bf16_probs_v(cublasHandle_t h,
+    const half_t *probs, int prob_stride,
+    const half_t *v, int v_stride,
+    float *out, int rows, int key_count, int dim) {
+    float alpha = 1.0f, beta_val = 0.0f;
+    cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, dim, rows, key_count,
+        &alpha, v, CUBLAS_HALF_T, v_stride, probs, CUBLAS_HALF_T, prob_stride,
+        &beta_val, out, CUDA_R_32F, dim,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+// ===== Main orchestrator =====
+extern "C" void launch_prefill_bf16(
+    const int *token_ids, int seq_len, int *output_token,
+    const half_t *embed_weight, const PFLayerWeights *layers,
+    const half_t *final_norm_w, const half_t *lm_head_w,
+    half_t *fa_k_cache, half_t *fa_v_cache,
+    float *dn_states, float *conv_bufs,
+    half_t *hidden, half_t *residual, half_t *normalized,
+    half_t *proj_buf, half_t *proj_buf2,
+    half_t *attn_buf, half_t *mlp_buf,
+    half_t *dn_out_buf,
+    float *beta_buf, float *alpha_buf, float *dn_pre_qkv,
+    float *dn_u_scratch, float *dn_w_scratch, float *dn_cs_scratch,
+    const half_t *fused_fa_qkv_base,
+    const half_t *fused_gate_up_base,
+    half_t *final_normed, half_t *hidden_bf16_out,
+    float *lm_bmv, int *lm_bmi,
+    half_t *fa_q_tail,
+    int max_seq_len,
+    int q_tail_len,
+    cudaStream_t stream)
+{
+    static cublasHandle_t cublas = nullptr;
+    if (!cublas) cublasCreate(&cublas);
+    cublasSetStream(cublas, stream);
+
+    static PFLayerWeights hl_v2[NUM_LAYERS];
+    static bool copied_v2 = false;
+    if (!copied_v2) { cudaMemcpy(hl_v2, layers, NUM_LAYERS*sizeof(PFLayerWeights), cudaMemcpyDeviceToHost); copied_v2 = true; }
+
+    int S = seq_len;
+    int bk = (S*HIDDEN+255)/256;
+
+    pf_embed<<<bk, 256, 0, stream>>>(token_ids, embed_weight, hidden, S);
+
+    int fa_stride = FA_KV_HEADS * max_seq_len * FA_HEAD_DIM;
+    int dn_stride = DN_HEADS * DN_KEY * DN_VAL;
+    int fa_idx = 0, dn_idx = 0;
+
+    for (int li = 0; li < NUM_LAYERS; li++) {
+        const PFLayerWeights &lw = hl_v2[li];
+        int lt = LAYER_TYPE[li];
+
+        const half_t *norm_w = (const half_t *)lw.ptrs[0];
+        pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, norm_w, normalized, residual, S, HIDDEN);
+
+        if (lt == 0) {
+            const half_t *qkv_w=(const half_t*)lw.ptrs[1];
+            const half_t *z_w=(const half_t*)lw.ptrs[2];
+            const half_t *beta_w=(const half_t*)lw.ptrs[3];
+            const half_t *alpha_w=(const half_t*)lw.ptrs[4];
+            const half_t *conv_w=(const half_t*)lw.ptrs[5];
+            const half_t *a_log=(const half_t*)lw.ptrs[6];
+            const half_t *dt_bias=(const half_t*)lw.ptrs[7];
+            const half_t *dn_norm=(const half_t*)lw.ptrs[8];
+            const half_t *out_w=(const half_t*)lw.ptrs[9];
+            const half_t *post_norm=(const half_t*)lw.ptrs[10];
+            const half_t *down_w=(const half_t*)lw.ptrs[13];
+
+            cublas_bf16_gemm(cublas, normalized, qkv_w, proj_buf, S, DN_CONV_CH, HIDDEN);
+            cublas_bf16_gemm(cublas, normalized, z_w, proj_buf2, S, DN_V_SIZE, HIDDEN);
+            pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, beta_w, beta_buf, S, HIDDEN, DN_HEADS);
+            pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_HEADS);
+
+            // V3: parallel pre-projection (conv1d + silu + L2 norm)
+            float *layer_conv_buf = conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K;
+            dim3 pre_grid(S, DN_HEADS);
+            pf_deltanet_preproject<<<pre_grid, 128, 0, stream>>>(
+                proj_buf, conv_w, layer_conv_buf, dn_pre_qkv, S);
+
+            // V4: chunk-parallel DeltaNet — phase 1 (intra-chunk, parallel)
+            int N_chunks = (S + DN_CHUNK_C - 1) / DN_CHUNK_C;
+            dim3 p1_grid(N_chunks, DN_HEADS);
+            pf_dn_chunk_phase1<<<p1_grid, DN_CHUNK_BLOCK, 0, stream>>>(
+                dn_pre_qkv, beta_buf, alpha_buf, a_log, dt_bias,
+                dn_u_scratch, dn_w_scratch, dn_cs_scratch, S);
+
+            // V4: chunk-parallel DeltaNet — phase 2 (inter-chunk, sequential per head)
+            // Compute dynamic shared memory size once.
+            constexpr int DK_S = DN_KEY + 1;
+            constexpr size_t P2_SMEM_FLOATS =
+                DN_PHASE2_J_PER_BLOCK * DK_S         // s_state
+                + DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK // s_u
+                + DN_CHUNK_C * DK_S                  // s_w
+                + DN_CHUNK_C * DK_S                  // s_Q
+                + DN_CHUNK_C * DK_S                  // s_K
+                + DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK // s_d
+                + DN_CHUNK_C * DN_CHUNK_C            // s_qkt
+                + DN_CHUNK_C                         // s_cs
+                + DN_CHUNK_C;                        // s_decay_rem_buf
+            constexpr size_t P2_SMEM_BYTES = P2_SMEM_FLOATS * sizeof(float);
+#if TARGET_SM >= 80
+            // WMMA path drops s_w (f32) — only s_w_bf16 is read by the WMMA d-compute —
+            // and adds: s_wmma_tile (16×32 f32, shared by d and o_inter qs)
+            //         + s_state_bf16 (J_per×DN_KEY bf16)
+            //         + s_w_bf16, s_Q_bf16, s_K_bf16 (each 16×DN_KEY bf16, M-padded)
+            //         + s_d_bf16 (16 × J_per bf16, K-padded for state-update fragment).
+            // Computing the WMMA budget directly (rather than P2_SMEM_BYTES + extras) lets
+            // us actually drop the s_w slot — important because at ~50 KB/block we need to
+            // stay under 100 KB per SM to fit 2 blocks/SM (per __launch_bounds__(128, 2)).
+            constexpr size_t P2_WMMA_F32_BYTES = (
+                  DN_PHASE2_J_PER_BLOCK * DK_S         // s_state
+                + DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK   // s_u
+                + DN_CHUNK_C * DK_S                    // s_Q  (s_w dropped)
+                + DN_CHUNK_C * DK_S                    // s_K
+                + DN_CHUNK_C * DN_PHASE2_J_PER_BLOCK   // s_d
+                + DN_CHUNK_C * DN_CHUNK_C              // s_qkt
+                + DN_CHUNK_C                           // s_cs
+                + DN_CHUNK_C                           // s_decay_rem_buf
+                + 16 * 32                              // s_wmma_tile
+                ) * sizeof(float);
+            constexpr size_t P2_WMMA_BF16_BYTES =
+                  DN_PHASE2_J_PER_BLOCK * DN_KEY * sizeof(half_t)   // s_state_bf16
+                + 16 * DN_KEY * sizeof(half_t)                      // s_w_bf16
+                + 16 * DN_KEY * sizeof(half_t)                      // s_Q_bf16
+                + 16 * DN_KEY * sizeof(half_t)                      // s_K_bf16
+                + 16 * DN_PHASE2_J_PER_BLOCK * sizeof(half_t);      // s_d_bf16
+            constexpr size_t P2_WMMA_SMEM_BYTES = P2_WMMA_F32_BYTES + P2_WMMA_BF16_BYTES;
+            // Runtime dispatcher: MEGAKERNEL_DN_PHASE2_WMMA_RUNTIME=0 -> scalar, otherwise WMMA.
+            static const bool use_wmma_phase2 = []() {
+                const char *e = std::getenv("MEGAKERNEL_DN_PHASE2_WMMA_RUNTIME");
+                return !e || std::atoi(e) != 0;
+            }();
+#endif // TARGET_SM >= 80
+            // Opt into >48KB shared (Ampere supports up to 100KB per block) — call once per kernel.
+            static bool phase2_opted_in = false;
+            if (!phase2_opted_in) {
+                cudaFuncSetAttribute(pf_dn_chunk_phase2,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P2_SMEM_BYTES);
+#if TARGET_SM >= 80
+                cudaFuncSetAttribute(pf_dn_chunk_phase2_wmma,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P2_WMMA_SMEM_BYTES);
+#endif
+                phase2_opted_in = true;
+            }
+            dim3 p2_grid(DN_HEADS, DN_PHASE2_J_SPLITS);
+#if TARGET_SM >= 80
+            if (use_wmma_phase2) {
+                pf_dn_chunk_phase2_wmma<<<p2_grid, DN_PHASE2_BLOCK, P2_WMMA_SMEM_BYTES, stream>>>(
+                    dn_u_scratch, dn_w_scratch, dn_cs_scratch, dn_pre_qkv,
+                    dn_states + dn_idx*dn_stride, dn_out_buf, S, N_chunks);
+            } else
+#endif
+            {
+                pf_dn_chunk_phase2<<<p2_grid, DN_PHASE2_BLOCK, P2_SMEM_BYTES, stream>>>(
+                    dn_u_scratch, dn_w_scratch, dn_cs_scratch, dn_pre_qkv,
+                    dn_states + dn_idx*dn_stride, dn_out_buf, S, N_chunks);
+            }
+
+            // V3: update conv_buf final state from qkv_proj last 4 positions
+            int cb_blocks = (DN_CONV_CH + 127) / 128;
+            pf_deltanet_update_conv_buf<<<cb_blocks, 128, 0, stream>>>(
+                proj_buf, layer_conv_buf, S);
+
+            // Separate gated rmsnorm kernel
+            dim3 norm_grid(S, DN_HEADS);
+            pf_deltanet_gated_rmsnorm<<<norm_grid, 128, 0, stream>>>(
+                dn_out_buf, proj_buf2, dn_norm, S);
+
+            cublas_bf16_gemm(cublas, dn_out_buf, out_w, proj_buf, S, HIDDEN, DN_V_SIZE);
+            pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+
+            pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
+            {
+                const half_t *gu_w = fused_gate_up_base + (size_t)li * (2*INTER) * HIDDEN;
+                pf_mlp_chunked_fused(
+                    cublas,
+                    normalized,
+                    residual,
+                    hidden,
+                    gu_w,
+                    down_w,
+                    proj_buf,
+                    mlp_buf,
+                    S,
+                    pf_mlp_chunk_tokens(S),
+                    stream);
+            }
+
+            dn_idx++;
+        } else {
+            const half_t *q_nw=(const half_t*)lw.ptrs[4];
+            const half_t *k_nw=(const half_t*)lw.ptrs[5];
+            const half_t *o_w=(const half_t*)lw.ptrs[6];
+            const half_t *post_norm=(const half_t*)lw.ptrs[7];
+            const half_t *down_w=(const half_t*)lw.ptrs[10];
+
+            // Fused QKV GEMM: output row stride FA_QPROJ_SIZE + 2*FA_KV_SIZE
+            constexpr int FA_QKV_STRIDE = FA_QPROJ_SIZE + 2*FA_KV_SIZE;
+            const half_t *fa_qkv_w = fused_fa_qkv_base + (size_t)fa_idx * FA_QKV_STRIDE * HIDDEN;
+            cublas_bf16_gemm(cublas, normalized, fa_qkv_w, proj_buf, S, FA_QKV_STRIDE, HIDDEN);
+
+            int total_heads = S*(FA_Q_HEADS+FA_KV_HEADS);
+            half_t *fa_v_layer = fa_v_cache ? (fa_v_cache + fa_idx*fa_stride) : nullptr;
+            pf_qk_norm_rope_fused<<<(total_heads+15)/16, 512, 0, stream>>>(
+                proj_buf, q_nw, k_nw,
+                fa_k_cache + fa_idx*fa_stride, fa_v_layer, S, max_seq_len);
+            if (fa_q_tail && q_tail_len > 0 && S >= q_tail_len) {
+                int qtail_total = q_tail_len * FA_Q_HEADS * FA_HEAD_DIM;
+                pf_capture_fa_q_tail<<<(qtail_total + 255) / 256, 256, 0, stream>>>(
+                    proj_buf, fa_q_tail, fa_idx, S, q_tail_len);
+            }
+
+            bool used_bsa_attn = false;
+#ifdef DFLASH27B_HAVE_BSA
+            static const bool use_bsa_fa = (std::getenv("DFLASH_FP_USE_BSA") != nullptr);
+            if (use_bsa_fa) {
+                used_bsa_attn = pf_flashprefill_bsa_attn(
+                    proj_buf,
+                    proj_buf2,
+                    dn_out_buf,
+                    S,
+                    stream);
+            }
+#endif
+            if (!used_bsa_attn) {
+                pf_causal_attn_fused_tiled_cublas(
+                    cublas,
+                    proj_buf,
+                    mlp_buf,
+                    dn_pre_qkv,
+                    dn_pre_qkv + static_cast<size_t>(S) * max_seq_len,
+                    dn_out_buf,
+                    S,
+                    4096,
+                    stream);
+            }
+
+            cublas_bf16_gemm(cublas, dn_out_buf, o_w, proj_buf, S, HIDDEN, FA_Q_SIZE);
+            pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+
+            pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
+            {
+                const half_t *gu_w = fused_gate_up_base + (size_t)li * (2*INTER) * HIDDEN;
+                pf_mlp_chunked_fused(
+                    cublas,
+                    normalized,
+                    residual,
+                    hidden,
+                    gu_w,
+                    down_w,
+                    proj_buf,
+                    mlp_buf,
+                    S,
+                    pf_mlp_chunk_tokens(S),
+                    stream);
+            }
+
+            fa_idx++;
+        }
+    }
+
+    if (output_token) {
+        pf_final_norm<<<1, 512, 0, stream>>>(hidden, final_norm_w, final_normed, hidden_bf16_out, S);
+
+        int lm_blocks = 512;
+        pf_lm_head<<<lm_blocks, 256, 0, stream>>>(final_normed, lm_head_w, lm_bmv, lm_bmi, VOCAB);
+        pf_lm_reduce<<<1, 256, 0, stream>>>(lm_bmv, lm_bmi, output_token, lm_blocks);
+    }
+}

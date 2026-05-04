@@ -366,7 +366,9 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
     @app.on_event("startup")
     async def _startup():
         import asyncio
+        ready = asyncio.create_task(bus.await_reply("[daemon] ready", timeout=300.0))
         bus.start(asyncio.get_running_loop())
+        await ready
         await prefix_cache.startup_sync()
 
     @app.get("/v1/models")
@@ -386,7 +388,9 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
         if req.tools:
             # Tool definitions ride in the prompt; compressing them mangles JSON.
             return prompt_bin, prompt_len, started_in_thinking
-        if not prefill_cfg.should_compress(prompt_len) or drafter_tokenizer is None:
+        if not prefill_cfg.should_compress(prompt_len):
+            return prompt_bin, prompt_len, started_in_thinking
+        if prefill_cfg.backend == "daemon" and drafter_tokenizer is None:
             return prompt_bin, prompt_len, started_in_thinking
 
         last_user = next((m for m in reversed(req.messages) if m.role == "user"), None)
@@ -909,7 +913,9 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
                                   msgs: list[dict]) -> tuple[Path, int]:
         if not prefill_cfg or not prefill_cfg.enabled:
             return prompt_bin, prompt_len
-        if not prefill_cfg.should_compress(prompt_len) or drafter_tokenizer is None:
+        if not prefill_cfg.should_compress(prompt_len):
+            return prompt_bin, prompt_len
+        if prefill_cfg.backend == "daemon" and drafter_tokenizer is None:
             return prompt_bin, prompt_len
         last_user_idx = next((i for i in range(len(msgs) - 1, -1, -1)
                               if msgs[i]["role"] == "user"), None)
@@ -1242,9 +1248,11 @@ def main():
         if ids: stop_ids.add(ids[0])
 
     drafter_tokenizer = None
-    if prefill_cfg.enabled:
+    if prefill_cfg.enabled and prefill_cfg.backend == "daemon":
         drafter_tokenizer = AutoTokenizer.from_pretrained(
             prefill_cfg.drafter_tokenizer_id, trust_remote_code=True)
+    elif prefill_cfg.enabled and prefill_cfg.backend == "mega-native":
+        drafter_tokenizer = tokenizer
 
     app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
                     tokenizer, stop_ids,
@@ -1263,7 +1271,7 @@ def main():
     print(f"  tokenizer = {args.tokenizer}")
     if prefill_cfg.enabled:
         print(f"  pflash = {prefill_cfg.mode} · threshold={prefill_cfg.threshold} "
-              f"keep={prefill_cfg.keep_ratio} drafter={prefill_cfg.drafter_gguf}")
+              f"keep={prefill_cfg.keep_ratio} backend={prefill_cfg.backend}")
     else:
         print("  pflash = off")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

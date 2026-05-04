@@ -22,6 +22,7 @@
 #include "internal.h"
 #include "dflash_graph.h"
 #include "qwen3_drafter.h"
+#include "mega_pflash_native.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -990,6 +991,12 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "--fast-rollback and --seq-verify are mutually exclusive\n");
         return 2;
     }
+    if (ddtree_mode && ddtree_budget < DFLASH27B_DRAFT_BLOCK_SIZE) {
+        std::fprintf(stderr,
+                     "--ddtree-budget must be >= draft block size (%d); got %d\n",
+                     DFLASH27B_DRAFT_BLOCK_SIZE, ddtree_budget);
+        return 2;
+    }
     std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d gpu_ddtree_topk=%d gpu_ddtree_rollback=%d gpu_ddtree_prep=%d\n",
                 (int)seq_verify, (int)fast_rollback, (int)ddtree_mode,
                 ddtree_budget, ddtree_temp, (int)ddtree_chain_seed, g_fa_window,
@@ -1316,6 +1323,8 @@ int main(int argc, char ** argv) {
     // pflash drafter (lazy-loaded on first `compress` command)
     dflash27b::DrafterContext drafter_ctx;
     bool drafter_loaded = false;
+    dflash27b::MegaPFlashContext mega_pflash_ctx;
+    bool mega_pflash_loaded = false;
 
     while (true) {
         std::string prompt_file_str;
@@ -1365,6 +1374,15 @@ int main(int argc, char ** argv) {
                 stream_emit(-1);
                 continue;
             }
+            if (line == "free mega-pflash" || line == "mega-pflash free") {
+                if (mega_pflash_loaded) {
+                    dflash27b::free_mega_pflash(mega_pflash_ctx);
+                    mega_pflash_loaded = false;
+                    std::printf("[mega-pflash] freed\n"); std::fflush(stdout);
+                }
+                stream_emit(-1);
+                continue;
+            }
             if (starts_with(line, "unpark")) {
                 bool want_draft  = (line == "unpark" || line == "unpark all" || line == "unpark draft");
                 bool want_target = (line == "unpark" || line == "unpark all" || line == "unpark target");
@@ -1390,17 +1408,20 @@ int main(int argc, char ** argv) {
 
             // ── Compress command (pflash speculative prefill) ───────────────
             // Format: "compress <src_bin_path> <keep_ratio_x1000> <drafter_gguf>"
+            //         "compress-nopark <src_bin_path> <keep_ratio_x1000> <drafter_gguf>"
             //   src_bin_path:   int32 token IDs file (drafter vocab)
             //   keep_ratio_x1000: integer keep ratio × 1000 (e.g. 20 → 0.020)
             //   drafter_gguf:   path to Qwen3-0.6B GGUF (loaded lazily once)
             // Output: stream of int32 compressed token IDs, terminated by -1.
             // Drafter coexists with target+draft via libllama in the same
             // ggml allocator — no park/unpark needed for compression itself.
-            if (starts_with(line, "compress ")) {
+            if (starts_with(line, "compress ") || starts_with(line, "compress-nopark ")) {
+                const bool no_park = starts_with(line, "compress-nopark ");
+                const size_t arg_off = no_park ? std::strlen("compress-nopark ") : std::strlen("compress ");
                 char ppath[1024];
                 int  keep_x1000 = 0;
                 char drafter_path[1024];
-                int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s",
+                int n = std::sscanf(line.c_str() + arg_off, "%1023s %d %1023s",
                                     ppath, &keep_x1000, drafter_path);
                 if (n != 3) {
                     std::fprintf(stderr,
@@ -1415,9 +1436,10 @@ int main(int argc, char ** argv) {
 
                 // Park target + draft before allocating drafter context so
                 // the drafter's KV (~1.3 GB Q4_0) + scratch (~600 MB) have
-                // headroom on a 24 GB card. Restore after scoring.
-                bool restore_target = !target_parked;
-                bool restore_draft  = !draft_parked;
+                // headroom on a 24 GB card. `compress-nopark` is for small
+                // target/model combos where the caller knows VRAM is enough.
+                bool restore_target = !no_park && !target_parked;
+                bool restore_draft  = !no_park && !draft_parked;
                 if (restore_target) {
                     free_target_weights(w);
                     target_parked = true;
@@ -1470,6 +1492,65 @@ int main(int argc, char ** argv) {
                     std::printf("[compress] draft restored\n"); std::fflush(stdout);
                 }
 
+                for (int32_t t : compressed) stream_emit(t);
+                stream_emit(-1);
+                continue;
+            }
+
+            // ── Native Mega PFlash command ──────────────────────────────────
+            // Format: "compress-mega <src_bin_path> <keep_ratio_x1000> <model_path> <max_seq_len>"
+            //   src_bin_path:       int32 token IDs file (Qwen3.5 tokenizer)
+            //   keep_ratio_x1000:   integer keep ratio × 1000
+            //   model_path:         Qwen3.5-0.8B native weight artifact
+            //   max_seq_len:        megakernel compression window
+            // Output: stream of int32 compressed token IDs, terminated by -1.
+            if (starts_with(line, "compress-mega ")) {
+                char ppath[1024];
+                int keep_x1000 = 0;
+                char model_path[1024];
+                int mega_max_seq_len = 0;
+                int n = std::sscanf(line.c_str() + std::strlen("compress-mega "),
+                                    "%1023s %d %1023s %d",
+                                    ppath, &keep_x1000, model_path, &mega_max_seq_len);
+                if (n != 4) {
+                    std::fprintf(stderr,
+                                 "[mega-pflash] bad args, need: <bin> <keep_x1000> <model_path> <max_seq_len>\n");
+                    stream_emit(-1);
+                    continue;
+                }
+                auto src_ids = read_int32_file(ppath);
+                if (src_ids.empty()) {
+                    std::fprintf(stderr, "[mega-pflash] empty input\n");
+                    stream_emit(-1);
+                    continue;
+                }
+
+                if (!mega_pflash_loaded) {
+                    if (!dflash27b::load_mega_pflash(model_path, mega_max_seq_len, mega_pflash_ctx)) {
+                        std::fprintf(stderr, "[mega-pflash] load failed: %s\n",
+                                     dflash27b_last_error());
+                        dflash27b::free_mega_pflash(mega_pflash_ctx);
+                        stream_emit(-1);
+                        continue;
+                    }
+                    mega_pflash_loaded = true;
+                    std::printf("[mega-pflash] loaded %s max_seq_len=%d\n",
+                                model_path, mega_max_seq_len);
+                    std::fflush(stdout);
+                }
+
+                float keep = std::max(0.001f, std::min(1.0f, keep_x1000 / 1000.0f));
+                auto compressed = dflash27b::mega_pflash_score_and_compress(
+                    mega_pflash_ctx, src_ids, keep);
+                if (compressed.empty()) {
+                    std::fprintf(stderr, "[mega-pflash] compress failed: %s\n",
+                                 dflash27b_last_error());
+                    stream_emit(-1);
+                    continue;
+                }
+                std::printf("[mega-pflash] %zu -> %zu tokens (keep_ratio=%.3f)\n",
+                            src_ids.size(), compressed.size(), keep);
+                std::fflush(stdout);
                 for (int32_t t : compressed) stream_emit(t);
                 stream_emit(-1);
                 continue;
@@ -2957,6 +3038,14 @@ int main(int argc, char ** argv) {
 
     if (daemon_mode) {
         for (int i = 0; i < PREFIX_CACHE_SLOTS; i++) free_prefix_snapshot(prefix_snapshots[i]);
+    }
+    if (mega_pflash_loaded) {
+        dflash27b::free_mega_pflash(mega_pflash_ctx);
+        mega_pflash_loaded = false;
+    }
+    if (drafter_loaded) {
+        dflash27b::free_drafter(drafter_ctx);
+        drafter_loaded = false;
     }
     step_graph_destroy(sg);
     free_target_cache(cache);

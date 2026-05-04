@@ -121,6 +121,7 @@ int flash_prefill_forward_bf16(
     void * dmK = nullptr;
     float * dS = nullptr, * dM = nullptr;
     int32_t * dIdx = nullptr, * dCnt = nullptr;
+    const char *forward_backend = "wmma";
     cudaError_t e;
     static const bool fused_select = (std::getenv("DFLASH_FP_FUSED_SELECT") != nullptr);
     if ((e = cudaMalloc(&dmK,  (size_t)B * M * Hk * D * 2)) != cudaSuccess) goto err;  // bf16
@@ -188,6 +189,14 @@ int flash_prefill_forward_bf16(
 #ifdef DFLASH27B_HAVE_BSA
     static const bool use_bsa = (std::getenv("DFLASH_FP_USE_BSA") != nullptr);
     if (use_bsa && D == 128 && BLOCK == 128) {
+        forward_backend = "bsa";
+        launch_bsa_sparse_flash_forward_bf16(
+            Q, K, V, O, dIdx, dCnt, scale,
+            B, H, Hk, S, D, BLOCK,
+            s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+            s_cnt_b, s_cnt_m, s_cnt_h, 0);
+    } else if (use_bsa && D == 256 && BLOCK == 128) {
+        forward_backend = "bsa";
         launch_bsa_sparse_flash_forward_bf16(
             Q, K, V, O, dIdx, dCnt, scale,
             B, H, Hk, S, D, BLOCK,
@@ -216,8 +225,8 @@ int flash_prefill_forward_bf16(
         cudaEventElapsedTime(&t3, pE[2], pE[3]);
         cudaEventElapsedTime(&t4, pE[3], pE[4]);
         std::fprintf(stderr,
-            "[fp-prof] S=%d H=%d Hk=%d  mean=%.2fms  score%s=%.2fms  select=%.2fms  forward=%.2fms\n",
-            S, n_q_heads, n_k_heads, t1, fused_select ? "+select" : "", t2, t3, t4);
+            "[fp-prof] S=%d H=%d Hk=%d backend=%s  mean=%.2fms  score%s=%.2fms  select=%.2fms  forward=%.2fms\n",
+            S, n_q_heads, n_k_heads, forward_backend, t1, fused_select ? "+select" : "", t2, t3, t4);
         for (int i=0;i<5;i++) cudaEventDestroy(pE[i]);
     }
     cudaFree(dmK); cudaFree(dS); cudaFree(dM); cudaFree(dIdx); cudaFree(dCnt);
