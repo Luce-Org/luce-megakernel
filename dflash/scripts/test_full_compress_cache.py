@@ -50,7 +50,7 @@ for p, label in [
 # ─── NIAH prompt builder ──────────────────────────────────────────────
 
 def build_long_prompt(target_tokens: int, seed: int = 42) -> tuple[str, str]:
-    """Needle-In-A-Haystack prompt, same shape as pflash/tests/niah_gen.py."""
+    """Needle-In-A-Haystack prompt for the PFlash compression path."""
     rng = random.Random(seed)
     key   = "".join(rng.choices("abcdefghijklmnopqrstuvwxyz", k=8))
     value = "".join(rng.choices("0123456789", k=7))

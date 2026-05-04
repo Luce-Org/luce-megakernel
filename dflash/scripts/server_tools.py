@@ -1220,7 +1220,7 @@ def main():
     if args.prefill_compression != "off":
         os.environ.setdefault("DFLASH27B_LM_HEAD_FIX", "0")
         os.environ.setdefault("DFLASH27B_FA_WINDOW", "0")
-        # FlashPrefill bench-tuned defaults from pflash/README.md headline numbers
+        # FlashPrefill bench-tuned defaults from the PFlash headline numbers.
         # (10x TTFT @ 64K). Without these the drafter falls through to the WMMA
         # fallback at the default ALPHA=0.12, which roughly triples cold-start
         # TTFT. setdefault so explicit user overrides still win.

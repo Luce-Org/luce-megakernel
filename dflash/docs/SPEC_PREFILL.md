@@ -4,8 +4,7 @@ In-process speculative-prefill + speculative-decode daemon (C++/CUDA only,
 no Python, no Triton, no PyTorch at runtime).
 
 This doc is the build / runtime / tunables reference for the C++ daemon
-path described in [`pflash/README.md`](../../pflash/README.md) and on the
-[blog post](https://lucebox.com/blog/pflash):
+path and the [PFlash blog post](https://lucebox.com/blog/pflash):
 
 - **Drafter** (Qwen3-0.6B) loaded via a custom forward (`qwen3_0p6b_*`)
   with the FlashPrefill block-sparse attention kernel for long-context
