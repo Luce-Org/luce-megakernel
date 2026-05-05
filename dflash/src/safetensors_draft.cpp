@@ -436,9 +436,13 @@ bool load_draft_safetensors(const std::string & path,
     // ── 4b. Read config.json for SWA layer_types (Qwen3.6 draft) ──
     {
         // config.json sits next to model.safetensors
-        std::string dir = path;
-        auto slash = dir.find_last_of('/');
-        if (slash != std::string::npos) dir = dir.substr(0, slash);
+        std::string dir;
+        auto slash = path.find_last_of('/');
+        if (slash != std::string::npos) {
+            dir = path.substr(0, slash);
+        } else {
+            dir = ".";  // bare filename — look in CWD
+        }
         std::string cfg_path = dir + "/config.json";
         FILE * f = std::fopen(cfg_path.c_str(), "r");
         if (f) {
