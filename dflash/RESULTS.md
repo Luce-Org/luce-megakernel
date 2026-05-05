@@ -229,3 +229,100 @@ Peak per-prompt: **70.70 tok/s at AL 10.67** (3.55× over AR on the same prompt)
 | VRAM              | 24 GB    | 22 GB       | 0.92× |
 
 AR scaling (~0.53×) tracks bandwidth × SM count. DFlash scaling (~0.41×) is lower because the draft compute bottleneck is proportionally larger on a slower GPU, even after the BF16→FP16 fix. Acceptance length is identical (same draft model, same tokens), confirming the FP16 conversion is numerically faithful.
+
+## RTX 5090 (Blackwell, sm_120/sm_120a, 32 GB)
+
+Single RTX 5090 32 GB, CUDA 13.0.88, driver 595.58.03.
+Target: `unsloth/Qwen3.6-27B-GGUF` (`Qwen3.6-27B-UD-Q5_K_XL.gguf`, ~19 GB).
+Draft:  local Qwen3.6-27B DFlash safetensors (`model.safetensors`, ~3.3 GB).
+Concurrency = 1, greedy decoding, `n_gen=256`.
+
+Build: `cmake -B build-luce-sm120 -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DDFLASH27B_USER_CUDA_ARCHITECTURES=120 -DDFLASH27B_ENABLE_BSA=ON`
+Runtime: FP16/FP16 KV, FA window 4096, DDTree budget 22.
+
+These numbers use a newer Qwen3.6 Q5_K_XL target, so they are not an
+apples-to-apples hardware comparison with the RTX 3090 Qwen3.5 Q4_K_M run
+above.
+
+### RTX 5090 headline
+
+| Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
+|-----------|:--------:|:------------:|:----:|:-------:|
+| HumanEval | 58.25    | **218.23**   | 7.12 | **3.75×** |
+| Math500   | 57.57    | **219.06**   | 7.31 | **3.80×** |
+| GSM8K     | 58.39    | **179.07**   | 5.88 | **3.07×** |
+
+### RTX 5090 per-prompt — HumanEval (10 samples)
+
+| # | n_tok | AR    | DFlash | AL    |
+|:-:|:-----:|:-----:|:------:|:-----:|
+| 01| 84    | 59.13 | 225.95 | 7.31  |
+| 02| 138   | 57.28 | 207.92 | 6.74  |
+| 03| 134   | 56.82 | 238.37 | 7.76  |
+| 04| 120   | 58.92 | **332.94** | **11.13** |
+| 05| 172   | 58.93 | 237.91 | 7.76  |
+| 06| 118   | 58.25 | 147.64 | 4.74  |
+| 07| 51    | 58.24 | 197.95 | 6.40  |
+| 08| 141   | 58.21 | 196.54 | 6.40  |
+| 09| 125   | 58.39 | 243.31 | 8.00  |
+| 10| 95    | 58.31 | 153.74 | 4.92  |
+| **mean** |   | **58.25** | **218.23** | **7.12** |
+
+Peak per-prompt: **332.94 tok/s at AL 11.13** (5.65× over AR on the same prompt).
+
+### RTX 5090 per-prompt — GSM8K (10 samples)
+
+| # | n_tok | AR    | DFlash | AL   |
+|:-:|:-----:|:-----:|:------:|:----:|
+| 01| 45    | 58.62 | 188.94 | 6.10 |
+| 02| 111   | 58.94 | 202.09 | 6.56 |
+| 03| 49    | 58.88 | 211.92 | 7.06 |
+| 04| 70    | 58.14 | 153.83 | 4.92 |
+| 05| 102   | 58.12 | 160.01 | 5.12 |
+| 06| 118   | 58.19 | 187.03 | 6.10 |
+| 07| 113   | 58.26 | 166.77 | 5.80 |
+| 08| 50    | 58.37 | **217.12** | **7.11** |
+| 09| 43    | 58.20 |  86.08 | 2.93 |
+| 10| 96    | 58.13 | 216.96 | 7.11 |
+| **mean** |   | **58.39** | **179.07** | **5.88** |
+
+### RTX 5090 per-prompt — Math500 (10 samples)
+
+| # | n_tok | AR    | DFlash | AL   |
+|:-:|:-----:|:-----:|:------:|:----:|
+| 01| 257   | 58.15 | 214.23 | 7.11 |
+| 02| 53    | 58.23 | 197.71 | 6.40 |
+| 03| 40    | 58.80 | 232.61 | 7.53 |
+| 04| 50    | 59.00 | 191.89 | 6.24 |
+| 05| 117   | 58.27 | **273.97** | **9.14** |
+| 06| 76    | 55.89 | 195.37 | 6.74 |
+| 07| 43    | 56.89 | 250.16 | 8.26 |
+| 08| 79    | 57.26 | 224.60 | 7.53 |
+| 09| 52    | 56.56 | 170.18 | 6.12 |
+| 10| 57    | 56.68 | 239.89 | 8.00 |
+| **mean** |   | **57.57** | **219.06** | **7.31** |
+
+### RTX 5090 DDTree budget sweep
+
+Fast HumanEval sweep, 10 prompts, `n_gen=128`, same target/draft, FP16/FP16 KV,
+FA window 4096.
+
+| Budget | Mean AL | Mean tok/s |
+|:------:|:-------:|:----------:|
+| 15     | 4.99    | 174.45     |
+| 16     | 5.76    | 176.98     |
+| 18     | 6.93    | 206.62     |
+| 20     | 6.94    | 204.03     |
+| **22** | **7.25**| **211.20** |
+| 24     | 7.19    | 203.08     |
+| 26     | 7.09    | 199.96     |
+| 30     | 7.44    | 206.19     |
+| 32     | 6.87    | 183.34     |
+| 40     | 6.97    | 174.52     |
+| 48     | 7.07    | 165.24     |
+| 64     | 7.14    | 148.12     |
+
+Budget 12 failed all prompts with a ggml shape assertion. Budget 22 remains the
+best short-context throughput default on this 5090 build. Budget 30 produced
+the highest mean AL but lower throughput, so it is a quality-biased experiment
+rather than the base setting.
