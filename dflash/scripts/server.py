@@ -261,9 +261,11 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
         ``template_kwargs`` is passed through to ``apply_chat_template`` so callers
         can toggle template knobs like ``enable_thinking`` per-request.
         """
-        prompt = tokenizer.apply_chat_template(
-            msgs_list, tokenize=False, add_generation_prompt=True,
-            **{k: v for k, v in (template_kwargs or {}).items() if k in _ALLOWED_TEMPLATE_KWARGS})
+        tpl_kwargs: dict = {"tokenize": False, "add_generation_prompt": True}
+        tpl_kwargs.update(
+            {k: v for k, v in (template_kwargs or {}).items() if k in _ALLOWED_TEMPLATE_KWARGS}
+        )
+        prompt = tokenizer.apply_chat_template(msgs_list, **tpl_kwargs)
         ids = tokenizer.encode(prompt, add_special_tokens=False)
         return _ids_to_bin(ids), ids, prompt
 

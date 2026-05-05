@@ -83,10 +83,15 @@ def wait_ready(proc, timeout=180):
         if proc.poll() is not None:
             return False
         try:
-            urllib.request.urlopen(f"http://127.0.0.1:{PORT}/v1/models", timeout=2).read()
-            return True
+            data = urllib.request.urlopen(f"http://127.0.0.1:{PORT}/v1/models", timeout=2).read()
+            # Verify the response belongs to OUR server, not a stale/foreign process on the port.
+            parsed = json.loads(data)
+            ids = [m.get("id", "") for m in parsed.get("data", [])]
+            if any("luce-dflash" in mid for mid in ids):
+                return True
         except Exception:
-            time.sleep(1)
+            pass
+        time.sleep(1)
     return False
 
 
@@ -109,6 +114,9 @@ def spawn(name, cfg, log_path):
 
 def run(name, cfg):
     log = f"/tmp/ab_results/server_{name}.log"
+    # Kill any stale/foreign process occupying the port before spawning our server.
+    subprocess.run(["fuser", "-k", f"{PORT}/tcp"], capture_output=True)
+    time.sleep(0.5)
     proc = spawn(name, cfg, log)
     try:
         if not wait_ready(proc):
@@ -179,20 +187,34 @@ def main():
         print(f"=== A/B COMPARISON ({ref_name} vs {other}) ===")
         print(f"{'id':6} {'category':14} {'status':6} {'lcp_ratio':10} {'lcp_chars':10}")
         exact = 0
+        compared = 0
+        skipped = 0
         for pid_ in sorted(ref):
-            a, b = ref[pid_]["reply"], test[pid_]["reply"]
+            ref_row, test_row = ref[pid_], test[pid_]
+            if ref_row.get("err") or test_row.get("err"):
+                # Both (or one) errored — empty string would look like an exact match;
+                # skip to avoid inflating the match score and hiding real failures.
+                skipped += 1
+                print(f"{pid_:6} {ref_row['category']:14} SKIP   (err: ref={ref_row.get('err')!r} test={test_row.get('err')!r})")
+                continue
+            a, b = ref_row["reply"], test_row["reply"]
             status, ratio, lcp = diff_replies(a, b)
             if status == "EXACT":
                 exact += 1
-            print(f"{pid_:6} {ref[pid_]['category']:14} {status:6} {ratio:<10} {lcp}")
-        n = len(ref)
-        print(f"Exact match: {exact}/{n}  ({100*exact/n:.0f}%)\n")
+            compared += 1
+            print(f"{pid_:6} {ref_row['category']:14} {status:6} {ratio:<10} {lcp}")
+        if compared:
+            print(f"Exact match: {exact}/{compared}  ({100*exact/compared:.0f}%)  [{skipped} skipped due to errors]\n")
+        else:
+            print(f"Exact match: N/A  (all {skipped} prompts errored — no valid comparison)\n")
 
     # Sanity-check verdict
     base = {r["id"]: r for r in results["baseline"]}
     base2 = {r["id"]: r for r in results["baseline_2"]}
-    sanity_exact = sum(1 for pid_ in base if base[pid_]["reply"] == base2[pid_]["reply"])
-    n = len(base)
+    # Exclude errored prompts from the sanity count to avoid false exact-matches.
+    valid_pids = [pid_ for pid_ in base if not base[pid_].get("err") and not base2[pid_].get("err")]
+    sanity_exact = sum(1 for pid_ in valid_pids if base[pid_]["reply"] == base2[pid_]["reply"])
+    n = len(valid_pids)
     print(f"=== SANITY: baseline vs baseline_2 → {sanity_exact}/{n} exact ===")
     if sanity_exact == n:
         print(">>> Server is deterministic. Any other DIFF is caused by the cache/feature being tested.")
