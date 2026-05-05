@@ -269,7 +269,7 @@ struct TargetCache {
     // beyond the cap wrap and overwrite older entries. Readers (draft) only
     // need the last DRAFT_CTX_MAX positions, so wrap is invisible in
     // practice. Fed into the draft graph's fc projection after a bf16→f32
-    // cast (dflash27b_launch_bf16_to_f32).
+    // cast (ggml_get_to_fp32_cuda).
     ggml_tensor * target_feat = nullptr;
     int target_feat_cap = 0;
 };

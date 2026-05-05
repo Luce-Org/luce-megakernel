@@ -30,23 +30,10 @@
 
 #include <cuda_runtime.h>
 
-// Half-precision → f32 widen kernel launchers (src/f16_convert.cu). Used by
-// the DDtree rollback (ssm_intermediate slot → cache.ssm_state) and the
-// drafter prep path (target_feat → sg.target_hidden_cat). We store the
-// per-token intermediate cache in f16 and the target_feat buffer in bf16 to
-// halve their memory footprint.
-extern "C" void dflash27b_launch_f16_to_f32(const void * src,
-                                            void * dst,
-                                            size_t n_elems,
-                                            cudaStream_t stream);
-extern "C" void dflash27b_launch_bf16_to_f32(const void * src,
-                                             void * dst,
-                                             size_t n_elems,
-                                             cudaStream_t stream);
-extern "C" void dflash27b_launch_q8_0_to_f32(const void * src,
-                                              void * dst,
-                                              size_t n_elems,
-                                              cudaStream_t stream);
+// ggml-cuda dequantize: Q8_0/F16/BF16 → F32. Replaces the custom
+// f16_convert.cu kernels with ggml's built-in converter dispatch.
+using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
+to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
 #include <algorithm>
 #include <chrono>
@@ -3454,16 +3441,17 @@ int main(int argc, char ** argv) {
             const int    post_n   = draft_ctx - pre_n;
 
             cudaSetDevice(draft_gpu);
-            dflash27b_launch_bf16_to_f32(
+            auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+            bf16_to_f32(
                 (const char *)cache.target_feat->data + (size_t)slot0 * elt_feat * fc_in,
-                draft_sg.target_hidden_cat->data,
-                (size_t)pre_n * fc_in,
+                (float *)sg.target_hidden_cat->data,
+                (int64_t)pre_n * fc_in,
                 nullptr);
             if (post_n > 0) {
-                dflash27b_launch_bf16_to_f32(
+                bf16_to_f32(
                     (const char *)cache.target_feat->data,
-                    (char *)draft_sg.target_hidden_cat->data + (size_t)pre_n * fc_in * sizeof(float),
-                    (size_t)post_n * fc_in,
+                    (float *)((char *)sg.target_hidden_cat->data + (size_t)pre_n * fc_in * sizeof(float)),
+                    (int64_t)post_n * fc_in,
                     nullptr);
             }
         }
@@ -3808,10 +3796,9 @@ int main(int argc, char ** argv) {
                         return 1;
                     }
                     // SSM state rollback: source is cache.ssm_intermediate_states
-                    // (f16, [S_v, S_v, H_v, max_verify_tokens]) at slot
-                    // rollback_dfs. Destination is cache.ssm_state[il] (f32).
-                    // Use a tiny CUDA kernel (src/f16_convert.cu) to widen f16
-                    // → f32 in a single launch per layer.
+                    // ([S_v, S_v, H_v, max_verify_tokens]) at slot rollback_dfs.
+                    // Destination is cache.ssm_state[il] (f32). Use ggml's
+                    // built-in dequantize to widen Q8_0/F16 → f32.
                     const size_t ssm_elems =
                         (size_t)cache.ssm_state[il]->ne[0] *
                         (size_t)cache.ssm_state[il]->ne[1] *
@@ -3820,15 +3807,9 @@ int main(int argc, char ** argv) {
                         (size_t)rollback_dfs * cap.ssm_intermediate_states->nb[3];
                     const void * ssm_src =
                         (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-                    if (cap.ssm_intermediate_states->type == GGML_TYPE_Q8_0) {
-                        dflash27b_launch_q8_0_to_f32(ssm_src,
-                                                     cache.ssm_state[il]->data,
-                                                     ssm_elems, stream);
-                    } else {
-                        dflash27b_launch_f16_to_f32(ssm_src,
-                                                    cache.ssm_state[il]->data,
-                                                    ssm_elems, stream);
-                    }
+                    ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
+                        ssm_src, (float *)cache.ssm_state[il]->data,
+                        (int64_t)ssm_elems, stream);
                     cudaError_t ce = cudaSuccess;  // launch error checked in the conv block below
 
                     // Conv rollback: copy the K-1 most recent inputs along
@@ -4136,8 +4117,8 @@ int main(int argc, char ** argv) {
                     // cap.ssm_intermediate_states is the persistent cache buffer
                     // cache.ssm_intermediate[il], shape [S_v, S_v, H_v, q_len].
                     // Stored in Q8_0 (or F16 legacy) to reduce memory;
-                    // cache.ssm_state[il] is f32. Use the dequant kernel to
-                    // convert on copy, same as the DDtree rollback path.
+                    // cache.ssm_state[il] is f32. Use ggml's built-in dequantize
+                    // to convert on copy, same as the DDtree rollback path.
                     const size_t ssm_elems =
                         (size_t)cache.ssm_state[il]->ne[0] *
                         (size_t)cache.ssm_state[il]->ne[1] *
@@ -4146,15 +4127,9 @@ int main(int argc, char ** argv) {
                         (size_t)rollback_idx * cap.ssm_intermediate_states->nb[3];
                     const void * ssm_src =
                         (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-                    if (cap.ssm_intermediate_states->type == GGML_TYPE_Q8_0) {
-                        dflash27b_launch_q8_0_to_f32(ssm_src,
-                                                     cache.ssm_state[il]->data,
-                                                     ssm_elems, stream);
-                    } else {
-                        dflash27b_launch_f16_to_f32(ssm_src,
-                                                    cache.ssm_state[il]->data,
-                                                    ssm_elems, stream);
-                    }
+                    ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
+                        ssm_src, (float *)cache.ssm_state[il]->data,
+                        (int64_t)ssm_elems, stream);
                     cudaError_t ce = cudaSuccess;
 
                     // ── Conv rollback: copy conv_input[commit_n..commit_n+K-2, :, :]
