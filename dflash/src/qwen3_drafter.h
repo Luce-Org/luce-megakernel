@@ -37,6 +37,7 @@ struct DrafterContext {
     ggml_backend_t        backend = nullptr;   // owned (created in load_drafter)
     Qwen3DrafterWeights   weights;             // BF16 weights on the backend
     DrafterArch           arch    = DrafterArch::Qwen3_0p6b;
+    void *                arch_state = nullptr;
     bool                  loaded  = false;
 };
 

@@ -229,6 +229,11 @@ struct TargetTensorAlloc {
     size_t buffer_offset = 0;
 };
 
+float get_f32_or(const gguf_context * g, const char * key, float fallback) {
+    int64_t id = gguf_find_key(g, key);
+    if (id < 0) return fallback;
+    return gguf_get_val_f32(g, id);
+}
 } // namespace
 
 bool load_target_gguf(const std::string & path,
@@ -288,10 +293,10 @@ bool load_target_gguf_partial(const std::string & path,
     if (n_embd == 0 || n_layer == 0 || n_head == 0 || n_headkv == 0 ||
         kl == 0 || vl == 0 || n_ff == 0 || fai == 0 ||
         ssm_conv == 0 || ssm_inner == 0 || ssm_state == 0 ||
-        ssm_dt == 0 || ssm_grp == 0) {
+        ssm_dt == 0 || ssm_grp == 0 || ssm_inner % ssm_dt != 0) {
         char buf[512];
         std::snprintf(buf, sizeof(buf),
-            "missing or zero hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
+            "invalid qwen35 hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
             "kl=%u vl=%u n_ff=%u fai=%u ssm{conv=%u inner=%u state=%u dt=%u grp=%u}",
             n_embd, n_layer, n_head, n_headkv, kl, vl, n_ff, fai,
             ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp);
@@ -300,65 +305,16 @@ bool load_target_gguf_partial(const std::string & path,
         return false;
     }
 
-    // Structural invariants required by the graph builder.
-    if (kl != vl) {
-        set_last_error("key_length != value_length not supported");
-        gguf_free(gctx); return false;
-    }
-    if (ssm_inner % ssm_dt != 0) {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "ssm.inner_size=%u not divisible by ssm.time_step_rank=%u", ssm_inner, ssm_dt);
-        set_last_error(buf);
-        gguf_free(gctx); return false;
-    }
-    if (n_layer % fai != 0) {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "block_count=%u not divisible by full_attention_interval=%u", n_layer, fai);
-        set_last_error(buf);
-        gguf_free(gctx); return false;
-    }
-
     // rope dimension_sections (array of 4 uint32)
     int rope_sections[4] = {0, 0, 0, 0};
     {
         int64_t rid = gguf_find_key(gctx, "qwen35.rope.dimension_sections");
-        if (rid < 0) {
-            set_last_error("missing qwen35.rope.dimension_sections");
-            gguf_free(gctx); return false;
-        }
-        size_t n = gguf_get_arr_n(gctx, rid);
-        if (n < 4) {
-            set_last_error("qwen35.rope.dimension_sections has < 4 entries");
-            gguf_free(gctx); return false;
-        }
-        const int32_t * arr = (const int32_t *)gguf_get_arr_data(gctx, rid);
-        for (int k = 0; k < 4; k++) rope_sections[k] = arr[k];
-    }
-
-    // Validate rope_sections against head_dim. n_rot = 2 * sum(sections) is
-    // the number of dims rotated by ggml_rope_multi; it must be even, > 0,
-    // and ≤ head_dim, otherwise rope reads/writes out of bounds.
-    {
-        long sum = 0;
-        for (int k = 0; k < 4; k++) {
-            if (rope_sections[k] < 0) {
-                char buf[160];
-                std::snprintf(buf, sizeof(buf),
-                    "rope_sections[%d]=%d is negative", k, rope_sections[k]);
-                set_last_error(buf);
-                gguf_free(gctx); return false;
+        if (rid >= 0) {
+            size_t n = gguf_get_arr_n(gctx, rid);
+            if (n >= 4) {
+                const int32_t * arr = (const int32_t *)gguf_get_arr_data(gctx, rid);
+                for (int k = 0; k < 4; k++) rope_sections[k] = arr[k];
             }
-            sum += rope_sections[k];
-        }
-        const long n_rot = 2 * sum;
-        if (n_rot <= 0 || n_rot > (long)kl) {
-            char buf[200];
-            std::snprintf(buf, sizeof(buf),
-                "rope_sections {%d,%d,%d,%d} → n_rot=%ld invalid for head_dim=%u",
-                rope_sections[0], rope_sections[1], rope_sections[2], rope_sections[3],
-                n_rot, kl);
-            set_last_error(buf);
-            gguf_free(gctx); return false;
         }
     }
 
@@ -392,28 +348,9 @@ bool load_target_gguf_partial(const std::string & path,
     out.ssm_d_state= (int)ssm_state;
     out.ssm_dt_rank= (int)ssm_dt;
     out.ssm_n_group= (int)ssm_grp;
-
-    // EOS token ids from GGUF tokenizer metadata (stored as UINT32 by the
-    // GGUF spec; we use the u32 helper and cast). UINT32_MAX is the
-    // missing-key sentinel and maps to int32_t -1, which the runtime EOS
-    // check rejects via the `>= 0` guard.
-    {
-        const uint32_t kEosKeyMissing = 0xFFFFFFFFu;
-        const uint32_t raw_eos      = get_u32_or(gctx, "tokenizer.ggml.eos_token_id", kEosKeyMissing);
-        const uint32_t raw_eos_chat = get_u32_or(gctx, "tokenizer.ggml.eot_token_id", kEosKeyMissing);
-        out.eos_id      = (raw_eos      == kEosKeyMissing) ? -1 : (int32_t)raw_eos;
-        out.eos_chat_id = (raw_eos_chat == kEosKeyMissing) ? -1 : (int32_t)raw_eos_chat;
-        std::printf("[loader] eos_id=%d eos_chat_id=%d\n", out.eos_id, out.eos_chat_id);
-    }
-
-    // Compute capture layer IDs: evenly spaced through the target layers.
-    // step = (n_layer - 2) / (N - 1), ids[k] = 1 + k * step.
-    {
-        const int N = DFLASH27B_DRAFT_N_TARGET_LAYERS;
-        const int step = ((int)n_layer - 2) / (N - 1);
-        for (int k = 0; k < N; k++) out.capture_layer_ids[k] = 1 + k * step;
-    }
-
+    out.rope_dimension_count = (int)get_u32_or(gctx, "qwen35.rope.dimension_count", 64);
+    out.rope_theta = get_f32_or(gctx, "qwen35.rope.freq_base", 10000000.0f);
+    out.rms_eps = get_f32_or(gctx, "qwen35.attention.layer_norm_rms_epsilon", 1e-6f);
     out.layers.assign((size_t)n_layer, TargetLayer{});
 
     // ── 2. Wire our layer pointers to tensors inside meta_ctx ─────────
@@ -423,11 +360,12 @@ bool load_target_gguf_partial(const std::string & path,
     out.tok_embd = g("token_embd.weight");
     out.out_norm = g("output_norm.weight");
     out.output   = g("output.weight");
-    if (!out.tok_embd || !out.out_norm || !out.output) {
-        set_last_error("missing top-level tensors (token_embd/output_norm/output)");
+    if (!out.tok_embd || !out.out_norm) {
+        set_last_error("missing top-level tensors (token_embd/output_norm)");
         gguf_free(gctx);
         return false;
     }
+    out.n_vocab = (int)out.tok_embd->ne[1];
 
     for (int il = 0; il < (int)n_layer; il++) {
         char name[128];
@@ -592,8 +530,8 @@ bool load_target_gguf_partial(const std::string & path,
     out.embedder.tok_embd_bytes = (const uint8_t *)mm.addr + tok_embd_off;
     out.embedder.tok_embd_type  = tok_embd_type;
     out.embedder.n_embd         = out.n_embd;
-    out.embedder.n_vocab        = DFLASH27B_TARGET_VOCAB;
-    out.embedder.row_bytes      = tok_embd_sz / DFLASH27B_TARGET_VOCAB;
+    out.embedder.n_vocab        = out.n_vocab;
+    out.embedder.row_bytes      = tok_embd_sz / (size_t)out.n_vocab;
     mm.release();  // don't munmap on Mmap dtor — now owned by the embedder
 
     // Stash the total for callers that want to print it

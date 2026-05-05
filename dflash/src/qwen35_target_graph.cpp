@@ -1,24 +1,34 @@
-// Forward pass of Qwen3.5 (qwen35 hybrid) in pure ggml.
+// Forward pass of Qwen3.5-27B (qwen35 hybrid) in pure ggml.
 //
 // Translates llama.cpp's `src/models/qwen35.cpp` + `delta-net-base.cpp` into
-// our standalone library. All model dimensions are read from GGUF at load time
-// via TargetWeights, supporting any Qwen3.5-dense model size (4B, 9B, 27B).
-// No llama.cpp runtime is linked — only ggml ops.
+// our standalone library, hardcoded for Qwen3.5-27B dimensions. No
+// llama.cpp runtime is linked — only ggml ops.
 //
 // Architecture highlights:
-//   - N layers; every Kth (il % K == K-1) is full attention, rest are Gated DeltaNet
+//   - 64 layers; every 4th (il % 4 == 3) is full attention, rest are Gated DeltaNet
 //   - Full-attention Q projection is PACKED with a gate (attn_q has width 2*q_dim)
-//   - Full attention uses M-RoPE with sections from GGUF
-//   - Flash attention is GQA, causal
+//   - Full attention uses M-RoPE with sections [11,11,10,0]
+//   - Flash attention is GQA 24/4, causal
 //   - Delta-net uses ggml_ssm_conv for the 1D conv + ggml_gated_delta_net for the recurrence
 //   - FFN is SwiGLU (w_gate * silu, element-wise multiply with w_up, then w_down)
 //
 // State (persisted in TargetCache across calls):
-//   - attn_k, attn_v           : KV cache for full-attn layers
-//   - conv_state               : 1D conv recurrence state, f32
-//   - ssm_state                : delta-net recurrent state, f32
+//   - attn_k[16], attn_v[16]     : KV cache for full-attn layers, f16
+//   - conv_state[48]             : 1D conv recurrence state, f32
+//   - ssm_state[48]              : delta-net recurrent state (head_v^2 × H_v), f32
 //
-// All dimensions are runtime values from TargetWeights (populated by GGUF loader).
+// Key dimensions (all hardcoded via DFLASH27B_* macros):
+//   n_embd           = 5120
+//   n_head           = 24    head_dim = 256   q_dim = n_head * head_dim = 6144
+//   n_head_kv        = 4     kv_dim = 4 * 256 = 1024
+//   n_ff             = 17408
+//   d_inner (ssm)    = 6144
+//   d_state (ssm)    = 128
+//   dt_rank (ssm)    = 48    (num_v_heads)
+//   n_group (ssm)    = 16    (num_k_heads)
+//   head_v_dim       = d_inner / dt_rank = 128
+//   head_k_dim       = d_state           = 128
+//   conv_kernel      = 4
 
 #include "internal.h"
 #include "delta_net_chunked.h"
@@ -31,9 +41,31 @@
 
 namespace dflash27b {
 
-// ─── File-local constants (architecture-invariant across all qwen35 sizes) ──
-static constexpr float EPS         = 1e-6f;
-static constexpr float ROPE_THETA  = 10000000.0f;
+// ─── Local qwen35 constants (from the GGUF, hardcoded for this model) ─
+// These complement the DFLASH27B_* macros in dflash27b.h with qwen35-specific
+// hparams that differ from the draft (which uses plain Qwen3 dims).
+namespace q35 {
+constexpr int N_HEAD        = 24;
+constexpr int N_HEAD_KV     = 4;
+constexpr int HEAD_DIM      = 256;   // key_length == value_length
+constexpr int Q_DIM         = N_HEAD * HEAD_DIM;    // 6144
+constexpr int KV_DIM        = N_HEAD_KV * HEAD_DIM; // 1024
+constexpr int FFN_DIM       = 17408;
+
+constexpr int SSM_D_INNER   = 6144;
+constexpr int SSM_D_STATE   = 128;
+constexpr int SSM_DT_RANK   = 48;
+constexpr int SSM_N_GROUP   = 16;
+constexpr int SSM_CONV_KERN = 4;
+
+// Derived
+constexpr int HEAD_V_DIM    = SSM_D_INNER / SSM_DT_RANK;  // 128
+constexpr int HEAD_K_DIM    = SSM_D_STATE;                // 128
+constexpr int CONV_CHANNELS = SSM_D_INNER + 2 * SSM_N_GROUP * SSM_D_STATE; // 6144 + 2*16*128 = 10240
+
+constexpr float EPS         = 1e-6f;
+constexpr float ROPE_THETA  = 10000000.0f;
+}  // namespace q35
 
 // ─── TargetCache allocation ─────────────────────────────────────────
 
@@ -72,6 +104,9 @@ bool create_target_cache_partial(const TargetWeights & w,
 
     const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
     const int n_delta     = w.n_layer - n_full_attn;               // 48
+    const int head_dim    = w.n_embd_head_k;
+    const int head_v_dim  = w.ssm_d_inner / w.ssm_dt_rank;
+    const int conv_ch     = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
 
     out.attn_k.assign(n_full_attn, nullptr);
     out.attn_v.assign(n_full_attn, nullptr);
@@ -103,9 +138,6 @@ bool create_target_cache_partial(const TargetWeights & w,
         if (!out.base_ctx) { set_last_error("base cache ggml_init failed"); return false; }
 
         int fa_idx = 0, dn_idx = 0;
-        const int head_dim      = w.n_embd_head_k;
-        const int head_v_dim    = w.ssm_d_inner / w.ssm_dt_rank;
-        const int conv_channels = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
         for (int il = 0; il < w.n_layer; il++) {
             const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
             const bool owns_layer = il >= layer_begin && il < layer_end;
@@ -131,7 +163,7 @@ bool create_target_cache_partial(const TargetWeights & w,
                                                      head_v_dim, head_v_dim, w.ssm_dt_rank);
                 // conv_state: [kernel-1, conv_channels]
                 ggml_tensor * C = ggml_new_tensor_2d(out.base_ctx, GGML_TYPE_F32,
-                                                     w.ssm_d_conv - 1, conv_channels);
+                                                     w.ssm_d_conv - 1, conv_ch);
                 char name[64];
                 std::snprintf(name, sizeof(name), "ssm_state_%d", il);  ggml_set_name(S, name);
                 std::snprintf(name, sizeof(name), "conv_state_%d", il); ggml_set_name(C, name);
@@ -171,8 +203,6 @@ bool create_target_cache_partial(const TargetWeights & w,
         if (!out.rollback_ctx) { set_last_error("rollback cache ggml_init failed"); return false; }
 
         int dn_idx = 0;
-        const int head_v_dim    = w.ssm_d_inner / w.ssm_dt_rank;
-        const int conv_channels = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
         for (int il = 0; il < w.n_layer; il++) {
             if (((il + 1) % w.full_attention_interval) != 0) {
                 const bool owns_layer = il >= layer_begin && il < layer_end;
@@ -180,13 +210,13 @@ bool create_target_cache_partial(const TargetWeights & w,
                 ggml_tensor * Sn = ggml_new_tensor_3d(out.rollback_ctx, GGML_TYPE_F32,
                                                        head_v_dim, head_v_dim, w.ssm_dt_rank);
                 ggml_tensor * Cn = ggml_new_tensor_2d(out.rollback_ctx, GGML_TYPE_F32,
-                                                       w.ssm_d_conv - 1, conv_channels);
+                                                       w.ssm_d_conv - 1, conv_ch);
                 ggml_tensor * Si = ggml_new_tensor_4d(out.rollback_ctx, GGML_TYPE_Q8_0,
                                                        head_v_dim, head_v_dim,
                                                        w.ssm_dt_rank, max_verify_tokens);
                 ggml_tensor * Ci = ggml_new_tensor_3d(out.rollback_ctx, GGML_TYPE_F32,
                                                        (w.ssm_d_conv - 1) + max_verify_tokens,
-                                                       conv_channels, 1);
+                                                       conv_ch, 1);
                 char name[64];
                 std::snprintf(name, sizeof(name), "ssm_state_snap_%d", il);  ggml_set_name(Sn, name);
                 std::snprintf(name, sizeof(name), "conv_state_snap_%d", il); ggml_set_name(Cn, name);
@@ -248,9 +278,7 @@ void free_target_cache(TargetCache & c) {
 }
 
 void reset_target_cache(TargetCache & c) {
-    c.cur_pos  = 0;
-    c.last_tok = -1;   // prevent the previous request's decode seed from
-                       // leaking into the next request after a reset.
+    c.cur_pos = 0;
     std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
     ggml_context * ctx_list[] = { c.base_ctx, c.rollback_ctx };
     for (int ci = 0; ci < 2; ci++) {
@@ -283,6 +311,8 @@ bool migrate_prefill_cache(const TargetWeights & w,
     if (cache.rollback_ctx) return true;
 
     const int n_delta = (int)cache.ssm_state.size(); // 48
+    const int head_v_dim = w.ssm_d_inner / w.ssm_dt_rank;
+    const int conv_ch = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
     if (max_verify_tokens <= 0) {
         max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
     }
@@ -301,20 +331,18 @@ bool migrate_prefill_cache(const TargetWeights & w,
     if (!cache.rollback_ctx) { set_last_error("rollback cache ggml_init failed"); return false; }
 
     int dn_idx = 0;
-    const int head_v_dim    = w.ssm_d_inner / w.ssm_dt_rank;
-    const int conv_channels = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
     for (int il = 0; il < w.n_layer; il++) {
         if (((il + 1) % w.full_attention_interval) != 0) {
             ggml_tensor * Sn = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
                                                    head_v_dim, head_v_dim, w.ssm_dt_rank);
             ggml_tensor * Cn = ggml_new_tensor_2d(cache.rollback_ctx, GGML_TYPE_F32,
-                                                   w.ssm_d_conv - 1, conv_channels);
+                                                   w.ssm_d_conv - 1, conv_ch);
             ggml_tensor * Si = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F16,
                                                    head_v_dim, head_v_dim,
                                                    w.ssm_dt_rank, max_verify_tokens);
             ggml_tensor * Ci = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
                                                    (w.ssm_d_conv - 1) + max_verify_tokens,
-                                                   conv_channels, 1);
+                                                   conv_ch, 1);
             char name[64];
             std::snprintf(name, sizeof(name), "ssm_state_snap_%d", il);  ggml_set_name(Sn, name);
             std::snprintf(name, sizeof(name), "conv_state_snap_%d", il); ggml_set_name(Cn, name);
@@ -372,302 +400,6 @@ void restore_ssm_state(TargetCache & c) {
     }
 }
 
-// ─── Cross-request prefix snapshot (Phase A) ─────────────────────────
-
-bool snapshot_target_cache(const TargetWeights & w,
-                           const TargetCache & cache,
-                           ggml_backend_t backend,
-                           PrefixSnapshot & snap) {
-    const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
-    const int n_delta     = w.n_layer - n_full_attn;               // 48
-
-    // Lazy allocation: only allocate on the first call.
-    if (snap.ctx == nullptr) {
-        const int total_tensors = 2 * n_full_attn + 2 * n_delta + 1; // 65
-        ggml_init_params ip{};
-        ip.mem_size   = (size_t)(total_tensors + 16) * ggml_tensor_overhead();
-        ip.mem_buffer = nullptr;
-        ip.no_alloc   = true;
-        snap.ctx = ggml_init(ip);
-        if (!snap.ctx) { set_last_error("PrefixSnapshot ggml_init failed"); return false; }
-
-        snap.attn_k_snap.assign(n_full_attn, nullptr);
-        snap.attn_v_snap.assign(n_full_attn, nullptr);
-        snap.ssm_state_snap.assign(n_delta, nullptr);
-        snap.conv_state_snap.assign(n_delta, nullptr);
-
-        // Allocate KV snap tensors matching the cache's shapes and types.
-        for (int i = 0; i < n_full_attn; i++) {
-            ggml_tensor * sk = cache.attn_k[i];
-            ggml_tensor * sv = cache.attn_v[i];
-            ggml_tensor * K = ggml_new_tensor_3d(snap.ctx, sk->type, sk->ne[0], sk->ne[1], sk->ne[2]);
-            ggml_tensor * V = ggml_new_tensor_3d(snap.ctx, sv->type, sv->ne[0], sv->ne[1], sv->ne[2]);
-            char name[64];
-            std::snprintf(name, sizeof(name), "snap_cache_k_%d", i); ggml_set_name(K, name);
-            std::snprintf(name, sizeof(name), "snap_cache_v_%d", i); ggml_set_name(V, name);
-            snap.attn_k_snap[i] = K;
-            snap.attn_v_snap[i] = V;
-        }
-
-        // Allocate SSM and conv snap tensors.
-        for (int i = 0; i < n_delta; i++) {
-            ggml_tensor * ss = cache.ssm_state[i];
-            ggml_tensor * cs = cache.conv_state[i];
-            ggml_tensor * S = ggml_new_tensor_3d(snap.ctx, ss->type, ss->ne[0], ss->ne[1], ss->ne[2]);
-            ggml_tensor * C = ggml_new_tensor_2d(snap.ctx, cs->type, cs->ne[0], cs->ne[1]);
-            char name[64];
-            std::snprintf(name, sizeof(name), "snap_ssm_state_%d", i);  ggml_set_name(S, name);
-            std::snprintf(name, sizeof(name), "snap_conv_state_%d", i); ggml_set_name(C, name);
-            snap.ssm_state_snap[i]  = S;
-            snap.conv_state_snap[i] = C;
-        }
-
-        // Allocate target_feat snap tensor.
-        {
-            ggml_tensor * tf = cache.target_feat;
-            snap.target_feat_snap = ggml_new_tensor_2d(snap.ctx, tf->type, tf->ne[0], tf->ne[1]);
-            ggml_set_name(snap.target_feat_snap, "snap_target_feat");
-        }
-
-        snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend);
-        if (!snap.buf) {
-            set_last_error("ggml_backend_alloc_ctx_tensors failed for PrefixSnapshot");
-            ggml_free(snap.ctx);
-            snap.ctx = nullptr;
-            snap.attn_k_snap.clear();
-            snap.attn_v_snap.clear();
-            snap.ssm_state_snap.clear();
-            snap.conv_state_snap.clear();
-            snap.target_feat_snap = nullptr;
-            return false;
-        }
-    }
-
-    // Copy live cache tensors into snapshot (works for both first call and refreshes).
-    for (int i = 0; i < n_full_attn; i++) {
-        ggml_backend_tensor_copy(cache.attn_k[i], snap.attn_k_snap[i]);
-        ggml_backend_tensor_copy(cache.attn_v[i], snap.attn_v_snap[i]);
-    }
-    for (int i = 0; i < n_delta; i++) {
-        ggml_backend_tensor_copy(cache.ssm_state[i],  snap.ssm_state_snap[i]);
-        ggml_backend_tensor_copy(cache.conv_state[i], snap.conv_state_snap[i]);
-    }
-    ggml_backend_tensor_copy(cache.target_feat, snap.target_feat_snap);
-
-    snap.cur_pos         = cache.cur_pos;
-    snap.last_tok        = cache.last_tok;
-    snap.kv_k_type       = cache.kv_k_type;
-    snap.max_ctx         = cache.max_ctx;
-    snap.target_feat_cap = cache.target_feat_cap;
-
-    return true;
-}
-
-bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
-    if (snap.kv_k_type != cache.kv_k_type) {
-        set_last_error("restore_target_cache: kv_k_type mismatch");
-        return false;
-    }
-    if (snap.max_ctx != cache.max_ctx) {
-        set_last_error("restore_target_cache: max_ctx mismatch");
-        return false;
-    }
-    // Topology: snapshot must describe the same model layout the cache was
-    // allocated against. A mismatch (stale snapshot from a different daemon
-    // run, or a snap captured before a model swap) would index past
-    // cache.attn_k / .ssm_state / .conv_state and silently corrupt memory.
-    if (snap.attn_k_snap.size() != cache.attn_k.size() ||
-        snap.attn_v_snap.size() != cache.attn_v.size() ||
-        snap.ssm_state_snap.size()  != cache.ssm_state.size() ||
-        snap.conv_state_snap.size() != cache.conv_state.size()) {
-        set_last_error("restore_target_cache: layer-count mismatch (stale snapshot?)");
-        return false;
-    }
-    if (snap.cur_pos < 0 || snap.cur_pos > cache.max_ctx) {
-        set_last_error("restore_target_cache: snap.cur_pos out of range");
-        return false;
-    }
-
-    const int n_full_attn = (int)snap.attn_k_snap.size();
-    const int n_delta     = (int)snap.ssm_state_snap.size();
-
-    for (int i = 0; i < n_full_attn; i++) {
-        ggml_backend_tensor_copy(snap.attn_k_snap[i], cache.attn_k[i]);
-        ggml_backend_tensor_copy(snap.attn_v_snap[i], cache.attn_v[i]);
-    }
-    for (int i = 0; i < n_delta; i++) {
-        ggml_backend_tensor_copy(snap.ssm_state_snap[i],  cache.ssm_state[i]);
-        ggml_backend_tensor_copy(snap.conv_state_snap[i], cache.conv_state[i]);
-    }
-    ggml_backend_tensor_copy(snap.target_feat_snap, cache.target_feat);
-
-    cache.cur_pos  = snap.cur_pos;
-    cache.last_tok = snap.last_tok;
-
-    return true;
-}
-
-void free_prefix_snapshot(PrefixSnapshot & snap) {
-    if (snap.buf) { ggml_backend_buffer_free(snap.buf); snap.buf = nullptr; }
-    if (snap.ctx) { ggml_free(snap.ctx);                snap.ctx = nullptr; }
-    snap.attn_k_snap.clear();
-    snap.attn_v_snap.clear();
-    snap.ssm_state_snap.clear();
-    snap.conv_state_snap.clear();
-    snap.target_feat_snap = nullptr;
-    snap.cur_pos         = 0;
-    snap.kv_k_type       = GGML_TYPE_COUNT;
-    snap.max_ctx         = 0;
-    snap.target_feat_cap = 0;
-    snap.is_thin         = false;
-    snap.kv_start        = 0;
-    snap.kv_end          = 0;
-}
-
-bool snapshot_target_cache_thin(const TargetWeights & w,
-                                 const TargetCache & cache,
-                                 ggml_backend_t backend,
-                                 int kv_start,
-                                 int kv_end,
-                                 PrefixSnapshot & snap) {
-    if (kv_end <= kv_start || kv_start < 0 || kv_end > cache.max_ctx) {
-        set_last_error("snapshot_thin: invalid kv range");
-        return false;
-    }
-    // Capturing past cur_pos would snapshot uninitialized KV data — the
-    // restore path would then resume decode from garbage state.
-    if (kv_end > cache.cur_pos) {
-        set_last_error("snapshot_thin: kv_end exceeds cache.cur_pos (would capture uninitialized KV)");
-        return false;
-    }
-    const int n_full_attn = w.n_layer / w.full_attention_interval;
-    const int block_size  = kv_end - kv_start;
-
-    // Lazy alloc; if snap was already a THIN with same range, reuse.
-    bool needs_alloc = (snap.ctx == nullptr) ||
-                       !snap.is_thin ||
-                       snap.kv_start != kv_start ||
-                       snap.kv_end   != kv_end;
-    if (needs_alloc) {
-        free_prefix_snapshot(snap);
-        const int total_tensors = 2 * n_full_attn;
-        ggml_init_params ip{};
-        ip.mem_size   = (size_t)(total_tensors + 16) * ggml_tensor_overhead();
-        ip.mem_buffer = nullptr;
-        ip.no_alloc   = true;
-        snap.ctx = ggml_init(ip);
-        if (!snap.ctx) { set_last_error("PrefixSnapshot thin ggml_init failed"); return false; }
-        snap.attn_k_snap.assign(n_full_attn, nullptr);
-        snap.attn_v_snap.assign(n_full_attn, nullptr);
-        // SSM/conv/target_feat NOT allocated for thin.
-        for (int i = 0; i < n_full_attn; i++) {
-            ggml_tensor * sk = cache.attn_k[i];
-            ggml_tensor * sv = cache.attn_v[i];
-            // Tightly-packed shape [HEAD_DIM, block_size, N_HEAD_KV]
-            snap.attn_k_snap[i] = ggml_new_tensor_3d(snap.ctx, sk->type,
-                                                      sk->ne[0], block_size, sk->ne[2]);
-            snap.attn_v_snap[i] = ggml_new_tensor_3d(snap.ctx, sv->type,
-                                                      sv->ne[0], block_size, sv->ne[2]);
-            char name[64];
-            std::snprintf(name, sizeof(name), "snap_thin_k_%d", i);
-            ggml_set_name(snap.attn_k_snap[i], name);
-            std::snprintf(name, sizeof(name), "snap_thin_v_%d", i);
-            ggml_set_name(snap.attn_v_snap[i], name);
-        }
-        snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend);
-        if (!snap.buf) {
-            set_last_error("thin snap alloc failed");
-            ggml_free(snap.ctx);
-            snap.ctx = nullptr;
-            snap.attn_k_snap.clear();
-            snap.attn_v_snap.clear();
-            return false;
-        }
-    }
-
-    // Copy strip-by-strip.
-    for (int i = 0; i < n_full_attn; i++) {
-        ggml_tensor * sk = cache.attn_k[i];
-        ggml_tensor * sv = cache.attn_v[i];
-        ggml_tensor * dk = snap.attn_k_snap[i];
-        ggml_tensor * dv = snap.attn_v_snap[i];
-        const size_t k_strip = (size_t)block_size * sk->nb[1];
-        const size_t v_strip = (size_t)block_size * sv->nb[1];
-        std::vector<uint8_t> bufk(k_strip), bufv(v_strip);
-        for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
-            size_t k_src = (size_t)kh * sk->nb[2] + (size_t)kv_start * sk->nb[1];
-            size_t k_dst = (size_t)kh * dk->nb[2];
-            ggml_backend_tensor_get(sk, bufk.data(), k_src, k_strip);
-            ggml_backend_tensor_set(dk, bufk.data(), k_dst, k_strip);
-            size_t v_src = (size_t)kh * sv->nb[2] + (size_t)kv_start * sv->nb[1];
-            size_t v_dst = (size_t)kh * dv->nb[2];
-            ggml_backend_tensor_get(sv, bufv.data(), v_src, v_strip);
-            ggml_backend_tensor_set(dv, bufv.data(), v_dst, v_strip);
-        }
-    }
-    snap.is_thin   = true;
-    snap.kv_start  = kv_start;
-    snap.kv_end    = kv_end;
-    snap.cur_pos   = kv_end;
-    snap.kv_k_type = cache.kv_k_type;
-    snap.max_ctx   = cache.max_ctx;
-    return true;
-}
-
-bool restore_target_cache_chain(const PrefixSnapshot * thick,
-                                 const PrefixSnapshot * const * thins,
-                                 int n_thins,
-                                 TargetCache & cache) {
-    // Step 1: restore thick base if provided.
-    if (thick) {
-        if (thick->is_thin) {
-            set_last_error("restore_chain: 'thick' arg is actually a thin snapshot");
-            return false;
-        }
-        if (!restore_target_cache(*thick, cache)) return false;
-    }
-    // Step 2: layer thins into KV cache at their respective ranges.
-    int max_kv_end = cache.cur_pos;
-    for (int t = 0; t < n_thins; t++) {
-        const PrefixSnapshot * thin = thins[t];
-        if (!thin->is_thin) {
-            set_last_error("restore_chain: 'thin' arg has is_thin=false");
-            return false;
-        }
-        if (thin->kv_k_type != cache.kv_k_type ||
-            thin->max_ctx   != cache.max_ctx) {
-            set_last_error("restore_chain: thin kv_k_type/max_ctx mismatch");
-            return false;
-        }
-        const int block_size = thin->kv_end - thin->kv_start;
-        for (int i = 0; i < (int)cache.attn_k.size(); i++) {
-            ggml_tensor * sk = thin->attn_k_snap[i];
-            ggml_tensor * sv = thin->attn_v_snap[i];
-            ggml_tensor * dk = cache.attn_k[i];
-            ggml_tensor * dv = cache.attn_v[i];
-            const size_t k_strip = (size_t)block_size * dk->nb[1];
-            const size_t v_strip = (size_t)block_size * dv->nb[1];
-            std::vector<uint8_t> bufk(k_strip), bufv(v_strip);
-            for (int kh = 0; kh < (int)dk->ne[2]; kh++) {
-                size_t k_src = (size_t)kh * sk->nb[2];
-                size_t k_dst = (size_t)kh * dk->nb[2] + (size_t)thin->kv_start * dk->nb[1];
-                ggml_backend_tensor_get(sk, bufk.data(), k_src, k_strip);
-                ggml_backend_tensor_set(dk, bufk.data(), k_dst, k_strip);
-                size_t v_src = (size_t)kh * sv->nb[2];
-                size_t v_dst = (size_t)kh * dv->nb[2] + (size_t)thin->kv_start * dv->nb[1];
-                ggml_backend_tensor_get(sv, bufv.data(), v_src, v_strip);
-                ggml_backend_tensor_set(dv, bufv.data(), v_dst, v_strip);
-            }
-        }
-        if (thin->kv_end > max_kv_end) max_kv_end = thin->kv_end;
-    }
-    cache.cur_pos = max_kv_end;
-    // Note: cache.last_tok is NOT updated by chain restore; the caller must
-    // ensure that the LAST thin's kv_end matches the prompt position where
-    // last_tok was captured, or fall back to bare-prompt prefill afterward.
-    return true;
-}
-
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
@@ -679,8 +411,9 @@ static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
 static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
                                       const TargetLayer & L) {
     ggml_tensor * gate = ggml_mul_mat(ctx, L.w_gate, cur);   // [inter, n_tokens]
+    gate = ggml_silu(ctx, gate);
     ggml_tensor * up = ggml_mul_mat(ctx, L.w_up, cur);
-    ggml_tensor * gu = ggml_swiglu_split(ctx, gate, up);
+    ggml_tensor * gu = ggml_mul(ctx, gate, up);
     return ggml_mul_mat(ctx, L.w_down, gu);                  // [hidden, n_tokens]
 }
 
@@ -697,6 +430,7 @@ static ggml_tensor * build_full_attn_block(
     const TargetLayer & L,
     ggml_tensor * cur,
     ggml_tensor * positions,
+    const int * rope_sections,
     ggml_tensor * cache_k,
     ggml_tensor * cache_v,
     ggml_tensor * attn_mask,
@@ -704,13 +438,14 @@ static ggml_tensor * build_full_attn_block(
     int n_tokens,
     ggml_type kv_k_type,
     ggml_type kv_v_type,
-    int fa_window = 0
+    int fa_window = 0,
+    ggml_tensor * q_tail_capture = nullptr,
+    int q_tail_start = 0
 ) {
     const int head_dim = w.n_embd_head_k;
-    const int n_head   = w.n_head;
+    const int n_head = w.n_head;
     const int n_head_kv = w.n_head_kv;
-    const int q_dim    = n_head * head_dim;
-
+    const int q_dim = head_dim * n_head;
     // ── Q projection (packed Q || gate), shape [2*q_dim, n_tokens]
     ggml_tensor * QG = ggml_mul_mat(ctx, L.wq, cur);
     // Reshape to [head_dim*2, n_head, n_tokens] so we can view the Q and gate halves
@@ -720,10 +455,10 @@ static ggml_tensor * build_full_attn_block(
     // Layout: [head_dim, n_head, n_tokens]
     ggml_tensor * Q = ggml_view_3d(ctx, QG,
         head_dim, n_head, n_tokens,
-        ggml_element_size(QG) * head_dim * 2,                // nb1: stride over n_head
-        ggml_element_size(QG) * head_dim * 2 * n_head,       // nb2: stride over n_tokens
+        ggml_element_size(QG) * head_dim * 2,                 // nb1: stride over n_head
+        ggml_element_size(QG) * head_dim * 2 * n_head,   // nb2: stride over n_tokens
         /*offset*/ 0);
-    Q = rms_norm_mul(ctx, Q, L.q_norm, EPS);
+    Q = rms_norm_mul(ctx, Q, L.q_norm, w.rms_eps);
 
     // Gate half: view at offset head_dim
     ggml_tensor * gate = ggml_view_3d(ctx, QG,
@@ -738,23 +473,48 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * Vcur = ggml_mul_mat(ctx, L.wv, cur);   // [kv_dim, n_tokens]
 
     Kcur = ggml_reshape_3d(ctx, Kcur, head_dim, n_head_kv, n_tokens);
-    Kcur = rms_norm_mul(ctx, Kcur, L.k_norm, EPS);
+    Kcur = rms_norm_mul(ctx, Kcur, L.k_norm, w.rms_eps);
     Vcur = ggml_reshape_3d(ctx, Vcur, head_dim, n_head_kv, n_tokens);
 
-    // ── M-RoPE (multi-axis rotary). n_rot derived from rope_sections.
-    const int n_rot = 2 * (w.rope_sections[0] + w.rope_sections[1] +
-                           w.rope_sections[2] + w.rope_sections[3]);
+    // ── M-RoPE (multi-axis rotary). n_rot = HEAD_DIM/4 * 4 ? Actually
+    //    ggml_rope_multi takes n_dims = the number of dims to rotate; for
+    //    qwen35 that's rope.dimension_count=64 (out of head_dim=256).
+    int n_rot = w.rope_dimension_count;
     int sections[4];
-    for (int i = 0; i < 4; i++) sections[i] = w.rope_sections[i];
+    for (int i = 0; i < 4; i++) sections[i] = rope_sections[i];
 
     Q = ggml_rope_multi(ctx, Q, positions, /*freq_factors=*/nullptr,
                         n_rot, sections, GGML_ROPE_TYPE_MROPE,
-                        /*n_ctx_orig=*/0, ROPE_THETA, 1.0f,
+                        /*n_ctx_orig=*/0, w.rope_theta, 1.0f,
                         0.0f, 1.0f, 0.0f, 0.0f);
     Kcur = ggml_rope_multi(ctx, Kcur, positions, nullptr,
                            n_rot, sections, GGML_ROPE_TYPE_MROPE,
-                           0, ROPE_THETA, 1.0f,
+                           0, w.rope_theta, 1.0f,
                            0.0f, 1.0f, 0.0f, 0.0f);
+
+    if (q_tail_capture) {
+        const int chunk_lo = kv_start;
+        const int chunk_hi = kv_start + n_tokens;
+        const int cap_n = (int) q_tail_capture->ne[2];
+        const int tail_lo = q_tail_start;
+        const int tail_hi = q_tail_start + cap_n;
+        const int ov_lo = std::max(chunk_lo, tail_lo);
+        const int ov_hi = std::min(chunk_hi, tail_hi);
+        if (ov_lo < ov_hi) {
+            const int local_lo = ov_lo - chunk_lo;
+            const int cap_lo = ov_lo - tail_lo;
+            const int n_cap = ov_hi - ov_lo;
+            ggml_tensor * q_src = ggml_view_3d(ctx, Q,
+                head_dim, n_head, n_cap,
+                Q->nb[1], Q->nb[2], (size_t)local_lo * Q->nb[2]);
+            q_src = ggml_cont(ctx, q_src);
+            q_src = ggml_reshape_1d(ctx, q_src, head_dim * n_head * n_cap);
+            ggml_tensor * q_dst = ggml_view_1d(ctx, q_tail_capture,
+                head_dim * n_head * n_cap,
+                (size_t)cap_lo * q_tail_capture->nb[2]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, q_src, q_dst));
+        }
+    }
 
     // ── Write K/V into the persistent cache at slot [kv_start..kv_start+n_tokens)
     //
@@ -862,15 +622,15 @@ static ggml_tensor * build_delta_net_block(
     DeltaNetCapture * cap,        // optional: populated on capture_delta_intermediate
     ggml_tensor * parent_ids      // optional [n_tokens] i32; tree mode when non-null
 ) {
-    const int head_k_dim    = w.ssm_d_state;
-    const int num_k_heads   = w.ssm_n_group;
-    const int num_v_heads   = w.ssm_dt_rank;
-    const int head_v_dim    = w.ssm_d_inner / w.ssm_dt_rank;
+    const int head_k_dim   = w.ssm_d_state;
+    const int num_k_heads  = w.ssm_n_group;
+    const int num_v_heads  = w.ssm_dt_rank;
+    const int head_v_dim   = w.ssm_d_inner / w.ssm_dt_rank;
     const int conv_channels = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
-    const int n_seqs        = 1;
-    const int n_seq_tokens  = n_tokens;
+    const int n_seqs       = 1;
+    const int n_seq_tokens = n_tokens;
 
-    // ── qkv_mixed = wqkv @ cur         [conv_channels, n_tokens]
+    // ── qkv_mixed = wqkv @ cur         [10240, n_tokens]
     ggml_tensor * qkv_mixed = ggml_mul_mat(ctx, L.wqkv, cur);
     qkv_mixed = ggml_reshape_3d(ctx, qkv_mixed, conv_channels, n_seq_tokens, n_seqs);
 
@@ -911,19 +671,7 @@ static ggml_tensor * build_delta_net_block(
     // past graph_compute). After graph_compute, the cache buffer's data is
     // always valid; the rollback code slices it at commit_n.
     if (cap && cap->conv_input) {
-        // conv_input may be shorter than the pre-allocated cache
-        // (e.g. during prefill when n_tokens < max_verify_tokens).
-        // Copy into a matching-sized view of the cache destination.
-        const int64_t ci_len = conv_input->ne[0];
-        ggml_tensor * dst;
-        if (ci_len == cap->conv_input->ne[0]) {
-            dst = cap->conv_input;
-        } else {
-            dst = ggml_view_3d(ctx, cap->conv_input,
-                ci_len, cap->conv_input->ne[1], cap->conv_input->ne[2],
-                cap->conv_input->nb[1], cap->conv_input->nb[2], 0);
-        }
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, conv_input, dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, conv_input, cap->conv_input));
     }
 
     // ── Save the last (kernel-1) steps back to conv_state
@@ -949,7 +697,7 @@ static ggml_tensor * build_delta_net_block(
     const int64_t v_offset = 2 * num_k_heads * head_k_dim;
 
     const size_t elt = ggml_element_size(conv_out);
-    const size_t row_size = (size_t)conv_channels * elt;
+    const size_t row_size = conv_channels * elt;
 
     ggml_tensor * q_c = ggml_view_4d(ctx, conv_out,
         head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
@@ -971,8 +719,8 @@ static ggml_tensor * build_delta_net_block(
         v_offset * elt);
 
     // L2 norm on Q and K
-    q_c = ggml_l2_norm(ctx, q_c, EPS);
-    k_c = ggml_l2_norm(ctx, k_c, EPS);
+    q_c = ggml_l2_norm(ctx, q_c, w.rms_eps);
+    k_c = ggml_l2_norm(ctx, k_c, w.rms_eps);
 
     // Repeat Q and K from num_k_heads to num_v_heads so they match V's layout
     // (only needed if not using the fused op's broadcast support).
@@ -1084,14 +832,8 @@ static ggml_tensor * build_delta_net_block(
             S_v * S_v * r_elt,
             S_v * S_v * H_v * r_elt,
             inter_offset);
-        // inter_view may be shorter than pre-allocated cache during prefill
-        ggml_tensor * inter_dst = cap->ssm_intermediate_states;
-        if (ggml_nelements(inter_view) != ggml_nelements(inter_dst)) {
-            inter_dst = ggml_view_4d(ctx, inter_dst,
-                inter_view->ne[0], inter_view->ne[1], inter_view->ne[2], inter_view->ne[3],
-                inter_dst->nb[1], inter_dst->nb[2], inter_dst->nb[3], 0);
-        }
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, inter_view, inter_dst));
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx, inter_view, cap->ssm_intermediate_states));
     }
     } // end of block started at `{` before `const int64_t S_v = head_v_dim;`
 
@@ -1107,7 +849,7 @@ after_delta_net:
 
     // ── Gated output norm: rms_norm(output) * silu(z_4d)
     ggml_tensor * z_4d = ggml_reshape_4d(ctx, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
-    ggml_tensor * output_n = ggml_rms_norm(ctx, output, EPS);
+    ggml_tensor * output_n = ggml_rms_norm(ctx, output, w.rms_eps);
     output_n = ggml_mul(ctx, output_n, L.ssm_norm);
     ggml_tensor * z_silu  = ggml_silu(ctx, z_4d);
     output_n = ggml_mul(ctx, output_n, z_silu);
@@ -1140,12 +882,17 @@ static ggml_tensor * build_single_layer(
     int                   kv_start,
     int                   n_tokens,
     bool                  capture,
-    int                   fa_window = 0)
+    int                   fa_window = 0,
+    ggml_tensor *         q_tail_capture = nullptr,
+    int                   q_tail_start = 0)
 {
     const int hidden = w.n_embd;
-    const float eps   = EPS;
+    const float eps   = w.rms_eps;
     const TargetLayer & L = w.layers[layer_idx];
     const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
+
+    static const int CAPTURE_LAYERS[DFLASH27B_DRAFT_N_TARGET_LAYERS] =
+        { 1, 16, 31, 46, 61 };
 
     ggml_tensor * inpSA = inp;
     ggml_tensor * cur   = rms_norm_mul(ctx, inp, L.attn_norm, eps);
@@ -1155,10 +902,11 @@ static ggml_tensor * build_single_layer(
         for (int il = 0; il < layer_idx; il++) {
             if (((il + 1) % w.full_attention_interval) == 0) fa_idx++;
         }
-        cur = build_full_attn_block(ctx, gf, w, L, cur, positions,
+        cur = build_full_attn_block(ctx, gf, w, L, cur, positions, w.rope_sections,
                                     cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                                     attn_mask, kv_start, n_tokens,
-                                    cache.kv_k_type, cache.kv_v_type, fa_window);
+                                    cache.kv_k_type, cache.kv_v_type, fa_window,
+                                    q_tail_capture, q_tail_start);
     } else {
         int dn_idx = 0;
         for (int il = 0; il < layer_idx; il++) {
@@ -1179,7 +927,7 @@ static ggml_tensor * build_single_layer(
     if (capture && cache.target_feat) {
         int capture_idx = -1;
         for (int k = 0; k < DFLASH27B_DRAFT_N_TARGET_LAYERS; k++) {
-            if (w.capture_layer_ids[k] == layer_idx) { capture_idx = k; break; }
+            if (CAPTURE_LAYERS[k] == layer_idx) { capture_idx = k; break; }
         }
         if (capture_idx >= 0) {
             const size_t elt        = ggml_element_size(cache.target_feat);
@@ -1241,11 +989,13 @@ QwenGraphOutputs build_qwen35_graph(
         og_early.delta_captures.resize(n_delta);
     }
 
-    // DFlash target layer IDs for feature capture, computed from n_layer.
+    // DFlash target layer IDs for feature capture: {1, 16, 31, 46, 61}
     // HF hidden_states[lid+1] convention — capture AFTER layer 'lid' runs.
+    static const int CAPTURE_LAYERS[DFLASH27B_DRAFT_N_TARGET_LAYERS] =
+        { 1, 16, 31, 46, 61 };
 
     const int hidden = w.n_embd;
-    const float eps  = EPS;
+    const float eps  = w.rms_eps;
 
     for (int il = 0; il < w.n_layer; il++) {
         const TargetLayer & L = w.layers[il];
@@ -1257,7 +1007,7 @@ QwenGraphOutputs build_qwen35_graph(
         ggml_tensor * cur = rms_norm_mul(ctx, inpL, L.attn_norm, eps);
 
         if (is_attn) {
-            cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions,
+            cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
                                         cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                                         in.attn_mask, in.kv_start, n_tokens,
                                         cache.kv_k_type, cache.kv_v_type, in.fa_window);
@@ -1299,7 +1049,7 @@ QwenGraphOutputs build_qwen35_graph(
         if (in.capture_layers && cache.target_feat) {
             int capture_idx = -1;
             for (int k = 0; k < DFLASH27B_DRAFT_N_TARGET_LAYERS; k++) {
-                if (w.capture_layer_ids[k] == il) { capture_idx = k; break; }
+                if (CAPTURE_LAYERS[k] == il) { capture_idx = k; break; }
             }
             if (capture_idx >= 0) {
                 const size_t elt        = ggml_element_size(cache.target_feat);
@@ -1341,13 +1091,18 @@ QwenGraphOutputs build_qwen35_graph(
     }
 
     // 2. Final norm
-    ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, EPS);
+    ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
 
     // 3. LM head
-    ggml_tensor * logits = ggml_mul_mat(ctx, w.output, out);
-    ggml_set_name(logits, "logits");
-
-    ggml_build_forward_expand(gf, logits);
+    ggml_tensor * logits = nullptr;
+    if (w.output) {
+        logits = ggml_mul_mat(ctx, w.output, out);
+        ggml_set_name(logits, "logits");
+        ggml_build_forward_expand(gf, logits);
+    } else {
+        ggml_set_name(out, "result_norm");
+        ggml_build_forward_expand(gf, out);
+    }
 
     QwenGraphOutputs og = std::move(og_early);
     og.logits = logits;
@@ -1366,10 +1121,13 @@ ggml_tensor * build_qwen35_layer(
     int                   kv_start,
     int                   n_tokens,
     bool                  capture,
-    int                   fa_window)
+    int                   fa_window,
+    ggml_tensor *         q_tail_capture,
+    int                   q_tail_start)
 {
     return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
-                              attn_mask, kv_start, n_tokens, capture, fa_window);
+                              attn_mask, kv_start, n_tokens, capture, fa_window,
+                              q_tail_capture, q_tail_start);
 }
 
 } // namespace dflash27b

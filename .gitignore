@@ -65,6 +65,12 @@ checkpoints/
 *.bin
 .cache/
 
+# HIP build artifacts
+dflash/build-hip/
+
+# Local model copies for benchmarking
+pflash/models/
+
 # Secrets
 .env.local
 *.pem

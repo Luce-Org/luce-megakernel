@@ -122,6 +122,10 @@ struct TargetWeights {
     int n_layer                 = 64;
     int n_embd                  = 5120;
     int n_ff                    = 17408;
+    int n_vocab                 = DFLASH27B_TARGET_VOCAB;
+    int rope_dimension_count    = 64;
+    float rope_theta            = 10000000.0f;
+    float rms_eps               = 1e-6f;
     int ssm_d_conv              = 4;
     int ssm_d_inner             = 6144;
     int ssm_d_state             = 128;
@@ -470,6 +474,8 @@ ggml_tensor * build_qwen35_layer(
     int                   kv_start,
     int                   n_tokens,
     bool                  capture,
-    int                   fa_window = 0);
+    int                   fa_window = 0,
+    ggml_tensor *         q_tail_capture = nullptr,
+    int                   q_tail_start = 0);
 
 } // namespace dflash27b

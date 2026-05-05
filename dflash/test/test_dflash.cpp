@@ -2766,9 +2766,14 @@ int main(int argc, char ** argv) {
                         stream_emit(-1); continue;
                     }
                     drafter_loaded = true;
-                    std::printf("[drafter] loaded %s arch=%s (n_layer=%d n_head=%d n_head_kv=%d)\n",
-                                drafter_path, dflash27b::drafter_arch_name(drafter_arch), drafter_ctx.weights.n_layer,
-                                drafter_ctx.weights.n_head, drafter_ctx.weights.n_head_kv);
+                    if (drafter_arch == dflash27b::DrafterArch::Qwen3_0p6b) {
+                        std::printf("[drafter] loaded %s arch=%s (n_layer=%d n_head=%d n_head_kv=%d)\n",
+                                    drafter_path, dflash27b::drafter_arch_name(drafter_arch), drafter_ctx.weights.n_layer,
+                                    drafter_ctx.weights.n_head, drafter_ctx.weights.n_head_kv);
+                    } else {
+                        std::printf("[drafter] loaded %s arch=%s\n",
+                                    drafter_path, dflash27b::drafter_arch_name(drafter_arch));
+                    }
                     std::fflush(stdout);
                 } else if (drafter_ctx.arch != drafter_arch) {
                     std::fprintf(stderr, "[compress] requested arch=%s but loaded arch=%s\n",
