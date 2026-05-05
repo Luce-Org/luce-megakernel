@@ -911,9 +911,10 @@ static bool build_target_step_tree(
     ggml_set_name(sg.positions, "positions");
     ggml_set_input(sg.positions);
 
-    const int win_start = (fa_window > 0 && kv_start > fa_window) ? (kv_start - fa_window) : 0;
-    const int win_len = kv_start + n_tokens - win_start;
-    const int kv_pad = align_up(win_len, g_kq_stride_pad);
+    // Use max possible mask size so gallocr shape stays fixed across steps.
+    // Actual valid region is filled before compute; unused area is -inf.
+    const int max_win_len = cache.max_ctx + n_tokens;
+    const int kv_pad = align_up(max_win_len, g_kq_stride_pad);
     const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
     sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
     ggml_set_name(sg.attn_mask, "attn_mask");
@@ -2533,7 +2534,8 @@ int main(int argc, char ** argv) {
                 L, ddtree_K, ddtree_budget,
                 ddtree_chain_seed);
 
-            const int N = 1 + tree.n_nodes;  // flat size including root
+            const int N_actual = 1 + tree.n_nodes;  // actual tree size
+            const int N = ddtree_budget + 1;         // fixed allocation size for gallocr reuse
 
             if (!build_target_step_tree(sg, w, cache, backend,
                                         /*kv_start=*/committed, /*n_tokens=*/N,
@@ -2543,20 +2545,21 @@ int main(int argc, char ** argv) {
             T_verify_build = sync_us();
             tt_verify_build += std::chrono::duration<double, std::micro>(T_verify_build - T_snap).count();
 
-            // Embeddings: [last_tok, tree.token_ids[0..n_nodes-1]]
-            std::vector<int32_t> flat_tokens(N);
+            // Embeddings: [last_tok, tree.token_ids[0..n_nodes-1], padding...]
+            std::vector<int32_t> flat_tokens(N, 0);
             flat_tokens[0] = last_tok;
             for (int i = 0; i < tree.n_nodes; i++) flat_tokens[1 + i] = tree.token_ids[i];
+            // Pad remaining slots with token 0 — their outputs are masked
 
-            std::vector<float> tree_embed(hidden * N);
-            if (!w.embedder.embed(flat_tokens.data(), N, tree_embed.data())) return 1;
+            std::vector<float> tree_embed((size_t)hidden * N, 0.0f);
+            if (!w.embedder.embed(flat_tokens.data(), N_actual, tree_embed.data())) return 1;
+            // Leave padding slots as zero
             ggml_backend_tensor_set(sg.inp_embed, tree_embed.data(), 0,
                                     sizeof(float) * hidden * N);
 
-            // M-RoPE axis-major positions: committed + depth_of_node.
-            // Slot 0 = root = depth 0 → position `committed`.
-            std::vector<int32_t> pos4(4 * N);
-            for (int i = 0; i < N; i++) {
+            // M-RoPE axis-major positions
+            std::vector<int32_t> pos4(4 * N, 0);
+            for (int i = 0; i < N_actual; i++) {
                 int p = committed + (i == 0 ? 0 : tree.depths[i - 1]);
                 pos4[0 * N + i] = p;
                 pos4[1 * N + i] = p;
@@ -2565,19 +2568,41 @@ int main(int argc, char ** argv) {
             }
             ggml_backend_tensor_set(sg.positions, pos4.data(), 0, sizeof(int32_t) * 4 * N);
 
-            // Ancestor-only attention mask (f16).
+            // Ancestor-only attention mask (f16). Build for the full N slots
+            // but only the first N_actual have valid visibility; padding slots
+            // get -inf everywhere (default from assign).
             const int tree_win_start = (g_fa_window > 0 && committed > g_fa_window)
                                            ? (committed - g_fa_window) : 0;
-            build_tree_mask(tree, /*past_length=*/committed, mask_buf, tree_win_start);
+            {
+                // Use the same kv_pad as the tensor allocation (max_ctx + N)
+                const int max_win_len = cache.max_ctx + N;
+                const int kv_pad_m = align_up(max_win_len, g_kq_stride_pad);
+                const int q_pad_m  = align_up(N, KQ_MASK_PAD);
+                mask_buf.assign((size_t)kv_pad_m * q_pad_m, F16_NEG_INF);
+                // Fill rows 0..N_actual-1 using the tree visibility
+                for (int q = 0; q < N_actual; q++) {
+                    // Past KV positions are visible to all tree nodes
+                    for (int k = std::max(0, tree_win_start); k < committed; k++) {
+                        mask_buf[(size_t)q * kv_pad_m + (k - tree_win_start)] = F16_ZERO;
+                    }
+                    // Tree self-visibility
+                    for (int j = 0; j < N_actual; j++) {
+                        if (tree.visibility[(size_t)q * N_actual + j]) {
+                            mask_buf[(size_t)q * kv_pad_m + (committed + j - tree_win_start)] = F16_ZERO;
+                        }
+                    }
+                }
+                // Rows N_actual..N-1 remain all -inf (padding slots see nothing)
+            }
             ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
                                     sizeof(uint16_t) * mask_buf.size());
 
-            // parent_ids for tree-mode DeltaNet kernel.
-            // Slot 0 (root): -1 (reload initial state — matches kernel's skip
-            // at t==0). Slots 1..N-1: the tree's parent index in the flat array.
-            std::vector<int32_t> parent_ids(N);
+            // parent_ids: actual tree nodes, then padding → point to root (slot 0)
+            std::vector<int32_t> parent_ids(N, 0);
             parent_ids[0] = -1;
-            for (int i = 1; i < N; i++) parent_ids[i] = (int32_t)tree.parents[i];
+            for (int i = 1; i < N_actual; i++) parent_ids[i] = (int32_t)tree.parents[i];
+            // Padding slots: parent=0 (root). DeltaNet kernel processes them
+            // but their outputs are never used (masked out in attention).
             ggml_backend_tensor_set(sg.parent_ids, parent_ids.data(), 0,
                                     sizeof(int32_t) * N);
 
@@ -2591,10 +2616,10 @@ int main(int argc, char ** argv) {
             T_verify_compute = sync_us();
             tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
 
-            // Read the N verify argmax from GPU (N × 4 bytes, not N × 248K × 4).
-            std::vector<int32_t> posterior(N);
+            // Read only the actual tree slots (not padding)
+            std::vector<int32_t> posterior(N_actual);
             ggml_backend_tensor_get(sg.argmax_tokens, posterior.data(), 0,
-                                    sizeof(int32_t) * N);
+                                    sizeof(int32_t) * N_actual);
 
             // Walk tree: accepted DFS indices and next bonus token.
             int next_token = -1;
@@ -2609,7 +2634,7 @@ int main(int argc, char ** argv) {
             }
             if (walked_sibling || n_draft_steps < 2) {
                 std::printf("[dbg sib step %d] N=%d accept=%d walked_sib=%d\n",
-                            n_draft_steps, N, accept_depth, walked_sibling ? 1 : 0);
+                            n_draft_steps, N_actual, accept_depth, walked_sibling ? 1 : 0);
                 std::printf("  walk:");
                 for (int x : accepted) std::printf(" %d", x);
                 if (walked_sibling) {
@@ -2624,7 +2649,7 @@ int main(int argc, char ** argv) {
 
 
             std::printf("[step %d] committed=%d last_tok=%d tree_N=%d accept=%d next=%d\n",
-                        n_draft_steps, committed, last_tok, N, accept_depth, next_token);
+                        n_draft_steps, committed, last_tok, N_actual, accept_depth, next_token);
 
             // Commit count: matches chain mode's accept_n semantics. The root
             // (= previous iter's last_tok) is "pending" — not yet in out_all —
