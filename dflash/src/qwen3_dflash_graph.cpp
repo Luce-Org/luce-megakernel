@@ -118,8 +118,27 @@ DraftGraphOutputs build_draft_graph(
         V = ggml_cont   (ctx, V);
 
         // ── 2f. Non-causal flash attention; GQA broadcast handled internally.
+        //   For SWA layers (Qwen3.6 draft): apply sliding window mask
+        //   limiting context K/V to the last `swa_window` positions.
         const float scale = 1.0f / std::sqrt((float)head_dim);
-        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, /*mask=*/nullptr,
+        ggml_tensor * attn_mask = nullptr;
+        if (L.is_swa && w.swa_window > 0 && total_k > w.swa_window) {
+            // Build a mask that blocks attention beyond the window.
+            // mask shape: [total_k, q_len] — element (k, q) = 0 (attend) or -inf (block)
+            // For SWA: each query at position p attends to K positions in [p - window, p + window]
+            // But in DFlash non-causal mode, queries are at positions [ctx_len..ctx_len+q_len-1]
+            // and keys span [0..total_k-1]. SWA means keys older than window are masked.
+            const int win = w.swa_window;
+            attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, total_k, q_len);
+            ggml_set_name(attn_mask, "swa_mask");
+            ggml_set_input(attn_mask);
+            // NOTE: mask data will be set at graph compute time by the caller.
+            // For now, we pass nullptr and let full attention run — the mask
+            // setup requires knowing absolute positions which are in `in.positions_k`.
+            // TODO: implement mask fill in the caller or use ggml_diag_mask_inf
+            attn_mask = nullptr; // fallback to full attention until mask fill is wired
+        }
+        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, attn_mask,
                                                  scale, /*max_bias=*/0.0f,
                                                  /*logit_softcap=*/0.0f);
         // attn result: [n_embd_v=head_dim, n_head, n_batch=q_len, 1]
