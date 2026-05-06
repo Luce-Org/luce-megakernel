@@ -359,6 +359,12 @@ bool forward_qwen3_0p6b_drafter(
         ggml_backend_get_default_buffer_type(w.backend));
 
     flashprefill::FlashPrefillConfig fp_cfg;
+#if defined(DFLASH27B_USE_HIP)
+    // The HIP sparse-forward kernel is much slower when FlashPrefill keeps a
+    // broad set of K blocks. Use a stricter default on ROCm; callers can still
+    // override with DFLASH_FP_ALPHA for quality/speed sweeps.
+    fp_cfg.alpha = 0.95f;
+#endif
     if (const char* a = std::getenv("DFLASH_FP_ALPHA")) {
         float v = (float)std::atof(a);
         if (v > 0.0f && v < 1.0f) fp_cfg.alpha = v;
@@ -484,7 +490,9 @@ bool forward_qwen3_0p6b_drafter(
         // Use the custom BF16 WMMA path on SM >= 80 with BF16 buffers.
         auto tF0 = std::chrono::steady_clock::now();
         const bool use_bf16_fp = (Q_buf.t->type == GGML_TYPE_BF16)
-#if DFLASH27B_MIN_SM >= 80
+#if defined(DFLASH27B_USE_HIP)
+                                 && false;  // ROCm: use ggml flash_attn_ext; custom sparse kernel is too slow on gfx1151.
+#elif DFLASH27B_MIN_SM >= 80
                                  && true;
 #else
                                  && false;  // WMMA kernels not compiled

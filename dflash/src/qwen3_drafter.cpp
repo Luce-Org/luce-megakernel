@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <unordered_map>
 #include <vector>
 
 namespace dflash27b {
@@ -459,26 +460,132 @@ static std::vector<int32_t> qwen35_score_and_compress(
 
     const int n_chunks = (S + chunk_size - 1) / chunk_size;
     const int n_keep = std::max(1, (int)((float)n_chunks * keep_ratio));
+    
+    std::vector<float> smooth_score = score;
+    int pool_kernel = std::max(3, env_int("DFLASH_COMPRESS_POOL_KERNEL", 5));
+    std::vector<float> smoothed((size_t)S, 0.0f);
+    int half = pool_kernel / 2;
+    for (int j = 0; j < S; ++j) {
+        int lo = std::max(0, j - half);
+        int hi = std::min(S - 1, j + half);
+        float s = 0.0f;
+        int n = 0;
+        for (int k = lo; k <= hi; ++k) { s += score[(size_t)k]; ++n; }
+        smoothed[(size_t)j] = (n > 0) ? (s / (float)n) : 0.0f;
+    }
+    smooth_score.swap(smoothed);
+    
     std::vector<std::pair<float, int>> chunk_means;
     for (int c = 0; c < n_chunks; ++c) {
         int lo = c * chunk_size, hi = std::min(S, lo + chunk_size);
         float s = 0.0f;
-        for (int j = lo; j < hi; ++j) s += score[(size_t)j];
+        for (int j = lo; j < hi; ++j) s += smooth_score[(size_t)j];
         chunk_means.push_back({s / std::max(1, hi - lo), c});
     }
     std::sort(chunk_means.begin(), chunk_means.end(), [](auto a, auto b) { return a.first > b.first; });
+    
     std::vector<uint8_t> selected((size_t)n_chunks, 0);
     int count = 0;
     for (int c = 0; c < std::min(n_chunks, env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8)); ++c) { selected[(size_t)c] = 1; ++count; }
     for (int c = std::max(0, n_chunks - env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24)); c < n_chunks; ++c) if (!selected[(size_t)c]) { selected[(size_t)c] = 1; ++count; }
+    
+    const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
+    const int anchor_radius = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS", 2);
+    const int max_anchor_hits = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", 8);
+    std::vector<uint8_t> forced((size_t)n_chunks, 0);
+
+    const int q0 = std::max(0, S - query_tokens);
+    constexpr int NGRAM = 4;
+    for (int q = q0; q + NGRAM <= S; ++q) {
+        int hits = 0;
+        int hit_pos[8];
+        const int search_end = std::max(0, q0 - NGRAM);
+        for (int p = 0; p <= search_end && hits <= max_anchor_hits; ++p) {
+            bool same = true;
+            for (int k = 0; k < NGRAM; ++k) {
+                if (ids[(size_t)p + k] != ids[(size_t)q + k]) { same = false; break; }
+            }
+            if (same) {
+                if (hits < 8) hit_pos[hits] = p;
+                ++hits;
+            }
+        }
+        if (hits > 0 && hits <= max_anchor_hits) {
+            for (int i = 0; i < hits && i < 8; ++i) {
+                force_chunk_neighborhood(forced, n_chunks, hit_pos[i] / chunk_size, anchor_radius);
+            }
+        }
+    }
+    for (int c = 0; c < n_chunks; ++c) {
+        if (forced[(size_t)c] && !selected[(size_t)c]) {
+            selected[(size_t)c] = 1;
+            ++count;
+        }
+    }
+
+    // Global aggregation tasks often depend on repeated rare tokens that do
+    // not appear in the final query. Preserve high-frequency-but-not-filler
+    // token chunks before filling with model-score top-K.
+    const int repeat_min = env_int("DFLASH_COMPRESS_REPEAT_MIN", 4);
+    const int repeat_max = env_int("DFLASH_COMPRESS_REPEAT_MAX", 32);
+    const int repeat_limit = env_int("DFLASH_COMPRESS_REPEAT_CHUNKS", n_keep);
+    if (repeat_min > 1 && count < repeat_limit) {
+        std::unordered_map<int32_t, int> freq;
+        freq.reserve((size_t)S);
+        const int repeat_scan_end = std::max(0, S - query_tokens);
+        for (int j = 0; j < repeat_scan_end; ++j) {
+            ++freq[ids[(size_t)j]];
+        }
+        std::vector<std::pair<int, int32_t>> repeated;
+        repeated.reserve(freq.size());
+        for (const auto & kv : freq) {
+            if (kv.second >= repeat_min && kv.second <= repeat_max) {
+                repeated.push_back({kv.second, kv.first});
+            }
+        }
+        std::sort(repeated.begin(), repeated.end(), [](const auto & a, const auto & b) {
+            if (a.first != b.first) return a.first > b.first;
+            return a.second < b.second;
+        });
+        for (const auto & rp : repeated) {
+            if (count >= repeat_limit) break;
+            const int32_t tok = rp.second;
+            for (int j = 0; j < repeat_scan_end && count < repeat_limit; ++j) {
+                if (ids[(size_t)j] != tok) continue;
+                const int c = j / chunk_size;
+                if (!selected[(size_t)c]) {
+                    selected[(size_t)c] = 1;
+                    ++count;
+                }
+            }
+        }
+    }
+    
     for (auto [_, c] : chunk_means) {
         if (count >= n_keep) break;
         if (!selected[(size_t)c]) { selected[(size_t)c] = 1; ++count; }
     }
+    
     std::vector<int32_t> out_ids;
-    for (int c = 0; c < n_chunks; ++c) if (selected[(size_t)c]) {
-        int lo = c * chunk_size, hi = std::min(S, lo + chunk_size);
-        for (int j = lo; j < hi; ++j) out_ids.push_back(ids[(size_t)j]);
+    std::vector<int> selected_chunks;
+    for (int c = 0; c < n_chunks; ++c) {
+        if (selected[(size_t)c]) selected_chunks.push_back(c);
+    }
+    int span_start = -1, span_end = -1;
+    for (int c : selected_chunks) {
+        int s_ = c * chunk_size;
+        int e_ = std::min(S, (c + 1) * chunk_size);
+        if (span_start < 0) {
+            span_start = s_; span_end = e_;
+        } else if (s_ == span_end) {
+            span_end = e_;
+        } else {
+            for (int j = span_start; j < span_end; ++j) out_ids.push_back(ids[j]);
+            span_start = s_; span_end = e_;
+        }
+    }
+    if (span_start >= 0) {
+        for (int j = span_start; j < span_end; ++j) out_ids.push_back(ids[j]);
     }
 
     auto t1 = std::chrono::steady_clock::now();

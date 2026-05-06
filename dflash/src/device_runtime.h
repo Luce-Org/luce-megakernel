@@ -39,6 +39,13 @@ using __nv_bfloat16 = __hip_bfloat16;
 #define cudaGetLastError hipGetLastError
 #define cudaGetErrorString hipGetErrorString
 #define cudaDeviceSynchronize hipDeviceSynchronize
+#define cudaSetDevice hipSetDevice
+#define cudaGetDeviceCount hipGetDeviceCount
+#define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
+#define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
+#define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
+#define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+#define cudaDeviceDisablePeerAccess hipDeviceDisablePeerAccess
 #endif
 #else
 #include <cuda_runtime.h>

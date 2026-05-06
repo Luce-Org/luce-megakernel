@@ -167,6 +167,7 @@ set(_dflash27b_sources
     src/kv_cache.cpp
     src/kv_quant.cpp
     src/delta_net_chunked.cpp
+    src/prefix_cache.cpp
 )
 # FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+). On Turing (sm_75)
 # the drafter uses ggml's flash_attn_ext instead. Guard added after SM check.
