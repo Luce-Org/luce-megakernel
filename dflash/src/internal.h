@@ -217,6 +217,12 @@ struct TargetCache {
     ggml_type kv_k_type = GGML_TYPE_Q8_0;
     ggml_type kv_v_type = GGML_TYPE_Q8_0;
 
+    // When true, K is FWHT-rotated in the graph before writing to the
+    // standard-type cache (Q4_0/Q8_0/etc), and Q is rotated at attention
+    // time. This gives TurboQuant-style outlier spreading with fast FA
+    // kernels that work on all GPU architectures.
+    bool kv_k_rotated = false;
+
     // Full-attention KV cache: one K and one V per full-attention layer.
     // Layout: [head_dim, max_ctx, n_head_kv] f16, contiguous per layer.
     std::vector<ggml_tensor *> attn_k;   // size = n_full_attn_layers (16)
@@ -415,6 +421,7 @@ struct QwenGraphInputs {
     bool          capture_layers; // if true, write captured layer features into cache.target_feat
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
+    bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
 };
 
