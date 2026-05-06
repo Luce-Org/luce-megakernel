@@ -166,7 +166,8 @@ void reset_laguna_target_cache(LagunaTargetCache & c);
 struct LagunaGraphInputs {
     ggml_tensor * inp_embed;      // [n_embd, n_tokens, 1] f32 (CPU-embedded by caller)
     ggml_tensor * positions;      // [n_tokens] i32 (NeoX rope; not M-RoPE)
-    ggml_tensor * attn_mask;      // optional [kv_len, n_tokens] f32 (causal)
+    ggml_tensor * attn_mask;      // optional [kv_len, n_tokens] F16 (causal) for FULL layers
+    ggml_tensor * attn_mask_swa;  // optional [kv_len, n_tokens] F16 (causal + sliding window) for SWA layers
     int           n_tokens;
     int           kv_start;
     bool          output_logits = true;

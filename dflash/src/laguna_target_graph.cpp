@@ -355,6 +355,7 @@ static ggml_tensor * build_laguna_attn_block(
     ggml_tensor * cache_k,
     ggml_tensor * cache_v,
     ggml_tensor * attn_mask,
+    ggml_tensor * attn_mask_swa,
     int kv_start,
     int n_tokens,
     bool is_full)
@@ -426,27 +427,14 @@ static ggml_tensor * build_laguna_attn_block(
     ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
 
     // ---- Flash attention ---
-    // For full attention: read [0..kv_len) from full cache (size = max_ctx).
-    // For SWA: read the last min(kv_len, sw) entries. After ring wraps,
-    // valid entries occupy the WHOLE buffer (size sw). We use a contiguous
-    // VIEW from offset 0 of the cache buffer covering valid entries.
-    // SIMPLIFICATION: we treat the SWA buffer as a window of [0..min(kv_len,
-    // sw)) once warm, even though entries are re-ordered (ring). This is
-    // approximate when kv_len > sw because the FA causal mask assumes
-    // absolute positions, but the ring breaks position monotonicity.
-    // For TTFT bench the SWA path's logits are not used as ground truth
-    // (we only sample from final layer's last position), so the ring
-    // approximation is acceptable. A correct implementation requires either
-    // (a) per-layer position arrays into the ring or (b) a proper sliding-
-    // window KV implementation; deferred.
-    const int kv_len = kv_start + n_tokens;
-    int win_start = 0;
-    int win_len   = kv_len;
-    if (!is_full) {
-        const int sw = w.sliding_window;
-        if (kv_len > sw) win_start = kv_len - sw;
-        win_len = kv_len - win_start;
-    }
+    // BOTH full and SWA layers read the FULL kv_len of K/V from the cache.
+    // For SWA layers, the per-row sliding-window causal constraint is enforced
+    // by attn_mask_swa (built by the caller). This is correct for the early-
+    // token rows (which need to see KV positions [0..p+1)) and the late-token
+    // rows (which need [p-sw+1..p+1)).
+    const int kv_len   = kv_start + n_tokens;
+    const int win_start = 0;
+    const int win_len   = kv_len;
 
     ggml_tensor * Qfa = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
     Qfa = ggml_cont(ctx, Qfa);
@@ -459,15 +447,11 @@ static ggml_tensor * build_laguna_attn_block(
         cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * (size_t)win_start);
 
     const float kq_scale = 1.0f / std::sqrt((float)head_dim);
-    // Mask passed by caller is sized for full-attn kv_len. SWA layers see a
-    // narrower window (last sw entries). Pass nullptr to skip masking on SWA;
-    // attention semantics is approximate within the window for the bench (FA
-    // over the last 512 keys allows future-within-window attention but those
-    // positions haven't been written by this chunk so they read prior valid
-    // K/V — acceptable for TTFT measurement).
-    ggml_tensor * use_mask = is_full ? attn_mask : nullptr;
+    // FULL -> attn_mask (causal). SWA -> attn_mask_swa (causal + sliding-window).
+    ggml_tensor * use_mask = is_full ? attn_mask : attn_mask_swa;
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, use_mask,
                                               kq_scale, 0.0f, 0.0f);
+    (void)win_start; (void)win_len;
     // attn: [head_dim, n_head, n_tokens]
 
     // Per-head softplus gate broadcast over head_dim:
@@ -496,7 +480,8 @@ static ggml_tensor * build_laguna_layer(
     ggml_tensor * positions,
     ggml_tensor * attn_mask,
     int kv_start,
-    int n_tokens)
+    int n_tokens,
+    ggml_tensor * attn_mask_swa)
 {
     const LagunaTargetLayer & L = w.layers[il];
 
@@ -507,7 +492,7 @@ static ggml_tensor * build_laguna_layer(
     const bool is_full = laguna_is_full_attn_layer(w, il);
     cur = build_laguna_attn_block(ctx, gf, w, L, il, cur,
                                     positions, cache.attn_k[il], cache.attn_v[il],
-                                    attn_mask, kv_start, n_tokens, is_full);
+                                    attn_mask, attn_mask_swa, kv_start, n_tokens, is_full);
 
     // Residual
     ggml_tensor * ffn_inp = ggml_add(ctx, cur, inp);
@@ -539,7 +524,8 @@ LagunaGraphOutputs build_laguna_graph(
 
     for (int il = 0; il < w.n_layer; ++il) {
         cur = build_laguna_layer(ctx, gf, w, cache, il, cur,
-                                  in.positions, in.attn_mask, in.kv_start, in.n_tokens);
+                                  in.positions, in.attn_mask, in.kv_start, in.n_tokens,
+                                  in.attn_mask_swa);
     }
 
     // Final norm + lm_head

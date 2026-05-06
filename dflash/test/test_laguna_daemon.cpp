@@ -60,6 +60,7 @@ static bool write_counted_i32(const std::string & path, const std::vector<int32_
 }
 
 // Build + run a single Laguna forward step. Returns last-token logits via host.
+// Builds BOTH a full causal mask AND a sliding-window-causal mask (for SWA layers).
 static bool laguna_step(
     ggml_backend_t backend,
     const LagunaTargetWeights & w,
@@ -80,18 +81,23 @@ static bool laguna_step(
     ggml_set_input(ie);
     ggml_tensor * pp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
     ggml_set_input(pp);
-    ggml_tensor * mk = nullptr, * mkc = nullptr;
-    if (!no_mask && n_tok > 1) {
-        const int kv_len = kv_start + n_tok;
-        mk = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len, n_tok, 1, 1);
-        ggml_set_input(mk);
-        mkc = ggml_cast(ctx, mk, GGML_TYPE_F16);
+    ggml_tensor * mk_full = nullptr, * mk_full_cnv = nullptr;
+    ggml_tensor * mk_swa  = nullptr, * mk_swa_cnv  = nullptr;
+    const int kv_len = kv_start + n_tok;
+    if (!no_mask) {
+        mk_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len, n_tok, 1, 1);
+        ggml_set_input(mk_full);
+        mk_full_cnv = ggml_cast(ctx, mk_full, GGML_TYPE_F16);
+        mk_swa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len, n_tok, 1, 1);
+        ggml_set_input(mk_swa);
+        mk_swa_cnv = ggml_cast(ctx, mk_swa, GGML_TYPE_F16);
     }
 
     LagunaGraphInputs gi{};
     gi.inp_embed       = ie;
     gi.positions       = pp;
-    gi.attn_mask       = mkc;
+    gi.attn_mask       = mk_full_cnv;
+    gi.attn_mask_swa   = mk_swa_cnv;
     gi.n_tokens        = n_tok;
     gi.kv_start        = kv_start;
     gi.output_logits   = true;
@@ -107,8 +113,7 @@ static bool laguna_step(
     std::vector<int32_t> pos(n_tok);
     for (int i = 0; i < n_tok; ++i) pos[i] = kv_start + i;
     ggml_backend_tensor_set(pp, pos.data(), 0, pos.size() * sizeof(int32_t));
-    if (mk) {
-        const int kv_len = kv_start + n_tok;
+    if (mk_full) {
         std::vector<float> mb((size_t)kv_len * n_tok, 0.0f);
         for (int t = 0; t < n_tok; ++t) {
             const int abs_q = kv_start + t;
@@ -116,7 +121,21 @@ static bool laguna_step(
                 if (j > abs_q) mb[(size_t)t * kv_len + j] = -INFINITY;
             }
         }
-        ggml_backend_tensor_set(mk, mb.data(), 0, mb.size() * sizeof(float));
+        ggml_backend_tensor_set(mk_full, mb.data(), 0, mb.size() * sizeof(float));
+    }
+    if (mk_swa) {
+        const int sw = w.sliding_window;
+        std::vector<float> mb((size_t)kv_len * n_tok, 0.0f);
+        for (int t = 0; t < n_tok; ++t) {
+            const int abs_q = kv_start + t;
+            for (int j = 0; j < kv_len; ++j) {
+                // Causal AND inside sliding window: keep iff j <= abs_q AND j > abs_q - sw.
+                if (j > abs_q || j <= abs_q - sw) {
+                    mb[(size_t)t * kv_len + j] = -INFINITY;
+                }
+            }
+        }
+        ggml_backend_tensor_set(mk_swa, mb.data(), 0, mb.size() * sizeof(float));
     }
 
     ggml_status st = ggml_backend_graph_compute(backend, gf);
