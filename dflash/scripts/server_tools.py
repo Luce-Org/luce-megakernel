@@ -40,6 +40,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from _prefill_hook import (
+    compress_texts_batch_via_daemon,
     PrefillConfig, add_cli_flags, config_from_args,
     compress_text_via_daemon,
 )
@@ -377,10 +378,19 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
     def _maybe_compress_tool_chat(req: "ChatRequest", prompt_bin: Path,
                                   prompt_len: int, started_in_thinking: bool
                                   ) -> tuple[Path, int, bool]:
-        """If prefill is on and the request has no tools and the last user
-        message is long, run the daemon compress + re-tokenise. Returns
-        (bin, prompt_len, started_in_thinking) — the last is recomputed when
-        compression fires, otherwise passed through."""
+        """If prefill is on, compress every role=tool message in place,
+        preserving role / tool_call_id / assistant.tool_calls so the OpenAI
+        tool-call structure is intact end-to-end. One daemon dance covers
+        all tool messages (drafter loads once, compresses N messages, frees
+        once). Falls back to compressing the last user message when there
+        are no tool messages — preserves the original RAG / single-shot
+        path.
+
+        Agent transcripts put 99% of their bytes in tool messages
+        (Read/Bash/Grep output); compressing only last_user is a no-op on
+        that shape. Compressing each tool message in place keeps tool
+        semantics correct while pflash compresses the bulk.
+        """
         if not prefill_cfg or not prefill_cfg.enabled:
             return prompt_bin, prompt_len, started_in_thinking
         if req.tools:
@@ -389,29 +399,76 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
         if not prefill_cfg.should_compress(prompt_len) or drafter_tokenizer is None:
             return prompt_bin, prompt_len, started_in_thinking
 
-        last_user = next((m for m in reversed(req.messages) if m.role == "user"), None)
-        if last_user is None or not isinstance(last_user.content, str):
-            return prompt_bin, prompt_len, started_in_thinking
+        tool_msg_indices = [i for i, m in enumerate(req.messages)
+                            if m.role == "tool"
+                            and isinstance(m.content, str) and m.content]
 
-        compressed_text = compress_text_via_daemon(
-            daemon_stdin=daemon_proc.stdin,
-            r_pipe=r_pipe,
-            drafter_tokenizer=drafter_tokenizer,
-            cfg=prefill_cfg,
-            prompt_text=last_user.content,
-        )
+        if tool_msg_indices:
+            # Compress all tool messages with one drafter load.
+            tool_texts = [req.messages[i].content for i in tool_msg_indices]
+            compressed_texts = compress_texts_batch_via_daemon(
+                daemon_stdin=daemon_proc.stdin,
+                r_pipe=r_pipe,
+                drafter_tokenizer=drafter_tokenizer,
+                cfg=prefill_cfg,
+                prompt_texts=tool_texts,
+            )
+            compressed_by_idx = dict(zip(tool_msg_indices, compressed_texts))
 
-        new_msgs = []
-        compressed_emitted = False
-        for m in req.messages:
-            if m is last_user and not compressed_emitted:
-                new_msgs.append({"role": "user", "content": compressed_text})
-                compressed_emitted = True
-            else:
-                d = {"role": m.role}
-                if m.content is not None:
+            # Rebuild messages preserving every other field; only swap the
+            # tool message contents.
+            new_msgs = []
+            for i, m in enumerate(req.messages):
+                d: dict = {"role": m.role}
+                if i in compressed_by_idx:
+                    d["content"] = compressed_by_idx[i]
+                elif m.content is not None:
                     d["content"] = m.content
+                if m.tool_call_id is not None:
+                    d["tool_call_id"] = m.tool_call_id
+                if m.tool_calls is not None:
+                    # Qwen template calls .items() on arguments — needs to
+                    # be a parsed dict, not the JSON string the API surface
+                    # carries it as.
+                    d["tool_calls"] = []
+                    for tc in m.tool_calls:
+                        args = tc.function.arguments
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except (json.JSONDecodeError, ValueError):
+                                args = {"_raw": tc.function.arguments}
+                        d["tool_calls"].append({
+                            "id": tc.id, "type": tc.type,
+                            "function": {"name": tc.function.name,
+                                         "arguments": args},
+                        })
+                if m.name is not None:
+                    d["name"] = m.name
                 new_msgs.append(d)
+        else:
+            # RAG / single-shot path: compress last user message.
+            last_user = next((m for m in reversed(req.messages) if m.role == "user"), None)
+            if last_user is None or not isinstance(last_user.content, str):
+                return prompt_bin, prompt_len, started_in_thinking
+            compressed_text = compress_text_via_daemon(
+                daemon_stdin=daemon_proc.stdin,
+                r_pipe=r_pipe,
+                drafter_tokenizer=drafter_tokenizer,
+                cfg=prefill_cfg,
+                prompt_text=last_user.content,
+            )
+            new_msgs = []
+            compressed_emitted = False
+            for m in req.messages:
+                if m is last_user and not compressed_emitted:
+                    new_msgs.append({"role": "user", "content": compressed_text})
+                    compressed_emitted = True
+                else:
+                    d = {"role": m.role}
+                    if m.content is not None:
+                        d["content"] = m.content
+                    new_msgs.append(d)
 
         kwargs = dict(tokenize=False, add_generation_prompt=True)
         if req.chat_template_kwargs:
