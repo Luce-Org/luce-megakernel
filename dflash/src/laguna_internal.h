@@ -171,6 +171,9 @@ struct LagunaGraphInputs {
     int           kv_start;
     bool          output_logits = true;
     bool          output_hidden_states = false;
+    // If true, lm_head only runs on the LAST token (saves ~6 GB of logit memory
+    // at n_tokens=16K, vocab=100352). Standard TTFT optimization.
+    bool          output_last_only = false;
 };
 
 struct LagunaGraphOutputs {

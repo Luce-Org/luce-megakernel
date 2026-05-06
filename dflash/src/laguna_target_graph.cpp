@@ -530,7 +530,13 @@ LagunaGraphOutputs build_laguna_graph(
     }
 
     if (in.output_logits) {
-        out.logits = ggml_mul_mat(ctx, w.output, cur);  // [vocab, n_tokens]
+        ggml_tensor * head_in = cur;  // [n_embd, n_tokens]
+        if (in.output_last_only && in.n_tokens > 1) {
+            head_in = ggml_view_2d(ctx, cur, w.n_embd, 1,
+                                    cur->nb[1],
+                                    (size_t)(in.n_tokens - 1) * cur->nb[1]);
+        }
+        out.logits = ggml_mul_mat(ctx, w.output, head_in);  // [vocab, 1] or [vocab, n_tokens]
         ggml_set_output(out.logits);
         ggml_build_forward_expand(gf, out.logits);
     }
