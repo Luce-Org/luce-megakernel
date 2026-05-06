@@ -326,3 +326,104 @@ Budget 12 failed all prompts with a ggml shape assertion. Budget 22 remains the
 best short-context throughput default on this 5090 build. Budget 30 produced
 the highest mean AL but lower throughput, so it is a quality-biased experiment
 rather than the base setting.
+
+## RTX 5090 (Blackwell, sm_120/sm_120a, 32 GB) — long-context NIAH
+
+> **Companion to the short-context RTX 5090 section** (HumanEval / Math500 /
+> GSM8K, added in #86). That section validates speculative decoding on
+> short prompts where PFlash compression is not engaged; this one validates
+> the full PFlash drafter scoring + ~20× compression + DFlash decode
+> pipeline at 117K tokens.
+
+Single RTX 5090 32 GB, CUDA 13.2, driver 595.58.
+Target: `unsloth/Qwen3.6-27B-GGUF` (`Qwen3.6-27B-Q4_K_M.gguf`, ~16.8 GB).
+Q4_K_M (vs Q5_K_XL in the short-context section above) leaves more
+VRAM headroom for the FP16 KV cache at 117K context.
+Draft: local Qwen3.6-27B DFlash safetensors + Qwen3-0.6B-BF16 PFlash drafter.
+
+Build: `cmake -B build-luce-sm120 -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DDFLASH27B_USER_CUDA_ARCHITECTURES=120 -DDFLASH27B_ENABLE_BSA=ON`
+
+Final ("V4") runtime config — driven via the `pflash/tests/bench_niah_cpp.py`
+CLI flags added in #90 plus daemon env vars (each bullet leads with the
+exact interface):
+
+- `--keep-ratio=0.05` (PFlash compression target ratio)
+- `DFLASH_FP_USE_BSA=1` and `DFLASH_FP_ALPHA=0.70` (BSA enabled, block-selection threshold; both are daemon env vars)
+- `--ddtree-budget=22`
+- `--fa-window=4096` (also settable via `DFLASH27B_FA_WINDOW=4096`)
+- `--kv-tq3=0` (Q8_0 KV cache — the daemon default when TQ3_0 is disabled and no other KV type is set; 5090 has VRAM headroom so TQ3_0 isn't needed)
+- `--n-gen=1024`
+
+Test set: 10 NIAH prompts at 117K tokens (margin under Qwen3.6-27B's 131K
+native RoPE limit, generated with [`pflash/tests/niah_gen.py`](../pflash/tests/niah_gen.py)
+at calibrated `char_per_tok`).
+
+### RTX 5090 long-ctx headline
+
+| Metric                 | Value                              |
+|------------------------|------------------------------------|
+| NIAH accuracy          | **20/20** across 2 runs of n=10    |
+| Decode throughput      | 210.7 tok/s avg (range 179–230)    |
+| TTFT                   | 10.0 s                             |
+| Compression            | 20.2× (117064 → 5800 tokens)       |
+| Prefill (compressed)   | 3.9 s for ~5800 tokens             |
+| Drafter score+migrate  | ~5.8 s                             |
+
+These headline numbers are the **Phase 4 reliability run** at the V4 config
+above (n=20 across 2 independent runs of 10 prompts each). The three
+exploratory sweeps below — alpha, then budget, then keep — are what
+*selected* the V4 config; each table holds the non-swept parameters at the
+values discovered in the prior phase, so the swept-axis throughput numbers
+are not directly comparable to the headline (different keep ratios produce
+different per-step decode rates, see the keep-ratio table below).
+
+### Phase 1 — `DFLASH_FP_ALPHA` sweep (held: `--keep-ratio=0.08`, `--ddtree-budget=28`)
+
+| `DFLASH_FP_ALPHA` | NIAH    | Decode tok/s |
+|:-----------------:|:-------:|:------------:|
+| 0.60              | 10/10   | 213.7        |
+| **0.70**          | 10/10   | 210.6        |
+| 0.85              | **8/10**| 204.6        |
+
+The docs default of `DFLASH_FP_ALPHA=0.85` fails 2/10 prompts at this
+setup. This may be specific to long context, Qwen3.6, or Blackwell — I
+have not isolated which. Validating alpha per setup is recommended. I
+chose 0.70 over 0.60 for reliability margin: 0.60 wins decode by only
+1.5%, below the run-to-run variance, on an n=10 sample.
+
+### Phase 2 — budget sweep (held: `DFLASH_FP_ALPHA=0.70`, `--keep-ratio=0.08`)
+
+| `--ddtree-budget` | NIAH | Decode tok/s |
+|:-----------------:|:----:|:------------:|
+| **22**            | 10/10| **217.4**    |
+| 28                | 10/10| 210.7        |
+| 30                | 10/10| 211.1        |
+
+#86's short-context budget sweep above on the same 5090 build also lands
+on budget=22 as throughput-optimal (211.20 mean tok/s at AL 7.25). So
+**budget=22 is a stable default for Qwen3.6-27B on Blackwell across
+context regimes**, not a knob that needs per-context-length tuning. This
+is the most useful cross-reference between the two sections.
+
+### Phase 3 — keep-ratio sweep (held: `DFLASH_FP_ALPHA=0.70`, `--ddtree-budget=22`)
+
+| `--keep-ratio` | NIAH    | Decode tok/s | TTFT    | Compression |
+|:--------------:|:-------:|:------------:|:-------:|:-----------:|
+| **0.05**       | 10/10   | 210.4        | 10.0 s  | 20.2×       |
+| 0.06           | 10/10   | 212.1        | 10.5 s  | 16.8×       |
+| 0.08           | 10/10   | 216.5        | 13.0 s  | 12.6×       |
+
+`--keep-ratio=0.08` wins per-token throughput by ~3% but pays 30% more
+TTFT and gives up 38% of the compression. For the 117K NIAH workload I
+chose 0.05 to optimize end-to-end response latency; 0.08 is preferable
+when sustained throughput on already-compressed prompts dominates.
+
+### Note on `--kv-tq3`
+
+I set `--kv-tq3=0`, which leaves the daemon at its Q8_0 KV-cache default
+(no `DFLASH27B_KV_K`/`DFLASH27B_KV_V` overrides). The 3-bit TQ3_0 cache
+trades VRAM for memory bandwidth; on a 5090 with 32 GB and ~22 GB peak
+usage at 117K, that trade isn't worth taking. Users on 4090 or 3090
+(24 GB) at this context length should likely keep `--kv-tq3=1`. To go
+further than Q8_0 in either direction set the K/V types explicitly via
+`DFLASH27B_KV_K=<type> DFLASH27B_KV_V=<type>`.
