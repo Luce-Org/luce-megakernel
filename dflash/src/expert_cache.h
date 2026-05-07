@@ -90,6 +90,10 @@ public:
         return !alt_layers_.empty() &&
                std::find(alt_layers_.begin(), alt_layers_.end(), layer) != alt_layers_.end();
     }
+    // Priority layers get eviction protection (first 6, last 3).
+    bool is_priority_layer(int layer) const {
+        return layer < 6 || layer >= n_layers_ - 3;
+    }
 
     int n_slots() const { return n_slots_; }
     int64_t hits()   const { return hit_count_; }
@@ -135,6 +139,7 @@ private:
     std::vector<int> alt_layers_;   // layers that use the alt down type
     int n_slots_     = 0;  // gate/up slots (also primary down slots)
     int n_alt_slots_ = 0;  // alt down slots
+    int n_layers_    = 0;  // total model layers (for priority calculation)
 
     uint32_t tick_       = 0;
     int64_t  hit_count_  = 0;

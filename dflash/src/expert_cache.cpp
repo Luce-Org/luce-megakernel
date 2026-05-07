@@ -17,6 +17,7 @@ bool ExpertCache::init(ggml_backend_t backend, const MoeExpertSource & src,
     backend_ = backend;
     n_slots_ = n_slots;
     n_alt_slots_ = n_alt_slots;
+    n_layers_ = src.n_layers;
 
     // Detect layers with alternate down type.
     ggml_type alt_type = GGML_TYPE_COUNT;
@@ -97,22 +98,31 @@ bool ExpertCache::init(ggml_backend_t backend, const MoeExpertSource & src,
 
 int ExpertCache::allocate_slot(int layer, int expert_id) {
     // Gate/up slot allocation — uses slots_ pool.
+    // Priority layers (first 6, last 3) get eviction protection:
+    // prefer evicting from middle layers first.
     int victim = 1;
     uint32_t min_tick = UINT32_MAX;
+
+    // First pass: find LRU among non-priority layers (or empty slots).
     for (int s = 1; s < n_slots_; s++) {
         if (slots_[s].layer_id < 0) {
             victim = s;
+            min_tick = 0;
             break;
         }
-        if (slots_[s].lru_tick < min_tick) {
+        if (!is_priority_layer(slots_[s].layer_id) && slots_[s].lru_tick < min_tick) {
             min_tick = slots_[s].lru_tick;
             victim = s;
         }
     }
-
-    // Evict old occupant from gate/up slot.
-    if (slots_[victim].layer_id >= 0) {
-        // Note: we don't clean cache_map_ here — it's done in ensure_cached.
+    // Fallback: if all slots belong to priority layers, evict LRU globally.
+    if (min_tick == UINT32_MAX) {
+        for (int s = 1; s < n_slots_; s++) {
+            if (slots_[s].lru_tick < min_tick) {
+                min_tick = slots_[s].lru_tick;
+                victim = s;
+            }
+        }
     }
 
     slots_[victim].layer_id  = layer;
@@ -129,14 +139,26 @@ int ExpertCache::allocate_down_slot(int layer, int expert_id) {
 
     int victim = 1;
     uint32_t min_tick = UINT32_MAX;
+
+    // First pass: prefer evicting from non-priority layers.
     for (int s = 1; s < pool_size; s++) {
         if (pool[s].layer_id < 0) {
             victim = s;
+            min_tick = 0;
             break;
         }
-        if (pool[s].lru_tick < min_tick) {
+        if (!is_priority_layer(pool[s].layer_id) && pool[s].lru_tick < min_tick) {
             min_tick = pool[s].lru_tick;
             victim = s;
+        }
+    }
+    // Fallback: evict LRU globally.
+    if (min_tick == UINT32_MAX) {
+        for (int s = 1; s < pool_size; s++) {
+            if (pool[s].lru_tick < min_tick) {
+                min_tick = pool[s].lru_tick;
+                victim = s;
+            }
         }
     }
 
@@ -295,27 +317,23 @@ void ExpertCache::batch_ensure_cached(int layer, const int * expert_ids, int n_e
 
     if (pending.empty()) return;
 
-    // Phase 2: Issue all H2D copies asynchronously on a dedicated stream.
-    // Using cudaStreamPerThread avoids creating/managing a custom stream.
+    // Phase 2: Issue all H2D copies asynchronously, single sync at end.
     cudaStream_t stream = cudaStreamPerThread;
     const auto & li = source.layers[layer];
 
     for (const auto & p : pending) {
-        // Gate
         const uint8_t * gate_data = source.mmap_base + li.gate_offset
                                   + (size_t)p.expert_id * source.gate_expert_bytes;
         char * gate_dst = (char *)gate_3d_->data + (size_t)p.gu_slot * gate_3d_->nb[2];
         cudaMemcpyAsync(gate_dst, gate_data, source.gate_expert_bytes,
                         cudaMemcpyHostToDevice, stream);
 
-        // Up
         const uint8_t * up_data = source.mmap_base + li.up_offset
                                 + (size_t)p.expert_id * source.up_expert_bytes;
         char * up_dst = (char *)up_3d_->data + (size_t)p.gu_slot * up_3d_->nb[2];
         cudaMemcpyAsync(up_dst, up_data, source.up_expert_bytes,
                         cudaMemcpyHostToDevice, stream);
 
-        // Down
         bool alt = is_alt_layer(layer);
         ggml_tensor * down_tensor = alt ? down_alt_3d_ : down_3d_;
         size_t down_bytes = source.layer_down_bytes.empty()
@@ -327,8 +345,6 @@ void ExpertCache::batch_ensure_cached(int layer, const int * expert_ids, int n_e
         cudaMemcpyAsync(down_dst, down_data, down_bytes,
                         cudaMemcpyHostToDevice, stream);
     }
-
-    // Phase 3: Single sync — wait for all transfers to complete.
     cudaStreamSynchronize(stream);
 }
 
@@ -361,6 +377,7 @@ void ExpertCache::destroy() {
     backend_ = nullptr;
     n_slots_ = 0;
     n_alt_slots_ = 0;
+    n_layers_ = 0;
 }
 
 // ─── MoeState ────────────────────────────────────────────────────────
