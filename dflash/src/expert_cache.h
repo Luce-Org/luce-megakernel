@@ -60,6 +60,11 @@ public:
     // Returns the slot index (always > 0 on success).
     int ensure_cached(int layer, int expert_id, const MoeExpertSource & source);
 
+    // Batch-ensure multiple experts for a layer using async H2D transfers.
+    // All misses are loaded with cudaMemcpyAsync, synced once at the end.
+    void batch_ensure_cached(int layer, const int * expert_ids, int n_experts,
+                             const MoeExpertSource & source);
+
     // Get slot index for a cached expert. Returns NULL_SLOT if not cached.
     int get_slot(int layer, int expert_id) const;
 

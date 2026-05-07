@@ -322,12 +322,11 @@ bool run_qwen35moe_layer(
         }
     }
 
-    // Collect unique experts for this layer, then ensure all are cached.
-    std::unordered_set<int> unique_experts(expert_ids.begin(), expert_ids.end());
-
-    for (int eid : unique_experts) {
-        ecache.ensure_cached(layer_idx, eid, source);
-    }
+    // Collect unique experts for this layer, then batch-load all misses.
+    std::unordered_set<int> unique_set(expert_ids.begin(), expert_ids.end());
+    std::vector<int> unique_experts(unique_set.begin(), unique_set.end());
+    ecache.batch_ensure_cached(layer_idx, unique_experts.data(),
+                               (int)unique_experts.size(), source);
 
     // Compute slot_ids (gate/up) and down_slot_ids (down).
     std::vector<int32_t> slot_ids((size_t)n_used * n_tokens);

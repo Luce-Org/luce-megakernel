@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <climits>
+#include <cuda_runtime.h>
 
 namespace dflash27b {
 
@@ -234,6 +235,101 @@ int ExpertCache::get_slot(int layer, int expert_id) const {
 int ExpertCache::get_down_slot(int layer, int expert_id) const {
     auto it = cache_map_.find(make_key(layer, expert_id));
     return (it != cache_map_.end()) ? it->second.down_slot : NULL_SLOT;
+}
+
+void ExpertCache::batch_ensure_cached(int layer, const int * expert_ids, int n_experts,
+                                      const MoeExpertSource & source) {
+    // Phase 1: Identify misses and allocate slots (CPU-only, no GPU sync).
+    struct PendingLoad {
+        int expert_id;
+        int gu_slot;
+        int d_slot;
+    };
+    std::vector<PendingLoad> pending;
+
+    for (int i = 0; i < n_experts; i++) {
+        int eid = expert_ids[i];
+        int64_t key = make_key(layer, eid);
+
+        auto it = cache_map_.find(key);
+        if (it != cache_map_.end()) {
+            // Hit — just update LRU.
+            hit_count_++;
+            slots_[it->second.gate_up_slot].lru_tick = ++tick_;
+            bool alt = is_alt_layer(layer);
+            auto & pool = alt ? alt_slots_ : down_slots_;
+            pool[it->second.down_slot].lru_tick = tick_;
+            continue;
+        }
+
+        // Miss — allocate slots.
+        miss_count_++;
+        int gu_slot = allocate_slot(layer, eid);
+        int d_slot  = allocate_down_slot(layer, eid);
+
+        // Evict stale cache_map_ entries for these slots.
+        for (auto mit = cache_map_.begin(); mit != cache_map_.end(); ) {
+            if (mit->second.gate_up_slot == gu_slot && mit->first != key) {
+                mit = cache_map_.erase(mit);
+            } else {
+                ++mit;
+            }
+        }
+        bool alt = is_alt_layer(layer);
+        for (auto mit = cache_map_.begin(); mit != cache_map_.end(); ) {
+            if (mit->second.down_slot == d_slot && mit->first != key) {
+                int other_layer = (int)(mit->first / 65536);
+                if (is_alt_layer(other_layer) == alt) {
+                    mit = cache_map_.erase(mit);
+                } else {
+                    ++mit;
+                }
+            } else {
+                ++mit;
+            }
+        }
+
+        cache_map_[key] = {gu_slot, d_slot};
+        pending.push_back({eid, gu_slot, d_slot});
+    }
+
+    if (pending.empty()) return;
+
+    // Phase 2: Issue all H2D copies asynchronously on a dedicated stream.
+    // Using cudaStreamPerThread avoids creating/managing a custom stream.
+    cudaStream_t stream = cudaStreamPerThread;
+    const auto & li = source.layers[layer];
+
+    for (const auto & p : pending) {
+        // Gate
+        const uint8_t * gate_data = source.mmap_base + li.gate_offset
+                                  + (size_t)p.expert_id * source.gate_expert_bytes;
+        char * gate_dst = (char *)gate_3d_->data + (size_t)p.gu_slot * gate_3d_->nb[2];
+        cudaMemcpyAsync(gate_dst, gate_data, source.gate_expert_bytes,
+                        cudaMemcpyHostToDevice, stream);
+
+        // Up
+        const uint8_t * up_data = source.mmap_base + li.up_offset
+                                + (size_t)p.expert_id * source.up_expert_bytes;
+        char * up_dst = (char *)up_3d_->data + (size_t)p.gu_slot * up_3d_->nb[2];
+        cudaMemcpyAsync(up_dst, up_data, source.up_expert_bytes,
+                        cudaMemcpyHostToDevice, stream);
+
+        // Down
+        bool alt = is_alt_layer(layer);
+        ggml_tensor * down_tensor = alt ? down_alt_3d_ : down_3d_;
+        size_t down_bytes = source.layer_down_bytes.empty()
+            ? source.down_expert_bytes
+            : source.layer_down_bytes[layer];
+        const uint8_t * down_data = source.mmap_base + li.down_offset
+                                  + (size_t)p.expert_id * down_bytes;
+        char * down_dst = (char *)down_tensor->data + (size_t)p.d_slot * down_tensor->nb[2];
+        cudaMemcpyAsync(down_dst, down_data, down_bytes,
+                        cudaMemcpyHostToDevice, stream);
+    }
+
+    // Phase 3: Single sync — wait for all transfers to complete.
+    cudaStreamSynchronize(stream);
 }
 
 void ExpertCache::warmup(const MoeExpertSource & source) {

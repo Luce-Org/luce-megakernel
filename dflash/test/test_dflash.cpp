@@ -2404,12 +2404,17 @@ static int run_moe_dflash(
         ggml_backend_tensor_set(attn_mask, verify_mask.data(), 0,
             sizeof(uint16_t) * vkv_pad * vq_pad);
 
+        int64_t misses_before = ecache.misses();
+        auto t_verify0 = std::chrono::steady_clock::now();
         if (!run_qwen35moe_forward(backend, w, cache, ecache, moe, w.expert_source,
                 act_a, act_b, q_len, positions, attn_mask,
                 committed, true, 0, logits_out, argmax_out)) {
             std::fprintf(stderr, "[moe] verify failed step %d\n", n_draft_steps);
             return 1;
         }
+        auto t_verify1 = std::chrono::steady_clock::now();
+        double verify_ms = std::chrono::duration<double, std::milli>(t_verify1 - t_verify0).count();
+        int64_t step_misses = ecache.misses() - misses_before;
         ggml_backend_tensor_get(argmax_out, target_tok.data(), 0, sizeof(int32_t) * q_len);
 
         // ─ 4. Accept ─
@@ -2453,12 +2458,17 @@ static int run_moe_dflash(
         ggml_backend_tensor_set(attn_mask, replay_mask.data(), 0,
             sizeof(uint16_t) * rkv_pad * rq_pad);
 
+        int64_t replay_misses_before = ecache.misses();
+        auto t_replay0 = std::chrono::steady_clock::now();
         if (!run_qwen35moe_forward(backend, w, cache, ecache, moe, w.expert_source,
                 act_a, act_b, commit_n, positions, attn_mask,
                 committed, true, 0, logits_out, nullptr)) {
             std::fprintf(stderr, "[moe] replay failed step %d\n", n_draft_steps);
             return 1;
         }
+        auto t_replay1 = std::chrono::steady_clock::now();
+        double replay_ms = std::chrono::duration<double, std::milli>(t_replay1 - t_replay0).count();
+        int64_t replay_misses = ecache.misses() - replay_misses_before;
 
         std::vector<float> replay_logits(vocab);
         ggml_backend_tensor_get(logits_out, replay_logits.data(),
@@ -2477,8 +2487,10 @@ static int run_moe_dflash(
         n_accept_sum += accept_n;
         n_draft_steps++;
 
-        std::printf("[step %d] accept=%d bonus=%d commit=%d\n",
-                    n_draft_steps - 1, accept_n, bonus_tok, commit_n);
+        std::printf("[step %d] accept=%d commit=%d | verify: %.1fms %lld misses | replay: %.1fms %lld misses\n",
+                    n_draft_steps - 1, accept_n, commit_n,
+                    verify_ms, (long long)step_misses,
+                    replay_ms, (long long)replay_misses);
 
         if (hit_eos) { std::printf("[moe] EOS after %d tokens\n", n_generated); break; }
     }
@@ -2490,6 +2502,14 @@ static int run_moe_dflash(
                 n_generated, gen_ms, n_generated * 1000.0 / gen_ms);
     std::printf("Draft steps: %d, avg accept: %.2f\n",
                 n_draft_steps, n_draft_steps > 0 ? (double)n_accept_sum / n_draft_steps : 0.0);
+    std::printf("Expert cache: %lld hits, %lld misses (%.1f%% hit rate)\n",
+                (long long)ecache.hits(), (long long)ecache.misses(),
+                ecache.hits() + ecache.misses() > 0
+                    ? 100.0 * ecache.hits() / (ecache.hits() + ecache.misses()) : 0.0);
+    const double bytes_per_miss = 589824.0 + 589824.0 + 720896.0;  // gate+up+down
+    std::printf("Estimated swap traffic: %.1f MB (%lld misses × %.2f MB/expert)\n",
+                ecache.misses() * bytes_per_miss / (1024*1024),
+                (long long)ecache.misses(), bytes_per_miss / (1024*1024));
 
     // Detokenize and print
     auto vocab_strs = load_gguf_vocab(target_path);
