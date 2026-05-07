@@ -2596,7 +2596,7 @@ int main(int argc, char ** argv) {
     bool  draft_feature_mirror = false;
     bool  target_split_load_draft = false;
     bool  target_split_dflash = false;
-    int   moe_cache_slots = 4000;  // expert cache slots for MoE models
+    int   moe_cache_slots = 5000;  // expert cache slots for MoE models
     int   moe_budget = 16;          // draft block size for MoE verify
     int   target_gpu = 0;
     int   draft_gpu = 0;
