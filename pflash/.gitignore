@@ -1,0 +1,16 @@
+# Approx-path scaffolding (PyTorch chunk-similarity scorer + llama.cpp CLI
+# wrapper + RULER-style benches). Kept on disk for local experiments but
+# intentionally not tracked on the strix-halo-rocm-compat branch — this
+# branch only ships HIP/ROCm support for the C++ exact path.
+pflash/prompt_compressor.py
+pflash/llama_cli.py
+tests/bench_niah_llama.py
+tests/bench_ruler64_compare.py
+tests/common_words_gen.py
+tests/niah_multi_gen.py
+tests/test_llama_cli.py
+tests/test_prompt_compressor.py
+
+# RULER runners (never tracked; same rationale as above).
+tests/run_ruler_full.py
+tests/gen_ruler_64k.py

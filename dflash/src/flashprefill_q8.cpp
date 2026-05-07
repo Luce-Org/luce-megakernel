@@ -99,11 +99,14 @@ int flash_prefill_forward_q8(
         ggml_set_name(O_full, "O_ext");
         ggml_set_output(O_full);
 
-        // Q chunk: [D, H, cl] view, then permute → [D, cl, H] for FA
+        // Q chunk: [D, H, cl] view, then permute -> [D, cl, H] for FA.
+        // ggml HIP flash_attn_ext requires F32 Q even when K/V are BF16.
         ggml_tensor * Q_chunk = ggml_view_3d(ctx, Q_full, D, H, cl,
                                              esz * D, esz * D * H,
                                              (size_t)cs * esz * D * H);
-        ggml_tensor * Q_fa = ggml_cont(ctx, ggml_permute(ctx, Q_chunk, 0, 2, 1, 3));
+        ggml_tensor * Q_fa_src = ggml_cont(ctx, ggml_permute(ctx, Q_chunk, 0, 2, 1, 3));
+        ggml_tensor * Q_f32 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, cl, H);
+        ggml_tensor * Q_fa = ggml_cpy(ctx, Q_fa_src, Q_f32);
 
         // K/V: [D, Hk, kv_len] view, then permute → [D, kv_len, Hk] for FA
         ggml_tensor * K_view = ggml_view_3d(ctx, K_full, D, Hk, kv_len,

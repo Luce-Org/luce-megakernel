@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
-#include <cuda_runtime.h>
+#include "device_runtime.h"
 
 namespace dflash27b {
 namespace flashprefill {
