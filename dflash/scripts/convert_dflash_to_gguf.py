@@ -39,16 +39,13 @@ import numpy as np
 import gguf
 
 # ──────────────────────────────────────────────────────────────────────
-# DFlash 27B draft architecture constants
+# DFlash draft architecture constants (defaults for 27B; overridden by
+# auto-detection from tensor shapes when possible)
 # ──────────────────────────────────────────────────────────────────────
 
 ARCH                = "qwen35-dflash-draft"
-HIDDEN              = 5120
 N_LAYER             = 5
-N_HEAD              = 32          # query heads
-N_HEAD_KV           = 8
 HEAD_DIM            = 128
-INTERMEDIATE        = 17408
 VOCAB               = 248320
 N_TARGET_LAYERS     = 5            # fc projects 5*hidden -> hidden
 ROPE_THETA          = 1_000_000.0
@@ -155,19 +152,67 @@ def main():
     n_entries = sum(1 for k in header if k != "__metadata__")
     print(f"[info]   {n_entries} tensor entries")
 
+    # Auto-detect dimensions from tensor shapes
+    fc_shape = header.get("fc.weight", {}).get("shape")
+    q_shape = header.get("layers.0.self_attn.q_proj.weight", {}).get("shape")
+    k_shape = header.get("layers.0.self_attn.k_proj.weight", {}).get("shape")
+    gate_shape = header.get("layers.0.mlp.gate_proj.weight", {}).get("shape")
+
+    if fc_shape:
+        # fc.weight: [hidden, n_target_layers * hidden] (PyTorch: [out, in])
+        HIDDEN = fc_shape[0]
+        detected_n_target = fc_shape[1] // HIDDEN
+        print(f"[info] auto-detected hidden={HIDDEN} n_target_layers={detected_n_target}")
+    else:
+        HIDDEN = 5120  # fallback for 27B
+        detected_n_target = N_TARGET_LAYERS
+        print("[warn] fc.weight not found, using default HIDDEN=5120")
+
+    if q_shape:
+        q_dim = q_shape[0]
+        N_HEAD = q_dim // HEAD_DIM
+    else:
+        N_HEAD = 32
+
+    if k_shape:
+        kv_dim = k_shape[0]
+        N_HEAD_KV = kv_dim // HEAD_DIM
+    else:
+        N_HEAD_KV = 8
+
+    if gate_shape:
+        INTERMEDIATE = gate_shape[0]
+    else:
+        INTERMEDIATE = 17408
+
+    # Count actual layers from tensor names
+    layer_indices = set()
+    for name in header:
+        if name.startswith("layers."):
+            parts = name.split(".")
+            if len(parts) >= 2:
+                try:
+                    layer_indices.add(int(parts[1]))
+                except ValueError:
+                    pass
+    if layer_indices:
+        actual_n_layer = max(layer_indices) + 1
+    else:
+        actual_n_layer = N_LAYER
+
+    print(f"[info] dimensions: hidden={HIDDEN} n_head={N_HEAD} n_head_kv={N_HEAD_KV} "
+          f"ffn={INTERMEDIATE} n_layer={actual_n_layer}")
+
     writer = gguf.GGUFWriter(args.out_gguf, ARCH)
 
     # Architecture metadata
-    writer.add_string("general.name", "Qwen3.5-27B-DFlash-Draft")
+    writer.add_string("general.name", "DFlash-Draft")
     writer.add_uint32(f"{ARCH}.context_length",          CTX_LEN)
     writer.add_uint32(f"{ARCH}.embedding_length",        HIDDEN)
-    writer.add_uint32(f"{ARCH}.block_count",             N_LAYER)
+    writer.add_uint32(f"{ARCH}.block_count",             actual_n_layer)
     writer.add_uint32(f"{ARCH}.feed_forward_length",     INTERMEDIATE)
     writer.add_uint32(f"{ARCH}.attention.head_count",    N_HEAD)
     writer.add_uint32(f"{ARCH}.attention.head_count_kv", N_HEAD_KV)
-    # llama.cpp uses key_length / value_length to override the default
-    # n_embd_head = n_embd / n_head heuristic (DFlash has n_embd=5120
-    # but head_dim=128 so n_head*head_dim=4096 != n_embd).
     writer.add_uint32(f"{ARCH}.attention.key_length",    HEAD_DIM)
     writer.add_uint32(f"{ARCH}.attention.value_length",  HEAD_DIM)
     writer.add_uint32(f"{ARCH}.vocab_size",              VOCAB)
@@ -175,7 +220,7 @@ def main():
     writer.add_float32(f"{ARCH}.rope.freq_base",         ROPE_THETA)
 
     # DFlash-specific hyperparameters
-    writer.add_uint32(f"{ARCH}.dflash.n_target_layers", N_TARGET_LAYERS)
+    writer.add_uint32(f"{ARCH}.dflash.n_target_layers", detected_n_target)
     writer.add_uint32(f"{ARCH}.dflash.block_size",      BLOCK_SIZE)
     writer.add_uint32(f"{ARCH}.dflash.mask_token_id",   MASK_TOKEN_ID)
 

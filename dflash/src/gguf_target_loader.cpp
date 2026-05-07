@@ -50,6 +50,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -649,6 +650,8 @@ bool load_target_gguf_partial(const std::string & path,
         es.n_experts      = (int)moe_expert_count;
         es.n_layers       = (int)n_layer;
         es.layers.resize(n_layer);
+        es.layer_down_types.resize(n_layer);
+        es.layer_down_bytes.resize(n_layer);
 
         for (int il = 0; il < (int)n_layer; il++) {
             char tn[128];
@@ -671,26 +674,47 @@ bool load_target_gguf_partial(const std::string & path,
             es.layers[il].up_offset   = data_start + gguf_get_tensor_offset(gctx, tid_u);
             es.layers[il].down_offset = data_start + gguf_get_tensor_offset(gctx, tid_d);
 
+            // Per-layer down type detection (UD quantization may vary by layer).
+            std::snprintf(tn, sizeof(tn), "blk.%d.ffn_down_exps.weight", il);
+            ggml_tensor * td_l = ggml_get_tensor(meta_ctx, tn);
+            es.layer_down_types[il] = td_l->type;
+            es.layer_down_bytes[il] = td_l->nb[2];  // one expert's bytes for this layer
+
             if (il == 0) {
                 ggml_tensor * tg = ggml_get_tensor(meta_ctx, "blk.0.ffn_gate_exps.weight");
                 ggml_tensor * tu = ggml_get_tensor(meta_ctx, "blk.0.ffn_up_exps.weight");
-                ggml_tensor * td = ggml_get_tensor(meta_ctx, "blk.0.ffn_down_exps.weight");
 
                 es.gate_type = tg->type;
                 es.up_type   = tu->type;
-                es.down_type = td->type;
+                es.down_type = td_l->type;  // primary type (layer 0)
 
                 es.gate_expert_bytes = tg->nb[2];
                 es.up_expert_bytes   = tu->nb[2];
-                es.down_expert_bytes = td->nb[2];
+                es.down_expert_bytes = td_l->nb[2];
             }
         }
+
+        // Report mixed types if detected.
+        int n_q6k = 0;
+        for (int il = 0; il < (int)n_layer; il++) {
+            if (es.layer_down_types[il] != es.down_type) n_q6k++;
+        }
         std::printf("[loader] MoE expert source: %d layers × %d experts, "
-                    "gate=%s %zu B, up=%s %zu B, down=%s %zu B\n",
+                    "gate=%s %zu B, up=%s %zu B, down=%s %zu B",
             es.n_layers, es.n_experts,
             ggml_type_name(es.gate_type), es.gate_expert_bytes,
             ggml_type_name(es.up_type),   es.up_expert_bytes,
             ggml_type_name(es.down_type), es.down_expert_bytes);
+        if (n_q6k > 0) {
+            int alt_idx = 0;
+            for (int il = 0; il < (int)n_layer; il++) {
+                if (es.layer_down_types[il] != es.down_type) { alt_idx = il; break; }
+            }
+            std::printf(" (%d layers have alt down type %s %zu B)",
+                n_q6k, ggml_type_name(es.layer_down_types[alt_idx]),
+                es.layer_down_bytes[alt_idx]);
+        }
+        std::printf("\n");
     }
 
     gguf_free(gctx);

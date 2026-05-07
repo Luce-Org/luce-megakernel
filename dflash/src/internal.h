@@ -498,6 +498,7 @@ struct MoeExpertSource;
 // Execute one MoE layer using two-graph-per-layer pattern.
 // Graph A: attention + router → Graph B: MoE FFN with expert cache.
 // positions and attn_mask must be pre-filled by the caller for full-attn layers.
+// gallocr_a/gallocr_b are pre-allocated graph allocators (reused across layers).
 bool run_qwen35moe_layer(
     ggml_backend_t         backend,
     const TargetWeights &  w,
@@ -514,6 +515,30 @@ bool run_qwen35moe_layer(
     ggml_tensor *          attn_mask,    // [kv_pad, q_pad] f16 (pre-filled, or nullptr)
     int                    kv_start,
     bool                   capture,
-    int                    fa_window = 0);
+    int                    fa_window,
+    ggml_gallocr_t         gallocr_a,
+    ggml_gallocr_t         gallocr_b);
+
+// Full MoE forward pass: all layers + lm_head (imperative, layer-by-layer).
+// Replaces build_qwen35_graph + graph_compute for MoE models.
+// act_a/act_b are double-buffered persistent activation tensors [hidden, max_tokens].
+// logits_out [vocab, max_tokens] and argmax_out [max_tokens] must be pre-allocated.
+bool run_qwen35moe_forward(
+    ggml_backend_t         backend,
+    const TargetWeights &  w,
+    TargetCache &          cache,
+    ExpertCache &          ecache,
+    MoeState &             moe,
+    const MoeExpertSource & source,
+    ggml_tensor *          act_a,        // [hidden, max_tokens] persistent buffer A
+    ggml_tensor *          act_b,        // [hidden, max_tokens] persistent buffer B
+    int                    n_tokens,
+    ggml_tensor *          positions,    // [4*n_tokens] i32 (pre-filled)
+    ggml_tensor *          attn_mask,    // optional [kv_pad, q_pad] f16
+    int                    kv_start,
+    bool                   capture,
+    int                    fa_window,
+    ggml_tensor *          logits_out,   // [vocab, n_tokens] f32 (pre-allocated)
+    ggml_tensor *          argmax_out = nullptr);  // [n_tokens] i32 (or nullptr)
 
 } // namespace dflash27b

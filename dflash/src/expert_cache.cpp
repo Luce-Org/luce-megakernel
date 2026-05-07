@@ -1,4 +1,5 @@
 // Expert GPU cache implementation — type-major 3D ggml tensors + LRU.
+// Supports mixed down types (e.g., Q5_K + Q6_K across layers).
 
 #include "expert_cache.h"
 
@@ -9,22 +10,34 @@
 
 namespace dflash27b {
 
-bool ExpertCache::init(ggml_backend_t backend, const MoeExpertSource & src, int n_slots) {
+bool ExpertCache::init(ggml_backend_t backend, const MoeExpertSource & src,
+                       int n_slots, int n_alt_slots) {
     destroy();
     backend_ = backend;
     n_slots_ = n_slots;
+    n_alt_slots_ = n_alt_slots;
+
+    // Detect layers with alternate down type.
+    ggml_type alt_type = GGML_TYPE_COUNT;
+    if (!src.layer_down_types.empty()) {
+        for (int l = 0; l < src.n_layers; l++) {
+            if (src.layer_down_types[l] != src.down_type) {
+                alt_type = src.layer_down_types[l];
+                alt_layers_.push_back(l);
+            }
+        }
+    }
 
     // Create ggml context for the 3D weight tensors.
+    int n_tensors = alt_layers_.empty() ? 3 : 4;
     ggml_init_params ip{};
-    ip.mem_size   = 8 * ggml_tensor_overhead() + 16 * 1024;
+    ip.mem_size   = (n_tensors + 4) * ggml_tensor_overhead() + 16 * 1024;
     ip.mem_buffer = nullptr;
     ip.no_alloc   = true;
     tensor_ctx_ = ggml_init(ip);
     if (!tensor_ctx_) return false;
 
     // 3D tensors: [cols, rows, n_slots].
-    // gate/up: matmul projects hidden → expert_ffn, so shape is [hidden, expert_ffn, n_slots].
-    // down: matmul projects expert_ffn → hidden, so shape is [expert_ffn, hidden, n_slots].
     gate_3d_ = ggml_new_tensor_3d(tensor_ctx_, src.gate_type,
         src.hidden_dim, src.expert_ffn_dim, n_slots);
     up_3d_ = ggml_new_tensor_3d(tensor_ctx_, src.up_type,
@@ -35,6 +48,13 @@ bool ExpertCache::init(ggml_backend_t backend, const MoeExpertSource & src, int 
     ggml_set_name(gate_3d_, "ecache_gate_3d");
     ggml_set_name(up_3d_,   "ecache_up_3d");
     ggml_set_name(down_3d_, "ecache_down_3d");
+
+    // Allocate alternate down tensor if needed.
+    if (!alt_layers_.empty() && n_alt_slots > 0 && alt_type != GGML_TYPE_COUNT) {
+        down_alt_3d_ = ggml_new_tensor_3d(tensor_ctx_, alt_type,
+            src.expert_ffn_dim, src.hidden_dim, n_alt_slots);
+        ggml_set_name(down_alt_3d_, "ecache_down_alt_3d");
+    }
 
     tensor_buf_ = ggml_backend_alloc_ctx_tensors(tensor_ctx_, backend);
     if (!tensor_buf_) {
@@ -47,34 +67,40 @@ bool ExpertCache::init(ggml_backend_t backend, const MoeExpertSource & src, int 
     ggml_backend_buffer_clear(tensor_buf_, 0);
 
     slots_.resize(n_slots);
+    down_slots_.resize(n_slots);
+    if (n_alt_slots > 0) alt_slots_.resize(n_alt_slots);
 
     size_t total_bytes = ggml_nbytes(gate_3d_) + ggml_nbytes(up_3d_) + ggml_nbytes(down_3d_);
-    std::printf("[ExpertCache] %d slots, %.1f MB total "
-                "(gate %s [%lld,%lld], up %s [%lld,%lld], down %s [%lld,%lld])\n",
-        n_slots, total_bytes / (1024.0 * 1024.0),
+    if (down_alt_3d_) total_bytes += ggml_nbytes(down_alt_3d_);
+
+    std::printf("[ExpertCache] %d slots + %d alt_slots, %.1f MB total "
+                "(gate %s [%lld,%lld], up %s [%lld,%lld], down %s [%lld,%lld]",
+        n_slots, n_alt_slots, total_bytes / (1024.0 * 1024.0),
         ggml_type_name(src.gate_type), (long long)gate_3d_->ne[0], (long long)gate_3d_->ne[1],
         ggml_type_name(src.up_type),   (long long)up_3d_->ne[0],   (long long)up_3d_->ne[1],
         ggml_type_name(src.down_type), (long long)down_3d_->ne[0], (long long)down_3d_->ne[1]);
+    if (down_alt_3d_) {
+        std::printf(", down_alt %s [%lld,%lld]",
+            ggml_type_name(alt_type),
+            (long long)down_alt_3d_->ne[0], (long long)down_alt_3d_->ne[1]);
+    }
+    std::printf(")\n");
+    if (!alt_layers_.empty()) {
+        std::printf("[ExpertCache] alt layers (%zu): ", alt_layers_.size());
+        for (int l : alt_layers_) std::printf("%d ", l);
+        std::printf("\n");
+    }
 
     return true;
 }
 
 int ExpertCache::allocate_slot(int layer, int expert_id) {
-    int64_t key = make_key(layer, expert_id);
-
-    // Check if already cached.
-    auto it = cache_map_.find(key);
-    if (it != cache_map_.end()) {
-        slots_[it->second].lru_tick = ++tick_;
-        return it->second;  // positive = hit
-    }
-
-    // Find LRU victim (skip NULL_SLOT = 0).
+    // Gate/up slot allocation — uses slots_ pool.
     int victim = 1;
     uint32_t min_tick = UINT32_MAX;
     for (int s = 1; s < n_slots_; s++) {
         if (slots_[s].layer_id < 0) {
-            victim = s;  // empty slot
+            victim = s;
             break;
         }
         if (slots_[s].lru_tick < min_tick) {
@@ -83,26 +109,47 @@ int ExpertCache::allocate_slot(int layer, int expert_id) {
         }
     }
 
-    // Evict old occupant from cache_map.
+    // Evict old occupant from gate/up slot.
     if (slots_[victim].layer_id >= 0) {
-        int64_t old_key = make_key(slots_[victim].layer_id, slots_[victim].expert_id);
-        cache_map_.erase(old_key);
+        // Note: we don't clean cache_map_ here — it's done in ensure_cached.
     }
 
-    // Assign new expert to this slot.
     slots_[victim].layer_id  = layer;
     slots_[victim].expert_id = expert_id;
     slots_[victim].lru_tick  = ++tick_;
-    cache_map_[key] = victim;
-
-    return -(victim + 1);  // negative = needs transfer
+    return victim;
 }
 
-void ExpertCache::load_to_slot(int slot, int layer, int expert_id,
+int ExpertCache::allocate_down_slot(int layer, int expert_id) {
+    // Pick the correct pool based on layer type.
+    bool is_alt = is_alt_layer(layer);
+    auto & pool = is_alt ? alt_slots_ : down_slots_;
+    int pool_size = is_alt ? n_alt_slots_ : n_slots_;
+
+    int victim = 1;
+    uint32_t min_tick = UINT32_MAX;
+    for (int s = 1; s < pool_size; s++) {
+        if (pool[s].layer_id < 0) {
+            victim = s;
+            break;
+        }
+        if (pool[s].lru_tick < min_tick) {
+            min_tick = pool[s].lru_tick;
+            victim = s;
+        }
+    }
+
+    pool[victim].layer_id  = layer;
+    pool[victim].expert_id = expert_id;
+    pool[victim].lru_tick  = tick_;  // same tick as gate/up
+    return victim;
+}
+
+void ExpertCache::load_to_slot(int slot, int down_slot, int layer, int expert_id,
                                const MoeExpertSource & src) {
     const auto & li = src.layers[layer];
 
-    // Gate: copy one expert's gate weights into slot position within gate_3d_.
+    // Gate
     const uint8_t * gate_data = src.mmap_base + li.gate_offset
                               + (size_t)expert_id * src.gate_expert_bytes;
     ggml_backend_tensor_set(gate_3d_, gate_data,
@@ -114,33 +161,82 @@ void ExpertCache::load_to_slot(int slot, int layer, int expert_id,
     ggml_backend_tensor_set(up_3d_, up_data,
         (size_t)slot * up_3d_->nb[2], src.up_expert_bytes);
 
-    // Down
+    // Down — use per-layer type/bytes and correct tensor.
+    bool is_alt = is_alt_layer(layer);
+    ggml_tensor * down_tensor = is_alt ? down_alt_3d_ : down_3d_;
+    size_t down_bytes = src.layer_down_bytes.empty()
+        ? src.down_expert_bytes
+        : src.layer_down_bytes[layer];
+
     const uint8_t * down_data = src.mmap_base + li.down_offset
-                              + (size_t)expert_id * src.down_expert_bytes;
-    ggml_backend_tensor_set(down_3d_, down_data,
-        (size_t)slot * down_3d_->nb[2], src.down_expert_bytes);
+                              + (size_t)expert_id * down_bytes;
+    ggml_backend_tensor_set(down_tensor, down_data,
+        (size_t)down_slot * down_tensor->nb[2], down_bytes);
 }
 
 int ExpertCache::ensure_cached(int layer, int expert_id, const MoeExpertSource & source) {
-    int result = allocate_slot(layer, expert_id);
-    if (result >= 0) {
+    int64_t key = make_key(layer, expert_id);
+
+    auto it = cache_map_.find(key);
+    if (it != cache_map_.end()) {
+        // Cache hit — update LRU ticks.
         hit_count_++;
-        return result;  // already cached
+        int gu_slot = it->second.gate_up_slot;
+        int d_slot  = it->second.down_slot;
+        slots_[gu_slot].lru_tick = ++tick_;
+        bool is_alt = is_alt_layer(layer);
+        auto & pool = is_alt ? alt_slots_ : down_slots_;
+        pool[d_slot].lru_tick = tick_;
+        return gu_slot;
     }
-    // Cache miss — load from mmap.
+
+    // Cache miss — allocate and load.
     miss_count_++;
-    int slot = -(result + 1);
-    load_to_slot(slot, layer, expert_id, source);
-    return slot;
+    int gu_slot = allocate_slot(layer, expert_id);
+    int d_slot  = allocate_down_slot(layer, expert_id);
+
+    // Evict old cache_map_ entries that pointed to these slots.
+    // Gate/up eviction:
+    for (auto mit = cache_map_.begin(); mit != cache_map_.end(); ) {
+        if (mit->second.gate_up_slot == gu_slot && mit->first != key) {
+            mit = cache_map_.erase(mit);
+        } else {
+            ++mit;
+        }
+    }
+    // Down eviction:
+    bool is_alt = is_alt_layer(layer);
+    for (auto mit = cache_map_.begin(); mit != cache_map_.end(); ) {
+        if (mit->second.down_slot == d_slot && mit->first != key) {
+            // Only evict if same pool (alt vs primary).
+            int64_t other_key = mit->first;
+            int other_layer = (int)(other_key / 65536);
+            if (is_alt_layer(other_layer) == is_alt) {
+                mit = cache_map_.erase(mit);
+            } else {
+                ++mit;
+            }
+        } else {
+            ++mit;
+        }
+    }
+
+    cache_map_[key] = {gu_slot, d_slot};
+    load_to_slot(gu_slot, d_slot, layer, expert_id, source);
+    return gu_slot;
 }
 
 int ExpertCache::get_slot(int layer, int expert_id) const {
     auto it = cache_map_.find(make_key(layer, expert_id));
-    return (it != cache_map_.end()) ? it->second : NULL_SLOT;
+    return (it != cache_map_.end()) ? it->second.gate_up_slot : NULL_SLOT;
+}
+
+int ExpertCache::get_down_slot(int layer, int expert_id) const {
+    auto it = cache_map_.find(make_key(layer, expert_id));
+    return (it != cache_map_.end()) ? it->second.down_slot : NULL_SLOT;
 }
 
 void ExpertCache::warmup(const MoeExpertSource & source) {
-    // Distribute slots evenly across layers.
     int slots_per_layer = (n_slots_ - 1) / source.n_layers;
     if (slots_per_layer > source.n_experts) slots_per_layer = source.n_experts;
 
@@ -152,19 +248,23 @@ void ExpertCache::warmup(const MoeExpertSource & source) {
             ensure_cached(l, e, source);
         }
     }
-    // Reset stats after warmup so runtime stats are meaningful.
     hit_count_  = 0;
     miss_count_ = 0;
 }
 
 void ExpertCache::destroy() {
+    if (alt_buf_)    { ggml_backend_buffer_free(alt_buf_);    alt_buf_    = nullptr; }
     if (tensor_buf_) { ggml_backend_buffer_free(tensor_buf_); tensor_buf_ = nullptr; }
     if (tensor_ctx_) { ggml_free(tensor_ctx_); tensor_ctx_ = nullptr; }
-    gate_3d_ = up_3d_ = down_3d_ = nullptr;
+    gate_3d_ = up_3d_ = down_3d_ = down_alt_3d_ = nullptr;
     slots_.clear();
+    down_slots_.clear();
+    alt_slots_.clear();
     cache_map_.clear();
+    alt_layers_.clear();
     backend_ = nullptr;
     n_slots_ = 0;
+    n_alt_slots_ = 0;
 }
 
 // ─── MoeState ────────────────────────────────────────────────────────
@@ -184,11 +284,13 @@ bool create_moe_state(ggml_backend_t backend, int hidden, int n_expert_used,
     out.ffn_residual = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, hidden, max_tokens);
     out.weights      = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, 1, n_expert_used, max_tokens);
     out.slot_ids     = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I32, n_expert_used, max_tokens);
+    out.down_slot_ids = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I32, n_expert_used, max_tokens);
 
-    ggml_set_name(out.post,         "moe_post");
-    ggml_set_name(out.ffn_residual, "moe_ffn_residual");
-    ggml_set_name(out.weights,      "moe_weights");
-    ggml_set_name(out.slot_ids,     "moe_slot_ids");
+    ggml_set_name(out.post,          "moe_post");
+    ggml_set_name(out.ffn_residual,  "moe_ffn_residual");
+    ggml_set_name(out.weights,       "moe_weights");
+    ggml_set_name(out.slot_ids,      "moe_slot_ids");
+    ggml_set_name(out.down_slot_ids, "moe_down_slot_ids");
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
     if (!out.buf) {
@@ -208,7 +310,7 @@ bool create_moe_state(ggml_backend_t backend, int hidden, int n_expert_used,
 void free_moe_state(MoeState & s) {
     if (s.buf) { ggml_backend_buffer_free(s.buf); s.buf = nullptr; }
     if (s.ctx) { ggml_free(s.ctx); s.ctx = nullptr; }
-    s.post = s.ffn_residual = s.weights = s.slot_ids = nullptr;
+    s.post = s.ffn_residual = s.weights = s.slot_ids = s.down_slot_ids = nullptr;
     s.max_tokens = 0;
 }
 
