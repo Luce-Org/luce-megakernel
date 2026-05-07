@@ -1385,6 +1385,7 @@ static bool compute_target_split_argmax(
         const TargetWeights & w,
         ggml_backend_t backend,
         ggml_tensor * act,
+        int token_offset,
         int n_tokens,
         int hidden,
         int vocab,
@@ -1398,7 +1399,8 @@ static bool compute_target_split_argmax(
     if (!sg.ctx) return false;
 
     ggml_tensor * act_view = ggml_view_2d(
-        sg.ctx, act, hidden, n_tokens, act->nb[1], 0);
+        sg.ctx, act, hidden, n_tokens, act->nb[1],
+        (size_t)token_offset * act->nb[1]);
     ggml_tensor * normed = ggml_rms_norm(sg.ctx, act_view, DFLASH27B_RMS_EPS);
     normed = ggml_mul(sg.ctx, normed, w.out_norm);
     ggml_tensor * logits = ggml_mul_mat(sg.ctx, w.output, normed);
@@ -1550,9 +1552,12 @@ static bool run_target_layer_split_forward(
     StepGraph final_sg;
     std::vector<int32_t> argmax_tokens;
     TargetLayerSplitShard & last_shard = shards.back();
+    const bool need_all_argmax = argmax_out != nullptr;
+    const int argmax_offset = need_all_argmax ? 0 : (n_tokens_total - 1);
+    const int argmax_count = need_all_argmax ? n_tokens_total : 1;
     const bool ok = compute_target_split_argmax(
         final_sg, last_shard.weights, last_shard.backend, act_in,
-        n_tokens_total, hidden, vocab, argmax_tokens);
+        argmax_offset, argmax_count, hidden, vocab, argmax_tokens);
     step_graph_destroy(final_sg);
     activation_pair_free(acts);
     if (!ok) return false;
