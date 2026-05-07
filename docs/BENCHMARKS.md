@@ -312,6 +312,42 @@ test_flashprefill_kernels numerics PASS (max diff = 0.00053, unchanged).
 Persistent kv_buf_K/V device buffers: allocated once per sequence length, reused across all
 28 layer calls (hipMalloc overhead per call was ~1ms total, not the bottleneck).
 
+End-to-end (Strix Halo, Phase 9, 64K context, bench_niah_cpp.py, 2 cases, 2026-05-07):
+| Metric | Phase 4 | Phase 9 | Speedup |
+|--------|:-------:|:-------:|:-------:|
+| FP step (drafter forward) | ~41 s | **~19.5 s** | **2.1×** |
+| Total compress | ~49.5 s | **~23.7 s** | **2.1×** |
+| Target prefill (3298 tok) | ~15.5 s | **~15.7 s** | ~same |
+| TTFT | ~73 s | **~43 s** | **1.7×** |
+| NIAH | 0/2 ❌ | **2/2 ✅** | — |
+| vs RTX 3090 (13.5 s) | 5.4× slower | **3.2× slower** | — |
+
+End-to-end (Strix Halo, Phase 9, 128K context, bench_niah_cpp.py, 2 cases, 2026-05-07):
+| Metric | Phase 8 | Phase 9 | Speedup |
+|--------|:-------:|:-------:|:-------:|
+| FP step (drafter forward) | ~114–120 s | **~49–50 s** | **~2.3×** |
+| Tail-score | ~8.5 s | **~8.5 s** | same |
+| Total compress | ~135–141 s | **~59 s** | **~2.3×** |
+| Target prefill (6539 tok) | ~33 s | **~33 s** | same |
+| TTFT | ~173 s | **~95–96 s** | **1.8×** |
+| NIAH | 2/2 ✅ | **2/2 ✅** | — |
+| vs RTX 3090 (24.8 s) | 7× slower | **~3.9× slower** | — |
+
+Phase 9 cut the gap to RTX 3090 roughly in half at both contexts. The remaining gap (~3–4×)
+is close to the raw bandwidth ratio (256 vs 936 GB/s = 3.7×) — kernel efficiency is near
+the memory-bandwidth ceiling.
+
+Estimated llama.cpp prefill baseline (from target-prefill rate in Phase 9 runs: ~200 tok/s):
+| Context | Estimated llama.cpp TTFT | Phase 9 dflash TTFT | Estimated speedup |
+|---------|:------------------------:|:-------------------:|:-----------------:|
+| 64K | ~313 s | **43 s** | **~7.3×** |
+| 128K | ~640 s | **96 s** | **~6.7×** |
+
+Note: llama.cpp baseline is estimated from the compressed-target prefill rate (~200 tok/s)
+applied to full uncompressed context. Actual speedup may be higher (llama.cpp degrades at
+long context without optimized sparse FA). NIAH at 64K now passes (NoPE fix included in
+Phase 9 build) where Phase 4 failed.
+
 ---
 
 ## Notes
