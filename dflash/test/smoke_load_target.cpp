@@ -83,12 +83,20 @@ int main(int argc, char ** argv) {
             std::printf("wqkv=%s[%" PRId64 ",%" PRId64 "] ",
                 ggml_type_name(L.wqkv->type), L.wqkv->ne[0], L.wqkv->ne[1]);
         }
-        std::printf("ffn_down=%s\n", ggml_type_name(L.w_down->type));
+        if (L.w_down)
+            std::printf("ffn_down=%s\n", ggml_type_name(L.w_down->type));
+        else if (L.shared_w_down)
+            std::printf("MoE shared_down=%s router=%s\n",
+                ggml_type_name(L.shared_w_down->type),
+                L.ffn_gate_inp ? ggml_type_name(L.ffn_gate_inp->type) : "null");
+        else
+            std::printf("ffn_down=(null)\n");
     };
     print_layer(0);
     print_layer(3);
-    print_layer(31);
-    print_layer(63);
+    if (w.n_layer > 31) print_layer(31);
+    if (w.n_layer > 63) print_layer(63);
+    else print_layer(w.n_layer - 1);
 
     free_target_weights(w);
     ggml_backend_free(backend);

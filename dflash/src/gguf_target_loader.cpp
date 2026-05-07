@@ -209,11 +209,20 @@ static bool parse_block_tensor_name(const char * name, int & layer_id) {
 static bool should_load_target_tensor(const char * name,
                                       int layer_begin,
                                       int layer_end,
-                                      bool load_output) {
+                                      bool load_output,
+                                      bool is_moe = false) {
     if (std::strcmp(name, "token_embd.weight") == 0) return false;
     if (std::strcmp(name, "output_norm.weight") == 0 ||
         std::strcmp(name, "output.weight") == 0) {
         return load_output;
+    }
+    // For MoE models, expert 3D tensors stay in CPU pinned memory (not uploaded to GPU).
+    if (is_moe) {
+        if (std::strstr(name, "ffn_gate_exps") ||
+            std::strstr(name, "ffn_up_exps") ||
+            std::strstr(name, "ffn_down_exps")) {
+            return false;
+        }
     }
     int layer_id = -1;
     if (parse_block_tensor_name(name, layer_id)) {
@@ -255,6 +264,7 @@ bool load_target_gguf_partial(const std::string & path,
     }
 
     // Validate arch + the dimensions we hardcode everywhere.
+    std::string arch_str;
     {
         int64_t arch_id = gguf_find_key(gctx, "general.architecture");
         if (arch_id < 0) {
@@ -263,30 +273,43 @@ bool load_target_gguf_partial(const std::string & path,
             return false;
         }
         const char * arch = gguf_get_val_str(gctx, arch_id);
-        if (std::string(arch) != "qwen35") {
-            set_last_error(std::string("unexpected arch: ") + arch + " (expected qwen35)");
+        arch_str = arch;
+        if (arch_str != "qwen35" && arch_str != "qwen35moe") {
+            set_last_error(std::string("unexpected arch: ") + arch + " (expected qwen35 or qwen35moe)");
             gguf_free(gctx);
             return false;
         }
     }
+    const bool is_moe = (arch_str == "qwen35moe");
+    const char * arch_prefix = is_moe ? "qwen35moe" : "qwen35";
 
     std::string err;
-    const uint32_t n_embd = get_u32_or(gctx, "qwen35.embedding_length",    0);
-    const uint32_t n_ff   = get_u32_or(gctx, "qwen35.feed_forward_length", 0);
-    const uint32_t n_layer= get_u32_or(gctx, "qwen35.block_count",         0);
-    const uint32_t n_head = get_u32_or(gctx, "qwen35.attention.head_count",0);
-    const uint32_t n_headkv=get_u32_or(gctx, "qwen35.attention.head_count_kv",0);
-    const uint32_t kl     = get_u32_or(gctx, "qwen35.attention.key_length",   0);
-    const uint32_t vl     = get_u32_or(gctx, "qwen35.attention.value_length", 0);
-    const uint32_t fai    = get_u32_or(gctx, "qwen35.full_attention_interval",0);
-    const uint32_t ssm_conv  = get_u32_or(gctx, "qwen35.ssm.conv_kernel",  0);
-    const uint32_t ssm_inner = get_u32_or(gctx, "qwen35.ssm.inner_size",   0);
-    const uint32_t ssm_state = get_u32_or(gctx, "qwen35.ssm.state_size",   0);
-    const uint32_t ssm_dt    = get_u32_or(gctx, "qwen35.ssm.time_step_rank",0);
-    const uint32_t ssm_grp   = get_u32_or(gctx, "qwen35.ssm.group_count",  0);
+    // Build metadata key names using the arch prefix (qwen35 or qwen35moe).
+
+    const uint32_t n_embd = get_u32_or(gctx, (std::string(arch_prefix) + ".embedding_length").c_str(),    0);
+    const uint32_t n_ff   = get_u32_or(gctx, (std::string(arch_prefix) + ".feed_forward_length").c_str(), 0);
+    const uint32_t n_layer= get_u32_or(gctx, (std::string(arch_prefix) + ".block_count").c_str(),         0);
+    const uint32_t n_head = get_u32_or(gctx, (std::string(arch_prefix) + ".attention.head_count").c_str(),0);
+    const uint32_t n_headkv=get_u32_or(gctx, (std::string(arch_prefix) + ".attention.head_count_kv").c_str(),0);
+    const uint32_t kl     = get_u32_or(gctx, (std::string(arch_prefix) + ".attention.key_length").c_str(),   0);
+    const uint32_t vl     = get_u32_or(gctx, (std::string(arch_prefix) + ".attention.value_length").c_str(), 0);
+    const uint32_t fai    = get_u32_or(gctx, (std::string(arch_prefix) + ".full_attention_interval").c_str(),0);
+    const uint32_t ssm_conv  = get_u32_or(gctx, (std::string(arch_prefix) + ".ssm.conv_kernel").c_str(),  0);
+    const uint32_t ssm_inner = get_u32_or(gctx, (std::string(arch_prefix) + ".ssm.inner_size").c_str(),   0);
+    const uint32_t ssm_state = get_u32_or(gctx, (std::string(arch_prefix) + ".ssm.state_size").c_str(),   0);
+    const uint32_t ssm_dt    = get_u32_or(gctx, (std::string(arch_prefix) + ".ssm.time_step_rank").c_str(),0);
+    const uint32_t ssm_grp   = get_u32_or(gctx, (std::string(arch_prefix) + ".ssm.group_count").c_str(),  0);
+
+    // MoE-specific metadata (zero for dense models).
+    const uint32_t moe_expert_count = is_moe
+        ? get_u32_or(gctx, (std::string(arch_prefix) + ".expert_count").c_str(), 0) : 0;
+    const uint32_t moe_expert_used  = is_moe
+        ? get_u32_or(gctx, (std::string(arch_prefix) + ".expert_used_count").c_str(), 0) : 0;
+    const uint32_t moe_expert_ff    = is_moe
+        ? get_u32_or(gctx, (std::string(arch_prefix) + ".expert_feed_forward_length").c_str(), 0) : 0;
 
     if (n_embd == 0 || n_layer == 0 || n_head == 0 || n_headkv == 0 ||
-        kl == 0 || vl == 0 || n_ff == 0 || fai == 0 ||
+        kl == 0 || vl == 0 || fai == 0 ||
         ssm_conv == 0 || ssm_inner == 0 || ssm_state == 0 ||
         ssm_dt == 0 || ssm_grp == 0) {
         char buf[512];
@@ -295,6 +318,21 @@ bool load_target_gguf_partial(const std::string & path,
             "kl=%u vl=%u n_ff=%u fai=%u ssm{conv=%u inner=%u state=%u dt=%u grp=%u}",
             n_embd, n_layer, n_head, n_headkv, kl, vl, n_ff, fai,
             ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp);
+        set_last_error(buf);
+        gguf_free(gctx);
+        return false;
+    }
+    // Dense models require n_ff > 0; MoE models may have n_ff=0 (experts replace dense FFN).
+    if (!is_moe && n_ff == 0) {
+        set_last_error("dense model has feed_forward_length=0");
+        gguf_free(gctx);
+        return false;
+    }
+    if (is_moe && (moe_expert_count == 0 || moe_expert_used == 0 || moe_expert_ff == 0)) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "MoE model missing expert params: expert_count=%u expert_used=%u expert_ff=%u",
+            moe_expert_count, moe_expert_used, moe_expert_ff);
         set_last_error(buf);
         gguf_free(gctx);
         return false;
@@ -321,14 +359,15 @@ bool load_target_gguf_partial(const std::string & path,
     // rope dimension_sections (array of 4 uint32)
     int rope_sections[4] = {0, 0, 0, 0};
     {
-        int64_t rid = gguf_find_key(gctx, "qwen35.rope.dimension_sections");
+        std::string rkey = std::string(arch_prefix) + ".rope.dimension_sections";
+        int64_t rid = gguf_find_key(gctx, rkey.c_str());
         if (rid < 0) {
-            set_last_error("missing qwen35.rope.dimension_sections");
+            set_last_error("missing " + rkey);
             gguf_free(gctx); return false;
         }
         size_t n = gguf_get_arr_n(gctx, rid);
         if (n < 4) {
-            set_last_error("qwen35.rope.dimension_sections has < 4 entries");
+            set_last_error(rkey + " has < 4 entries");
             gguf_free(gctx); return false;
         }
         const int32_t * arr = (const int32_t *)gguf_get_arr_data(gctx, rid);
@@ -393,6 +432,12 @@ bool load_target_gguf_partial(const std::string & path,
     out.ssm_dt_rank= (int)ssm_dt;
     out.ssm_n_group= (int)ssm_grp;
 
+    // MoE fields
+    out.is_moe           = is_moe;
+    out.n_experts        = (int)moe_expert_count;
+    out.n_experts_active = (int)moe_expert_used;
+    out.expert_ffn_dim   = (int)moe_expert_ff;
+
     // EOS token ids from GGUF tokenizer metadata (stored as UINT32 by the
     // GGUF spec; we use the u32 helper and cast). UINT32_MAX is the
     // missing-key sentinel and maps to int32_t -1, which the runtime EOS
@@ -440,15 +485,38 @@ bool load_target_gguf_partial(const std::string & path,
         // Always-present tensors
         L.attn_norm      = fnd("attn_norm.weight");
         L.attn_post_norm = fnd("post_attention_norm.weight");
-        L.w_gate         = fnd("ffn_gate.weight");
-        L.w_up           = fnd("ffn_up.weight");
-        L.w_down         = fnd("ffn_down.weight");
-        if (!L.attn_norm || !L.attn_post_norm || !L.w_gate || !L.w_up || !L.w_down) {
-            char b[128];
-            std::snprintf(b, sizeof(b), "layer %d: missing shared tensor", il);
-            set_last_error(b);
-            gguf_free(gctx);
-            return false;
+
+        if (is_moe) {
+            // MoE: router + shared expert replace dense FFN
+            L.ffn_gate_inp       = fnd("ffn_gate_inp.weight");
+            L.ffn_gate_inp_shexp = fnd("ffn_gate_inp_shexp.weight");
+            L.shared_w_gate      = fnd("ffn_gate_shexp.weight");
+            L.shared_w_up        = fnd("ffn_up_shexp.weight");
+            L.shared_w_down      = fnd("ffn_down_shexp.weight");
+            // Dense FFN tensors are null for MoE
+            L.w_gate = nullptr;
+            L.w_up   = nullptr;
+            L.w_down = nullptr;
+            if (!L.attn_norm || !L.attn_post_norm ||
+                !L.ffn_gate_inp || !L.shared_w_gate || !L.shared_w_up || !L.shared_w_down) {
+                char b[128];
+                std::snprintf(b, sizeof(b), "layer %d: missing MoE shared tensor", il);
+                set_last_error(b);
+                gguf_free(gctx);
+                return false;
+            }
+        } else {
+            // Dense: standard SwiGLU FFN
+            L.w_gate = fnd("ffn_gate.weight");
+            L.w_up   = fnd("ffn_up.weight");
+            L.w_down = fnd("ffn_down.weight");
+            if (!L.attn_norm || !L.attn_post_norm || !L.w_gate || !L.w_up || !L.w_down) {
+                char b[128];
+                std::snprintf(b, sizeof(b), "layer %d: missing shared tensor", il);
+                set_last_error(b);
+                gguf_free(gctx);
+                return false;
+            }
         }
 
         // Full-attention tensors (only on layers where (il+1)%fai == 0,
@@ -500,7 +568,7 @@ bool load_target_gguf_partial(const std::string & path,
     for (int64_t tid = 0; tid < n_tensors; tid++) {
         const char * tname = gguf_get_tensor_name(gctx, tid);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
-        if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output)) {
+        if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, is_moe)) {
             continue;
         }
         alloc_total = align_up_size(alloc_total, alignment);
@@ -565,11 +633,64 @@ bool load_target_gguf_partial(const std::string & path,
             tok_embd_type = gguf_get_tensor_type(gctx, tid);
             continue;
         }
-        if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output)) {
+        if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, is_moe)) {
             continue;
         }
         ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
         total += sz;
+    }
+
+    // ── 4b. Record expert tensor mmap offsets for the ExpertCache. ──
+    if (is_moe && moe_expert_count > 0) {
+        auto & es = out.expert_source;
+        es.mmap_base      = (const uint8_t *)mm.addr;
+        es.hidden_dim     = (int)n_embd;
+        es.expert_ffn_dim = (int)moe_expert_ff;
+        es.n_experts      = (int)moe_expert_count;
+        es.n_layers       = (int)n_layer;
+        es.layers.resize(n_layer);
+
+        for (int il = 0; il < (int)n_layer; il++) {
+            char tn[128];
+            std::snprintf(tn, sizeof(tn), "blk.%d.ffn_gate_exps.weight", il);
+            int tid_g = gguf_find_tensor(gctx, tn);
+            std::snprintf(tn, sizeof(tn), "blk.%d.ffn_up_exps.weight", il);
+            int tid_u = gguf_find_tensor(gctx, tn);
+            std::snprintf(tn, sizeof(tn), "blk.%d.ffn_down_exps.weight", il);
+            int tid_d = gguf_find_tensor(gctx, tn);
+
+            if (tid_g < 0 || tid_u < 0 || tid_d < 0) {
+                char b[128];
+                std::snprintf(b, sizeof(b), "layer %d: missing expert 3D tensor(s)", il);
+                set_last_error(b);
+                gguf_free(gctx);
+                return false;
+            }
+
+            es.layers[il].gate_offset = data_start + gguf_get_tensor_offset(gctx, tid_g);
+            es.layers[il].up_offset   = data_start + gguf_get_tensor_offset(gctx, tid_u);
+            es.layers[il].down_offset = data_start + gguf_get_tensor_offset(gctx, tid_d);
+
+            if (il == 0) {
+                ggml_tensor * tg = ggml_get_tensor(meta_ctx, "blk.0.ffn_gate_exps.weight");
+                ggml_tensor * tu = ggml_get_tensor(meta_ctx, "blk.0.ffn_up_exps.weight");
+                ggml_tensor * td = ggml_get_tensor(meta_ctx, "blk.0.ffn_down_exps.weight");
+
+                es.gate_type = tg->type;
+                es.up_type   = tu->type;
+                es.down_type = td->type;
+
+                es.gate_expert_bytes = tg->nb[2];
+                es.up_expert_bytes   = tu->nb[2];
+                es.down_expert_bytes = td->nb[2];
+            }
+        }
+        std::printf("[loader] MoE expert source: %d layers × %d experts, "
+                    "gate=%s %zu B, up=%s %zu B, down=%s %zu B\n",
+            es.n_layers, es.n_experts,
+            ggml_type_name(es.gate_type), es.gate_expert_bytes,
+            ggml_type_name(es.up_type),   es.up_expert_bytes,
+            ggml_type_name(es.down_type), es.down_expert_bytes);
     }
 
     gguf_free(gctx);
