@@ -9,9 +9,18 @@ import time
 from typing import Optional
 
 from . import config
-from .platform import query_gpu_memory_mib
 
 log = logging.getLogger(__name__)
+
+
+def _query_nvidia_vram_mib() -> Optional[int]:
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL, timeout=5)
+        return int(out.decode().splitlines()[0])
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
+        return None
 
 
 class DflashClient:
@@ -65,26 +74,21 @@ class DflashClient:
 
     def _wait_until_loaded(self, timeout: float = 60.0, vram_mib: int = 18000):
         boot = time.time()
-        telemetry_seen = False
+        telemetry_works = True
         while time.time() - boot < timeout:
             time.sleep(1)
             if self.proc.poll() is not None:
                 raise RuntimeError(
-                    "dflash daemon exited before weights finished loading. Check the daemon's stderr."
-                )
-            try:
-                vram = query_gpu_memory_mib()
+                    "dflash daemon exited before weights finished loading. Check the daemon's stderr.")
+            if telemetry_works:
+                vram = _query_nvidia_vram_mib()
                 if vram is None:
-                    continue
-                telemetry_seen = True
-                if vram > vram_mib:
+                    telemetry_works = False  # No nvidia-smi (e.g. ROCm); fall through to time-based check
+                elif vram > vram_mib:
                     return
-            except Exception:
-                pass
-            if not telemetry_seen and time.time() - boot >= min(timeout, 5.0):
+            if not telemetry_works and time.time() - boot >= min(timeout, 5.0):
                 log.warning(
-                    "no GPU memory telemetry detected; assuming daemon boot succeeded because the process is still alive"
-                )
+                    "no GPU memory telemetry; assuming daemon boot succeeded since the process is still alive")
                 return
         raise RuntimeError(
             f"dflash daemon failed to load target weights within {timeout:.0f}s "
