@@ -2131,6 +2131,7 @@ static int run_moe_dflash(
     int n_cache_slots,
     int budget,
     ggml_backend_t backend,
+    ggml_backend_t draft_backend,
     TargetWeights & w,
     DraftWeights & dw,
     bool ddtree_mode = false,
@@ -2345,7 +2346,7 @@ static int run_moe_dflash(
         ggml_set_name(d.argmax_tokens, "draft_argmax");
         ggml_set_output(d.argmax_tokens);
         ggml_build_forward_expand(d.gf, d.argmax_tokens);
-        if (!d.alloc) d.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!d.alloc) d.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(draft_backend));
         return ggml_gallocr_alloc_graph(d.alloc, d.gf);
     };
 
@@ -2406,7 +2407,7 @@ static int run_moe_dflash(
         ggml_backend_tensor_set(dctx.positions_q, pos_q.data(), 0, sizeof(int32_t) * draft_block);
         ggml_backend_tensor_set(dctx.positions_k, pos_k.data(), 0,
                                 sizeof(int32_t) * (cur_draft_ctx + draft_block));
-        ggml_backend_graph_compute(backend, dctx.gf);
+        ggml_backend_graph_compute(draft_backend, dctx.gf);
         // Read first q_len tokens from the 16 draft outputs
         ggml_backend_tensor_get(dctx.argmax_tokens, draft_tok.data(), 0, sizeof(int32_t) * q_len);
         draft_tok[0] = last_tok;
@@ -3118,7 +3119,7 @@ int main(int argc, char ** argv) {
     // ── MoE early branch ──
     if (w.is_moe) {
         int rc = run_moe_dflash(target_path, draft_path, prompt_path, n_gen, out_path,
-                                moe_cache_slots, moe_budget, target_backend, w, dw,
+                                moe_cache_slots, moe_budget, target_backend, draft_backend, w, dw,
                                 ddtree_mode, ddtree_budget, ddtree_temp, ddtree_chain_seed,
                                 moe_pin_layers);
         free_draft_weights(dw);
