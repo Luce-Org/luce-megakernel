@@ -18,6 +18,7 @@ bool ExpertCache::init(ggml_backend_t backend, const MoeExpertSource & src,
     n_slots_ = n_slots;
     n_alt_slots_ = n_alt_slots;
     n_layers_ = src.n_layers;
+    layer_miss_count_.assign(src.n_layers, 0);
 
     // Detect layers with alternate down type.
     ggml_type alt_type = GGML_TYPE_COUNT;
@@ -215,6 +216,7 @@ int ExpertCache::ensure_cached(int layer, int expert_id, const MoeExpertSource &
 
     // Cache miss — allocate and load.
     miss_count_++;
+    if (layer < (int)layer_miss_count_.size()) layer_miss_count_[layer]++;
     int gu_slot = allocate_slot(layer, expert_id);
     int d_slot  = allocate_down_slot(layer, expert_id);
 
@@ -286,6 +288,7 @@ void ExpertCache::batch_ensure_cached(int layer, const int * expert_ids, int n_e
 
         // Miss — allocate slots.
         miss_count_++;
+        if (layer < (int)layer_miss_count_.size()) layer_miss_count_[layer]++;
         int gu_slot = allocate_slot(layer, eid);
         int d_slot  = allocate_down_slot(layer, eid);
 

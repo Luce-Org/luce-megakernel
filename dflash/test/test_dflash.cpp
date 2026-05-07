@@ -2510,6 +2510,15 @@ static int run_moe_dflash(
     std::printf("Estimated swap traffic: %.1f MB (%lld misses × %.2f MB/expert)\n",
                 ecache.misses() * bytes_per_miss / (1024*1024),
                 (long long)ecache.misses(), bytes_per_miss / (1024*1024));
+    // Per-layer miss distribution
+    {
+        auto & lm = ecache.layer_misses();
+        std::printf("Per-layer misses:\n");
+        for (int i = 0; i < (int)lm.size(); i++) {
+            std::printf("  L%02d: %5lld", i, (long long)lm[i]);
+            if (i % 8 == 7 || i == (int)lm.size()-1) std::printf("\n");
+        }
+    }
 
     // Detokenize and print
     auto vocab_strs = load_gguf_vocab(target_path);

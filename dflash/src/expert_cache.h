@@ -98,6 +98,7 @@ public:
     int n_slots() const { return n_slots_; }
     int64_t hits()   const { return hit_count_; }
     int64_t misses() const { return miss_count_; }
+    const std::vector<int64_t> & layer_misses() const { return layer_miss_count_; }
 
     void destroy();
     ~ExpertCache() { destroy(); }
@@ -144,6 +145,7 @@ private:
     uint32_t tick_       = 0;
     int64_t  hit_count_  = 0;
     int64_t  miss_count_ = 0;
+    std::vector<int64_t> layer_miss_count_;  // per-layer miss tracking
 };
 
 // Persistent GPU buffers for MoE two-graph-per-layer execution.
