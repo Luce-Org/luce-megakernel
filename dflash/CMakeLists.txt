@@ -120,6 +120,11 @@ add_library(dflash27b STATIC
     src/kv_cache.cpp
     src/kv_quant.cpp
     src/delta_net_chunked.cpp
+    # Laguna-XS.2 (Poolside) target arch
+    src/laguna_target_loader.cpp
+    src/laguna_target_graph.cpp
+    src/laguna_daemon.cpp
+    src/sampler.cpp
 )
 # FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+). On Turing (sm_75)
 # the drafter uses ggml's flash_attn_ext instead. Guard added after SM check.
@@ -276,6 +281,36 @@ if(DFLASH27B_TESTS)
         add_executable(smoke_load_target test/smoke_load_target.cpp)
         target_include_directories(smoke_load_target PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(smoke_load_target PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target_laguna.cpp")
+        add_executable(smoke_load_target_laguna test/smoke_load_target_laguna.cpp)
+        target_include_directories(smoke_load_target_laguna PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(smoke_load_target_laguna PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_laguna_forward.cpp")
+        add_executable(smoke_laguna_forward test/smoke_laguna_forward.cpp)
+        target_include_directories(smoke_laguna_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(smoke_laguna_forward PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_ttft.cpp")
+        add_executable(bench_laguna_ttft test/bench_laguna_ttft.cpp)
+        target_include_directories(bench_laguna_ttft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(bench_laguna_ttft PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_pflash.cpp")
+        add_executable(bench_laguna_pflash test/bench_laguna_pflash.cpp)
+        target_include_directories(bench_laguna_pflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(bench_laguna_pflash PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_generate.cpp")
+        add_executable(bench_laguna_generate test/bench_laguna_generate.cpp)
+        target_include_directories(bench_laguna_generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(bench_laguna_generate PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_laguna_daemon.cpp")
+        add_executable(test_laguna_daemon test/test_laguna_daemon.cpp)
+        target_include_directories(test_laguna_daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_laguna_daemon PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_target_forward.cpp")
         add_executable(smoke_target_forward test/smoke_target_forward.cpp)

@@ -24,7 +24,7 @@
 
 ## Inside the box
 
-Three projects today, more coming. Each one is a self-contained release with its own benchmarks and paper-style writeup.
+Four projects today, more coming. Each one is a self-contained release with its own benchmarks and paper-style writeup.
 
 <p align="center">
   <a href="megakernel/"><img src="assets/svg/card-megakernel-dark.svg" alt="Megakernel" width="46%"></a>
@@ -34,6 +34,8 @@ Three projects today, more coming. Each one is a self-contained release with its
 
 <p align="center">
   <a href="pflash/"><img src="assets/svg/card-pflash-dark.svg" alt="PFlash speculative prefill" width="46%"></a>
+  &nbsp;&nbsp;
+  <a href="dflash/README.md#laguna-xs2-target-experimental-poolside-moe">Laguna-XS.2 target (Poolside MoE)</a>
 </p>
 
 ---
@@ -217,6 +219,65 @@ DFLASH_FP_PROFILE=1     # log mean / score / select / forward stage timings
 - 4 CUDA kernels (`flashprefill_kernels.cu`) for the FlashPrefill `mean_K / score / select / sparse_fwd` algorithm.
 
 [Full writeup →](pflash/README.md) · [Daemon-side build / tunables →](dflash/docs/SPEC_PREFILL.md) · [Blog post →](https://lucebox.com/blog/pflash)
+
+---
+
+## 04 · Laguna-XS.2 (Poolside MoE) target on RTX 3090
+
+**Hand-rolled CUDA forward for Poolside [Laguna-XS.2](https://huggingface.co/poolside/Laguna-XS.2)**, a 678-tensor / 40-layer MoE (256 experts, 8 active, +1 always-on shared expert) with per-layer head counts `[48,64,64,64]×10`, dense leading layer + per-layer SWA pattern (window 512), partial-rotary YaRN RoPE on full-attn layers and partial RoPE on SWA layers. The Q4_K_M GGUF weighs 18.77 GiB on a single RTX 3090; the dflash daemon adds tok_embd CPU-only at 110 MiB to keep the GPU budget under 24 GB.
+
+- **NIAH retrieval at 4K → 131K** with PFlash compression (Qwen3-0.6B drafter), single-needle PASS at every measured (ctx, keep) point
+- **End-to-end TTFT 15.9 s @ 131K** (Q4_0 KV, drafter compress 11.1 s + target prefill 4.8 s, keep=0.10)
+- **OpenAI-compatible HTTP server** (`scripts/laguna_serve.py`) with `temperature` / `top_p` / `top_k` / `seed` / `frequency_penalty` flowing through to the daemon's CPU sampler chain
+
+```bash
+# 1. build dflash + Laguna targets (CUDA 12+, sm_86 for RTX 3090)
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build --target test_laguna_daemon pflash_daemon bench_laguna_ttft -j
+
+# 2. fetch weights: 19 GB Laguna Q4_K_M target + 1.2 GB Qwen3-0.6B BF16 drafter + tokenizers
+huggingface-cli download Lucebox/Laguna-XS.2-GGUF laguna-xs2-Q4_K_M.gguf --local-dir models/
+huggingface-cli download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-BF16.gguf --local-dir models/
+huggingface-cli download poolside/Laguna-XS.2 --local-dir models/Laguna-XS-2 --include 'tokenizer*' '*.json'
+
+# 3a. NIAH @ 131K, keep=0.10 (PFlash compress + target prefill + decode)
+python3 scripts/laguna_pflash_niah.py \
+    --target models/laguna-xs2-Q4_K_M.gguf \
+    --drafter models/Qwen3-0.6B-BF16.gguf \
+    --laguna-tok models/Laguna-XS-2 \
+    --drafter-tok Qwen/Qwen3-0.6B \
+    --pflash-bin ./build/pflash_daemon \
+    --laguna-bin ./build/test_laguna_daemon \
+    --ctx 131072 --depth 0.5 --keep 0.10 --target-kv q4_0
+
+# 3b. or serve OpenAI-compatible HTTP
+python3 scripts/laguna_serve.py \
+    --target models/laguna-xs2-Q4_K_M.gguf \
+    --laguna-tok models/Laguna-XS-2 \
+    --laguna-bin ./build/test_laguna_daemon \
+    --max-ctx 16384 --kv q8_0 --port 8000
+```
+
+| Context | KV   | keep | drafter (s) | target prefill (s) | end-to-end TTFT | NIAH |
+|--------:|:----:|:----:|------------:|-------------------:|----------------:|:----:|
+|   4 096 | Q8_0 | 0.10 |        1.5  |               0.39 |          1.92 s |  ✅  |
+|  65 536 | Q4_0 | 0.10 |        ~5   |                ~6  |           ~11 s |  ✅  |
+|  65 536 | Q4_0 | 0.30 |        ~5   |                ~10 |           ~15 s |  ✅  |
+| 131 072 | Q4_0 | 0.10 |       11.1  |               4.79 |         15.91 s |  ✅  |
+| 131 072 | Q4_0 | 0.20 |       11.2  |              13.55 |         24.75 s |  ✅  |
+| 131 072 | Q4_0 | 0.30 |       11.4  |              26.43 |         37.84 s |  ✅  |
+
+**What we built.** Path A (ggml-only, no libllama):
+- `src/laguna_target_loader.cpp` — full GGUF loader, validates `arch == "laguna"`, reads per-layer head count as a 40-element array, copies all 678 tensors to a CUDA backend buffer.
+- `src/laguna_target_graph.cpp` — full forward graph (≈2900 ggml nodes): full-attn vs SWA dispatch per layer, dense MLP for layer 0 + sparse MoE (sigmoid router + score-correction bias + sum-norm + scale 2.5 + always-on shared expert) for layers 1–39, per-head softplus attention gate, two-mask SWA design.
+- `test/test_laguna_daemon.cpp` — stdin daemon (`generate <prompt.bin> <n_gen> <out.bin>` + optional ` samp=temp,top_p,top_k,rep_pen,seed` tail), greedy by default, full CPU sampler chain on demand.
+- `scripts/laguna_pflash_niah.py` — NIAH driver with cross-tokenizer round-trip (Qwen3 → text → Laguna) including word-boundary recovery so needles split across PFlash chunk boundaries (e.g. `BLUEHORIZON-7421`) survive aggressive `keep=0.10` at 131K context.
+- `scripts/laguna_serve.py` — OpenAI-compatible FastAPI server on top of `test_laguna_daemon`.
+
+**Outstanding.** No Laguna draft model is published yet, so the current daemon path is autoregressive only (~111 tok/s on RTX 3090). When a matched draft lands, the existing DFlash + DDTree machinery in `test_dflash` should drop in unchanged.
+
+[Full writeup →](dflash/README.md#laguna-xs2-target-experimental-poolside-moe)
 
 ---
 

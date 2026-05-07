@@ -326,3 +326,64 @@ Budget 12 failed all prompts with a ggml shape assertion. Budget 22 remains the
 best short-context throughput default on this 5090 build. Budget 30 produced
 the highest mean AL but lower throughput, so it is a quality-biased experiment
 rather than the base setting.
+
+## Laguna-XS.2 target on RTX 3090 (Poolside MoE, Q4_K_M)
+
+Hand-rolled CUDA forward (Path A, ggml-only) for the 40-layer / 256-expert
+Laguna-XS.2 target. Loader pins 678 tensors at 18.77 GiB on GPU + 110 MiB
+tok_embd CPU-only, leaving room for KV cache and PFlash drafter activations
+in 24 GB. Drafter for compression: Qwen3-0.6B BF16 GGUF (Qwen tokenizer
+cross-mapped to Laguna BPE).
+
+### Dense TTFT (no PFlash compression, full chunked prefill)
+
+Measured with `bench_laguna_ttft`, `DFLASH_KV_TYPE=q4_0` for ctx > 32K, default
+chunk=4096 except where noted (smaller chunks needed at long ctx to keep the
+activation alloc inside 24 GB):
+
+| Context | KV   | chunk | TTFT (s) | tok/s   |
+|--------:|:----:|:-----:|---------:|--------:|
+|   4 096 | Q8_0 | 4096  |     1.04 |  3 932  |
+|  16 384 | Q8_0 | 4096  |     5.71 |  2 867  |
+|  65 536 | Q4_0 | 1024  |    53.17 |  1 233  |
+|  65 536 | Q4_0 | 2048  |    51.33 |  1 277  |
+
+65K @ chunk=4096 OOMs on a 24 GB 3090 because the F32 mask alone needs ~1 GB;
+use chunk=1024 or 2048 for ctx > 32K. PFlash compression (below) bypasses the
+problem by feeding the target a much smaller compressed prompt.
+
+### NIAH single-needle retrieval with PFlash compression (depth=0.5)
+
+`scripts/laguna_pflash_niah.py` orchestrates haystack → drafter compress →
+cross-tokenizer round-trip with word-boundary recovery → Laguna prefill →
+decode → grep needle. The drafter scores Qwen3 token chunks; the
+word-boundary helper expands each kept run outward to whitespace before
+re-tokenizing as Laguna IDs, so multi-token needles like `BLUEHORIZON-7421`
+survive aggressive `keep` ratios.
+
+| Context | KV   | keep | drafter (s) | target prefill (s) | end-to-end TTFT | NIAH |
+|--------:|:----:|:----:|------------:|-------------------:|----------------:|:----:|
+|   4 096 | Q8_0 | 0.10 |        1.54 |               0.39 |          1.92 s |  ✅  |
+|  65 536 | Q4_0 | 0.10 |        ~5   |                ~6  |           ~11 s |  ✅  |
+|  65 536 | Q4_0 | 0.20 |        ~5   |                ~8  |           ~13 s |  ✅  |
+|  65 536 | Q4_0 | 0.30 |        ~5   |                ~10 |           ~15 s |  ✅  |
+|  65 536 | Q4_0 | 0.50 |        ~5   |                ~17 |           ~22 s |  ✅  |
+| 131 072 | Q4_0 | 0.10 |       11.11 |               4.79 |         15.91 s |  ✅  |
+| 131 072 | Q4_0 | 0.20 |       11.20 |              13.55 |         24.75 s |  ✅  |
+| 131 072 | Q4_0 | 0.30 |       11.41 |              26.43 |         37.84 s |  ✅  |
+
+Decode is autoregressive (~96 tok/s @ ctx=4K, ~27 tok/s @ ctx=131K) until a
+matched Laguna spec-decode draft model is published; the dflash daemon's
+draft-loaded path is reserved for that future drop-in.
+
+### Sampler smoke (test_laguna_daemon, prompt = "Tell me a one-line haiku about clouds.")
+
+| samp= tail                  | first 90 chars of decode |
+|-----------------------------|--------------------------|
+| (none, greedy)              | `Fluffy white giants / Sail through the sky on gentle / Wings of summer breeze` |
+| `2.0,1.0,0,1.0,42`          | `requires_blog_proxygps … setUser dirs feedbackUse thin covsyl Banks/mythtv MITMially beac` |
+| `2.0,1.0,0,1.0,43`          | `Phantom ships sail cre ways—.permissions['agrant\` paramount Then never Streaming Home>s` |
+| `1.0,0.5,0,1.0,99` (top_p)  | `Clouds drift like cotton dreams floating through the sky.` |
+
+Four distinct outputs from the same prompt confirms the rep_penalty → top_k
+→ softmax(temp) → top_p → draw chain is wired correctly end to end.

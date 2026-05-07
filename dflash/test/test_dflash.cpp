@@ -22,11 +22,19 @@
 #include "internal.h"
 #include "dflash_graph.h"
 #include "qwen3_drafter.h"
+#include "laguna_daemon.h"  // arch dispatch — laguna targets are served by
+                            // dflash27b::run_laguna_daemon() instead of the
+                            // qwen35 + DFlash + DDTree pipeline below.
+#include "sampler.h"        // shared CPU sampler chain (SamplerCfg /
+                            // sample_logits / parse_sampler_token) used by
+                            // both arches; behaviour stays identical.
 
 #include "ggml.h"
+#include "gguf.h"  // gguf_init_from_file / gguf_find_key for arch detect
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+
 
 #include <cuda_runtime.h>
 
@@ -111,103 +119,12 @@ static int argmax_f32(const float * x, int n) {
     return best;
 }
 
-// Optional sampling. Greedy is the default. When SamplerCfg.temp > 0
-// the corresponding committed-token argmax sites instead run a small
-// CPU sampler chain (rep penalty -> top_k -> top_p -> temp -> draw).
-// The DDTree skeleton itself stays argmax to keep accept rate intact.
-struct SamplerCfg {
-    float    temp       = 0.0f;
-    float    top_p      = 1.0f;
-    int      top_k      = 0;
-    float    rep_pen    = 1.0f;
-    int      rep_window = 256;
-    uint64_t seed       = 0;
-};
-
-static int sample_logits(const float * logits_in,
-                         int vocab,
-                         const SamplerCfg & cfg,
-                         const std::vector<int32_t> & history,
-                         std::mt19937_64 & rng) {
-    std::vector<std::pair<float,int>> cand(vocab);
-    for (int i = 0; i < vocab; i++) cand[i] = {logits_in[i], i};
-
-    if (cfg.rep_pen > 1.0f && !history.empty()) {
-        const int win  = std::min((int)history.size(), cfg.rep_window);
-        const int from = (int)history.size() - win;
-        std::unordered_set<int> seen;
-        for (int i = from; i < (int)history.size(); i++) seen.insert(history[i]);
-        for (auto & c : cand) {
-            if (seen.count(c.second)) {
-                c.first = (c.first > 0.0f) ? c.first / cfg.rep_pen
-                                           : c.first * cfg.rep_pen;
-            }
-        }
-    }
-
-    if (cfg.top_k > 0 && cfg.top_k < vocab) {
-        std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(),
-                          [](auto & a, auto & b){ return a.first > b.first; });
-        cand.resize(cfg.top_k);
-    } else {
-        std::sort(cand.begin(), cand.end(),
-                  [](auto & a, auto & b){ return a.first > b.first; });
-    }
-
-    const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
-    float maxv = cand.front().first * inv_t;
-    double Z   = 0.0;
-    std::vector<float> probs(cand.size());
-    for (size_t i = 0; i < cand.size(); i++) {
-        probs[i] = std::exp(cand[i].first * inv_t - maxv);
-        Z       += probs[i];
-    }
-    for (auto & p : probs) p = (float)(p / Z);
-
-    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
-        double cum = 0.0;
-        size_t cut = probs.size();
-        for (size_t i = 0; i < probs.size(); i++) {
-            cum += probs[i];
-            if (cum >= cfg.top_p) { cut = i + 1; break; }
-        }
-        probs.resize(cut); cand.resize(cut);
-        double zz = 0.0;
-        for (auto p : probs) zz += p;
-        for (auto & p : probs) p = (float)(p / zz);
-    }
-
-    std::uniform_real_distribution<double> u(0.0, 1.0);
-    double r   = u(rng);
-    double acc = 0.0;
-    for (size_t i = 0; i < probs.size(); i++) {
-        acc += probs[i];
-        if (r <= acc) return cand[i].second;
-    }
-    return cand.back().second;
-}
-
-static bool parse_sampler_token(std::string & line, SamplerCfg & out) {
-    auto pos = line.find(" samp=");
-    if (pos == std::string::npos) return false;
-    auto end = line.find(' ', pos + 1);
-    std::string tok = (end == std::string::npos)
-                          ? line.substr(pos + 6)
-                          : line.substr(pos + 6, end - (pos + 6));
-    line.erase(pos, (end == std::string::npos ? std::string::npos : end - pos));
-    float t = 0.0f, tp = 1.0f, rp = 1.0f;
-    int   tk = 0;
-    unsigned long long sd = 0;
-    int n = std::sscanf(tok.c_str(), "%f,%f,%d,%f,%llu",
-                        &t, &tp, &tk, &rp, &sd);
-    if (n < 1) return false;
-    out.temp    = t;
-    out.top_p   = tp;
-    out.top_k   = tk;
-    out.rep_pen = rp;
-    out.seed    = sd;
-    return true;
-}
+// CPU sampler chain (SamplerCfg / sample_logits / parse_sampler_token) lives
+// in src/sampler.{h,cpp} and is shared with src/laguna_daemon.cpp. Behaviour
+// is unchanged: greedy when cfg.temp <= 0, otherwise rep_penalty -> top_k ->
+// softmax(temp) -> top_p -> draw. The DDTree skeleton itself stays argmax to
+// keep the accept rate intact; sample_logits only runs at committed-token
+// sites when ` samp=` was on the request line.
 
 // ggml_flash_attn_ext expects kv_len aligned to KQ_MASK_PAD (32) on the
 // f16/Q* paths, and to FATTN_KQ_STRIDE (256) on the TurboQuant FA paths.
@@ -2081,10 +1998,42 @@ int main(int argc, char ** argv) {
         g_fa_window = std::max(0, std::atoi(s));
     }
     const char * target_path = argv[1];
-    const char * draft_path  = argv[2];
-    const char * prompt_path = (argc >= 6 && argv[3][0] != '-') ? argv[3] : nullptr;
-    int          n_gen       = (argc >= 6 && argv[3][0] != '-') ? std::atoi(argv[4]) : 0;
-    const char * out_path    = (argc >= 6 && argv[3][0] != '-') ? argv[5] : nullptr;
+
+    // ---- Architecture detection ------------------------------------------
+    // Read general.architecture from the target GGUF before parsing argv
+    // shape so we can route laguna requests to run_laguna_daemon() and
+    // accept the no-draft argv layout server.py uses for that arch.
+    auto peek_gguf_arch = [&](const char * path) -> std::string {
+        gguf_init_params gip{};
+        gip.no_alloc = true;
+        gip.ctx = nullptr;
+        gguf_context * gctx = gguf_init_from_file(path, gip);
+        if (!gctx) return std::string();
+        std::string out;
+        const int64_t kid = gguf_find_key(gctx, "general.architecture");
+        if (kid >= 0) {
+            const char * v = gguf_get_val_str(gctx, kid);
+            if (v) out = v;
+        }
+        gguf_free(gctx);
+        return out;
+    };
+    const std::string detected_arch = peek_gguf_arch(target_path);
+    const bool is_laguna = (detected_arch == "laguna");
+
+    // When arch == laguna there is no DFlash draft model (Poolside hasn't
+    // released one); server.py omits --draft from the spawn cmd. Accept the
+    // shorter argv layout: argv[1] = target, argv[2..] = flags. Same fall-
+    // back applies if the user manually drops the draft (argv[2] starts with
+    // a dash) on any arch — keeps the binary friendly to ad-hoc invocation.
+    const bool no_draft_layout = is_laguna || (argc >= 3 && argv[2][0] == '-');
+    const char * draft_path  = no_draft_layout ? nullptr : argv[2];
+    const int    flags_start = no_draft_layout ? 2 : 3;
+    const bool   has_positional_args =
+        (!no_draft_layout) && (argc >= 6 && argv[3][0] != '-');
+    const char * prompt_path = has_positional_args ? argv[3] : nullptr;
+    int          n_gen       = has_positional_args ? std::atoi(argv[4]) : 0;
+    const char * out_path    = has_positional_args ? argv[5] : nullptr;
     // --seq-verify: run the target verify as q_len independent single-token
     // decodes instead of one batched forward with a causal mask. Isolates
     // the correctness-of-batched-verify hypothesis from z-lab issue #57.
@@ -2134,7 +2083,7 @@ int main(int argc, char ** argv) {
     }
     int   stream_fd     = -1;     // write each committed token to this fd (int32 LE) as they land
     bool  daemon_mode   = false;
-    for (int i = 3; i < argc; i++) {
+    for (int i = flags_start; i < argc; i++) {
         if      (std::strcmp(argv[i], "--daemon") == 0)        daemon_mode = true;
         else if (std::strcmp(argv[i], "--seq-verify") == 0)    seq_verify = true;
         else if (std::strcmp(argv[i], "--fast-rollback") == 0) fast_rollback = true;
@@ -2228,9 +2177,46 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (!daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
+    if (!is_laguna && !daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
         std::fprintf(stderr, "Missing positional arguments for non-daemon mode.\n");
         return 2;
+    }
+
+    // ---- Arch dispatch: hand laguna targets to the dedicated daemon -----
+    // The qwen35 + DFlash + DDTree code path below assumes the target is a
+    // qwen35-shaped hybrid (attention + DeltaNet/SSM) and that a draft model
+    // exists. Laguna is a pure-attention MoE arch with no published draft,
+    // so dispatch to run_laguna_daemon() before any qwen35-specific init.
+    // The daemon protocol it speaks (bare prompt, samp= tail, generate cmd)
+    // matches what scripts/server.py emits, so the OpenAI HTTP path is
+    // byte-identical for the two arches — only the binary'́s internal
+    // forward kernels differ.
+    if (is_laguna) {
+        ggml_type kv = GGML_TYPE_Q8_0;
+        if (const char * kvs = std::getenv("DFLASH27B_KV_K")) {
+            std::string s = kvs;
+            if      (s == "q4_0") kv = GGML_TYPE_Q4_0;
+            else if (s == "q5_0") kv = GGML_TYPE_Q5_0;
+            else if (s == "q8_0") kv = GGML_TYPE_Q8_0;
+            else if (s == "f16")  kv = GGML_TYPE_F16;
+        }
+        const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
+        int chunk = 2048;
+        if (const char * ck = std::getenv("DFLASH27B_LAGUNA_CHUNK")) {
+            const int v = std::atoi(ck);
+            if (v > 0) chunk = v;
+        }
+        std::fprintf(stderr,
+            "[test_dflash] arch=laguna -> dispatching to run_laguna_daemon "
+            "(max_ctx=%d kv=%s chunk=%d stream_fd=%d). DFlash + DDTree disabled.\n",
+            max_ctx_eff, ggml_type_name(kv), chunk, stream_fd);
+        dflash27b::LagunaDaemonArgs largs;
+        largs.target_path = target_path;
+        largs.max_ctx     = max_ctx_eff;
+        largs.chunk       = chunk;
+        largs.kv_type     = kv;
+        largs.stream_fd   = stream_fd;
+        return dflash27b::run_laguna_daemon(largs);
     }
 
     // Helper: write a committed token to the stream fd immediately (int32 LE).
