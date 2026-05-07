@@ -1,4 +1,9 @@
 build/
+
+# Strix Halo design notes — kept on disk, not on this branch (only HIP/ROCm
+# code support is in scope). Restore via: git show 388867a:dflash/docs/STRIX_HALO_PFLASH.md
+docs/STRIX_HALO_PFLASH.md
+
 *.o
 *.a
 *.so
