@@ -2129,6 +2129,7 @@ static int run_moe_dflash(
     int n_gen,
     const char * out_path,
     int n_cache_slots,
+    int budget,
     ggml_backend_t backend,
     TargetWeights & w,
     DraftWeights & dw)
@@ -2136,12 +2137,13 @@ static int run_moe_dflash(
     using namespace dflash27b;
     const int hidden = w.n_embd;
     const int vocab  = (int)w.embedder.n_vocab;
-    const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;  // 16
+    const int draft_block = DFLASH27B_DRAFT_BLOCK_SIZE;  // draft always produces 16
+    const int q_len  = std::min(budget, draft_block);    // verify at most budget tokens
     const int max_ctx = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
     const int max_verify = q_len + 1;
 
-    std::printf("[moe] hidden=%d vocab=%d n_layer=%d experts=%d active=%d cache_slots=%d\n",
-                hidden, vocab, w.n_layer, w.n_experts, w.n_experts_active, n_cache_slots);
+    std::printf("[moe] hidden=%d vocab=%d n_layer=%d experts=%d active=%d cache_slots=%d budget=%d\n",
+                hidden, vocab, w.n_layer, w.n_experts, w.n_experts_active, n_cache_slots, q_len);
 
     // ── ExpertCache ──
     int n_alt_layers = 0;
@@ -2285,13 +2287,13 @@ static int run_moe_dflash(
         d.ctx = ggml_init(ip);
         if (!d.ctx) return false;
         const int fc_in = DFLASH27B_DRAFT_N_TARGET_LAYERS * w.n_embd;
-        d.inp_embed = ggml_new_tensor_3d(d.ctx, GGML_TYPE_F32, hidden, q_len, 1);
+        d.inp_embed = ggml_new_tensor_3d(d.ctx, GGML_TYPE_F32, hidden, draft_block, 1);
         ggml_set_name(d.inp_embed, "inp_embed"); ggml_set_input(d.inp_embed);
         d.target_hidden_cat = ggml_new_tensor_3d(d.ctx, GGML_TYPE_F32, fc_in, ctx_len, 1);
         ggml_set_name(d.target_hidden_cat, "target_hidden_cat"); ggml_set_input(d.target_hidden_cat);
-        d.positions_q = ggml_new_tensor_1d(d.ctx, GGML_TYPE_I32, q_len);
+        d.positions_q = ggml_new_tensor_1d(d.ctx, GGML_TYPE_I32, draft_block);
         ggml_set_name(d.positions_q, "positions_q"); ggml_set_input(d.positions_q);
-        d.positions_k = ggml_new_tensor_1d(d.ctx, GGML_TYPE_I32, ctx_len + q_len);
+        d.positions_k = ggml_new_tensor_1d(d.ctx, GGML_TYPE_I32, ctx_len + draft_block);
         ggml_set_name(d.positions_k, "positions_k"); ggml_set_input(d.positions_k);
         d.gf = ggml_new_graph_custom(d.ctx, 4096, false);
         DraftGraphInputs gi{};
@@ -2317,8 +2319,8 @@ static int run_moe_dflash(
     auto t_gen0 = std::chrono::steady_clock::now();
     int n_generated = 0, n_draft_steps = 0, n_accept_sum = 0;
     std::vector<int32_t> out_all;
-    std::vector<float> noise_embed_buf((size_t)hidden * q_len);
-    std::vector<int32_t> noise_ids(q_len);
+    std::vector<float> noise_embed_buf((size_t)hidden * draft_block);
+    std::vector<int32_t> noise_ids(draft_block);
     std::vector<int32_t> draft_tok(q_len), target_tok(q_len);
     MoeDraftCtx dctx;
     int draft_ctx_len = -1;
@@ -2328,8 +2330,8 @@ static int run_moe_dflash(
     while (n_generated < n_gen) {
         // ─ 1. Draft ─
         noise_ids[0] = last_tok;
-        for (int i = 1; i < q_len; i++) noise_ids[i] = mask_tok;
-        w.embedder.embed(noise_ids.data(), q_len, noise_embed_buf.data());
+        for (int i = 1; i < draft_block; i++) noise_ids[i] = mask_tok;
+        w.embedder.embed(noise_ids.data(), draft_block, noise_embed_buf.data());
 
         const int cur_draft_ctx = std::min(committed, DRAFT_CTX_MAX);
         const int draft_start = committed - cur_draft_ctx;
@@ -2362,14 +2364,15 @@ static int run_moe_dflash(
             cudaDeviceSynchronize();
         }
 
-        // Draft positions + compute
-        std::vector<int32_t> pos_q(q_len), pos_k(cur_draft_ctx + q_len);
-        for (int i = 0; i < q_len; i++) pos_q[i] = cur_draft_ctx + i;
-        for (int i = 0; i < cur_draft_ctx + q_len; i++) pos_k[i] = i;
-        ggml_backend_tensor_set(dctx.positions_q, pos_q.data(), 0, sizeof(int32_t) * q_len);
+        // Draft positions + compute (always 16 tokens)
+        std::vector<int32_t> pos_q(draft_block), pos_k(cur_draft_ctx + draft_block);
+        for (int i = 0; i < draft_block; i++) pos_q[i] = cur_draft_ctx + i;
+        for (int i = 0; i < cur_draft_ctx + draft_block; i++) pos_k[i] = i;
+        ggml_backend_tensor_set(dctx.positions_q, pos_q.data(), 0, sizeof(int32_t) * draft_block);
         ggml_backend_tensor_set(dctx.positions_k, pos_k.data(), 0,
-                                sizeof(int32_t) * (cur_draft_ctx + q_len));
+                                sizeof(int32_t) * (cur_draft_ctx + draft_block));
         ggml_backend_graph_compute(backend, dctx.gf);
+        // Read first q_len tokens from the 16 draft outputs
         ggml_backend_tensor_get(dctx.argmax_tokens, draft_tok.data(), 0, sizeof(int32_t) * q_len);
         draft_tok[0] = last_tok;
 
@@ -2565,6 +2568,7 @@ int main(int argc, char ** argv) {
     bool  target_split_load_draft = false;
     bool  target_split_dflash = false;
     int   moe_cache_slots = 4000;  // expert cache slots for MoE models
+    int   moe_budget = 16;          // draft block size for MoE verify
     int   target_gpu = 0;
     int   draft_gpu = 0;
     std::vector<int> target_gpus;
@@ -2684,6 +2688,9 @@ int main(int argc, char ** argv) {
         else if (std::strncmp(argv[i], "--cache-slots=", 14) == 0) {
             moe_cache_slots = std::max(100, std::atoi(argv[i] + 14));
         }
+        else if (std::strncmp(argv[i], "--budget=", 9) == 0) {
+            moe_budget = std::clamp(std::atoi(argv[i] + 9), 1, 64);
+        }
     }
 
     if (!daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
@@ -2794,7 +2801,7 @@ int main(int argc, char ** argv) {
     // ── MoE early branch ──
     if (w.is_moe) {
         int rc = run_moe_dflash(target_path, draft_path, prompt_path, n_gen, out_path,
-                                moe_cache_slots, target_backend, w, dw);
+                                moe_cache_slots, moe_budget, target_backend, w, dw);
         free_draft_weights(dw);
         free_target_weights(w);
         if (split_gpus) ggml_backend_free(draft_backend);
