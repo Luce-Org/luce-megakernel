@@ -56,7 +56,9 @@ static ggml_tensor * build_moe_graph_a(
     ggml_tensor *         attn_mask,   // optional
     int                   kv_start,
     int                   n_tokens,
-    int                   fa_window = 0)
+    int                   fa_window = 0,
+    ggml_tensor *         parent_ids = nullptr,   // [n_tokens] i32 for DDTree
+    DeltaNetCapture *     cap = nullptr)          // optional SSM capture
 {
     const int hidden  = w.n_embd;
     const int n_used  = w.n_experts_active;
@@ -82,7 +84,7 @@ static ggml_tensor * build_moe_graph_a(
             if (((il + 1) % w.full_attention_interval) != 0) dn_idx++;
         cur = build_delta_net_block(ctx, gf, w, L, cur,
                                      cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
-                                     n_tokens, nullptr, nullptr);
+                                     n_tokens, cap, parent_ids);
     }
 
     // Residual after attention
@@ -244,7 +246,9 @@ bool run_qwen35moe_layer(
     bool                   capture,
     int                    fa_window,
     ggml_gallocr_t         gallocr_a,
-    ggml_gallocr_t         gallocr_b)
+    ggml_gallocr_t         gallocr_b,
+    ggml_tensor *          parent_ids = nullptr,
+    DeltaNetCapture *      cap = nullptr)
 {
     const int hidden = w.n_embd;
     const int n_used = w.n_experts_active;
@@ -270,7 +274,8 @@ bool run_qwen35moe_layer(
 
     ggml_tensor * selected = build_moe_graph_a(
         ctx_a, gf_a, w, cache, moe, layer_idx,
-        inp, positions, attn_mask, kv_start, n_tokens, fa_window);
+        inp, positions, attn_mask, kv_start, n_tokens, fa_window,
+        parent_ids, cap);
 
     // Allocate graph work buffer + execute (reuses pre-allocated gallocr)
     auto t0 = std::chrono::steady_clock::now();
@@ -469,7 +474,9 @@ bool run_qwen35moe_forward(
     bool                   capture,
     int                    fa_window,
     ggml_tensor *          logits_out,   // [vocab, n_tokens] f32 (pre-allocated)
-    ggml_tensor *          argmax_out)   // [n_tokens] i32 (pre-allocated, or nullptr)
+    ggml_tensor *          argmax_out,   // [n_tokens] i32 (pre-allocated, or nullptr)
+    ggml_tensor *          parent_ids,   // [n_tokens] i32 for DDTree (or nullptr)
+    std::vector<DeltaNetCapture> * delta_captures)  // optional SSM captures for rollback
 {
     const int hidden  = w.n_embd;
     const int n_layer = w.n_layer;
@@ -500,12 +507,21 @@ bool run_qwen35moe_forward(
         if (g_moe_debug_sync) {
             std::fprintf(stderr, "[MoE-DBG] layer %d/%d (call=%d)\n", il, n_layer, g_moe_debug_call);
         }
+        // Determine per-layer DeltaNetCapture (only for non-attention layers when captures requested).
+        DeltaNetCapture * cap_ptr = nullptr;
+        if (delta_captures && !((il + 1) % w.full_attention_interval == 0)) {
+            int dn_idx = 0;
+            for (int j = 0; j < il; j++)
+                if (((j + 1) % w.full_attention_interval) != 0) dn_idx++;
+            if (dn_idx < (int)delta_captures->size())
+                cap_ptr = &(*delta_captures)[dn_idx];
+        }
         bool ok = run_qwen35moe_layer(
             backend, w, cache, ecache, moe, source,
             il, act_in, act_out,
             /*chunk_start=*/0, n_tokens,
             positions, attn_mask, kv_start, capture, fa_window,
-            gallocr_a, gallocr_b);
+            gallocr_a, gallocr_b, parent_ids, cap_ptr);
         if (!ok) {
             std::fprintf(stderr, "[MoE] forward failed at layer %d\n", il);
             ggml_gallocr_free(gallocr_a);

@@ -2132,18 +2132,26 @@ static int run_moe_dflash(
     int budget,
     ggml_backend_t backend,
     TargetWeights & w,
-    DraftWeights & dw)
+    DraftWeights & dw,
+    bool ddtree_mode = false,
+    int  ddtree_budget = 22,
+    float ddtree_temp = 1.0f,
+    bool ddtree_chain_seed = true)
 {
     using namespace dflash27b;
     const int hidden = w.n_embd;
     const int vocab  = (int)w.embedder.n_vocab;
     const int draft_block = DFLASH27B_DRAFT_BLOCK_SIZE;  // draft always produces 16
-    const int q_len  = std::min(budget, draft_block);    // verify at most budget tokens
+    const int q_len  = std::min(budget, draft_block);    // verify at most budget tokens (chain mode)
     const int max_ctx = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
-    const int max_verify = q_len + 1;
+    // DDTree needs room for 1 + ddtree_budget tree nodes in intermediate buffers.
+    const int max_verify = ddtree_mode
+        ? std::max(q_len + 1, ddtree_budget + 1)
+        : q_len + 1;
 
-    std::printf("[moe] hidden=%d vocab=%d n_layer=%d experts=%d active=%d cache_slots=%d budget=%d\n",
-                hidden, vocab, w.n_layer, w.n_experts, w.n_experts_active, n_cache_slots, q_len);
+    std::printf("[moe] hidden=%d vocab=%d n_layer=%d experts=%d active=%d cache_slots=%d budget=%d ddtree=%d(%d)\n",
+                hidden, vocab, w.n_layer, w.n_experts, w.n_experts_active, n_cache_slots, q_len,
+                (int)ddtree_mode, ddtree_budget);
 
     // ── ExpertCache ──
     int n_alt_layers = 0;
@@ -2193,9 +2201,9 @@ static int run_moe_dflash(
     ggml_set_name(logits_out, "logits_out"); ggml_set_name(argmax_out, "argmax_out");
     ggml_backend_buffer_t out_buf = ggml_backend_alloc_ctx_tensors(out_ctx, backend);
 
-    // ── Positions + mask ──
+    // ── Positions + mask + parent_ids ──
     ggml_init_params pos_ip{};
-    pos_ip.mem_size = 8 * ggml_tensor_overhead() + 4096;
+    pos_ip.mem_size = 12 * ggml_tensor_overhead() + 4096;
     pos_ip.no_alloc = true;
     ggml_context * pos_ctx = ggml_init(pos_ip);
     ggml_tensor * positions = ggml_new_tensor_1d(pos_ctx, GGML_TYPE_I32, 4 * max_verify);
@@ -2203,6 +2211,11 @@ static int run_moe_dflash(
     ggml_tensor * attn_mask = ggml_new_tensor_2d(pos_ctx, GGML_TYPE_F16,
         align_up(max_ctx + max_verify, KQ_MASK_PAD), align_up(max_verify, KQ_MASK_PAD));
     ggml_set_name(attn_mask, "attn_mask");
+    ggml_tensor * parent_ids_t = nullptr;
+    if (ddtree_mode) {
+        parent_ids_t = ggml_new_tensor_1d(pos_ctx, GGML_TYPE_I32, max_verify);
+        ggml_set_name(parent_ids_t, "parent_ids");
+    }
     ggml_backend_buffer_t pos_buf = ggml_backend_alloc_ctx_tensors(pos_ctx, backend);
 
     // ── Load prompt ──
@@ -2376,7 +2389,254 @@ static int run_moe_dflash(
         ggml_backend_tensor_get(dctx.argmax_tokens, draft_tok.data(), 0, sizeof(int32_t) * q_len);
         draft_tok[0] = last_tok;
 
-        // ─ 2. Snapshot ─
+        // ── DDTree path ──
+        if (ddtree_mode) {
+            const int L = q_len - 1;  // max tree depth
+            const int ddK = (ddtree_budget > L) ? 8 : 1;
+
+            // Extract top-K from draft logits (positions 1..q_len-1)
+            std::vector<float>   top_log_probs((size_t)L * ddK, 0.0f);
+            std::vector<int32_t> top_token_ids((size_t)L * ddK, 0);
+            if (ddK == 1) {
+                for (int i = 0; i < L; i++) {
+                    top_log_probs[i] = 0.0f;
+                    top_token_ids[i] = draft_tok[i + 1];
+                }
+            } else {
+                std::vector<float> draft_logits_buf((size_t)vocab * q_len);
+                ggml_backend_tensor_get(dctx.logits, draft_logits_buf.data(), 0,
+                                        sizeof(float) * vocab * q_len);
+                extract_draft_topk(draft_logits_buf.data() + (size_t)vocab,
+                                   L, vocab, ddK,
+                                   top_log_probs.data(), top_token_ids.data(),
+                                   ddtree_temp);
+            }
+
+            // Build DDTree
+            DDTree tree = build_ddtree(top_log_probs.data(), top_token_ids.data(),
+                                       L, ddK, ddtree_budget, ddtree_chain_seed);
+            const int N_actual = 1 + tree.n_nodes;
+            const int N = ddtree_budget + 1;  // fixed alloc size for gallocr reuse
+
+            // Snapshot SSM state
+            snapshot_ssm_state(cache);
+
+            // Embeddings: [last_tok, tree.token_ids[0..n_nodes-1], padding...]
+            std::vector<int32_t> flat_tokens(N, 0);
+            flat_tokens[0] = last_tok;
+            for (int i = 0; i < tree.n_nodes; i++) flat_tokens[1 + i] = tree.token_ids[i];
+
+            std::vector<float> tree_embed((size_t)hidden * N, 0.0f);
+            w.embedder.embed(flat_tokens.data(), N_actual, tree_embed.data());
+            ggml_backend_tensor_set(act_a, tree_embed.data(), 0, sizeof(float) * hidden * N);
+
+            // M-RoPE positions (axis-major)
+            std::vector<int32_t> pos4(4 * N, 0);
+            for (int i = 0; i < N_actual; i++) {
+                int p = committed + (i == 0 ? 0 : tree.depths[i - 1]);
+                pos4[0 * N + i] = p;
+                pos4[1 * N + i] = p;
+                pos4[2 * N + i] = p;
+                pos4[3 * N + i] = 0;
+            }
+            positions->ne[0] = 4 * N;
+            ggml_backend_tensor_set(positions, pos4.data(), 0, sizeof(int32_t) * 4 * N);
+
+            // Ancestor-only tree mask
+            const int tree_kv_len = committed + N;
+            const int kv_pad_m = align_up(tree_kv_len, KQ_MASK_PAD);
+            const int q_pad_m  = align_up(N, KQ_MASK_PAD);
+            std::vector<uint16_t> tree_mask((size_t)kv_pad_m * q_pad_m, F16_NEG_INF);
+            for (int q = 0; q < N_actual; q++) {
+                // Past KV positions: visible to all tree nodes
+                for (int k = 0; k < committed; k++) {
+                    tree_mask[(size_t)q * kv_pad_m + k] = F16_ZERO;
+                }
+                // Tree self-visibility
+                for (int j = 0; j < N_actual; j++) {
+                    if (tree.visibility[(size_t)q * N_actual + j]) {
+                        tree_mask[(size_t)q * kv_pad_m + (committed + j)] = F16_ZERO;
+                    }
+                }
+            }
+            attn_mask->ne[0] = kv_pad_m;
+            attn_mask->ne[1] = q_pad_m;
+            attn_mask->nb[1] = (size_t)kv_pad_m * ggml_element_size(attn_mask);
+            ggml_backend_tensor_set(attn_mask, tree_mask.data(), 0,
+                sizeof(uint16_t) * tree_mask.size());
+
+            // parent_ids tensor
+            std::vector<int32_t> parent_ids_data(N, 0);
+            parent_ids_data[0] = -1;
+            for (int i = 1; i < N_actual; i++) parent_ids_data[i] = (int32_t)tree.parents[i];
+            ggml_backend_tensor_set(parent_ids_t, parent_ids_data.data(), 0,
+                sizeof(int32_t) * N);
+
+            // DeltaNetCapture: point at cache's intermediate buffers
+            const int n_delta = (int)cache.ssm_state.size();
+            std::vector<DeltaNetCapture> delta_caps(n_delta);
+            for (int il = 0; il < n_delta; il++) {
+                delta_caps[il].ssm_intermediate_states = cache.ssm_intermediate[il];
+                delta_caps[il].conv_input              = cache.conv_input_cache[il];
+            }
+
+            // Run tree-structured verify through MoE forward
+            int64_t misses_before = ecache.misses();
+            auto t_verify0 = std::chrono::steady_clock::now();
+            if (!run_qwen35moe_forward(backend, w, cache, ecache, moe, w.expert_source,
+                    act_a, act_b, N, positions, attn_mask,
+                    committed, true, 0, logits_out, argmax_out,
+                    parent_ids_t, &delta_caps)) {
+                std::fprintf(stderr, "[moe] DDTree verify failed step %d\n", n_draft_steps);
+                return 1;
+            }
+            auto t_verify1 = std::chrono::steady_clock::now();
+            double verify_ms = std::chrono::duration<double, std::milli>(t_verify1 - t_verify0).count();
+            int64_t step_misses = ecache.misses() - misses_before;
+
+            // Read argmax for the actual tree slots
+            std::vector<int32_t> posterior(N_actual);
+            ggml_backend_tensor_get(argmax_out, posterior.data(), 0, sizeof(int32_t) * N_actual);
+
+            // Walk tree
+            int next_token = -1;
+            int bonus_node_idx = 0;
+            std::vector<int> accepted = follow_verified_tree(tree, posterior.data(), next_token, &bonus_node_idx);
+            const int accept_depth = (int)accepted.size();
+
+            int commit_n = accept_depth;
+            const int need_budget = n_gen - n_generated;
+            if (commit_n > need_budget) commit_n = need_budget;
+
+            // Commit accepted tokens
+            bool hit_eos = false;
+            for (int i = 0; i < commit_n; i++) {
+                const int dfs_idx = accepted[i];
+                const int32_t tok = (dfs_idx == 0) ? last_tok : tree.token_ids[dfs_idx - 1];
+                out_all.push_back(tok);
+                if (tok == w.eos_id || tok == w.eos_chat_id) hit_eos = true;
+            }
+            last_tok = next_token;
+
+            // Rollback SSM + conv state
+            const int rollback_dfs = (commit_n > 0) ? accepted[commit_n - 1] : 0;
+            bool walked_sibling = false;
+            for (int i = 0; i < commit_n; i++) {
+                if (accepted[i] != i) { walked_sibling = true; break; }
+            }
+            {
+                cudaStream_t stream = nullptr;
+                for (int il = 0; il < n_delta; il++) {
+                    const DeltaNetCapture & cap = delta_caps[il];
+                    if (!cap.ssm_intermediate_states || !cap.conv_input) continue;
+
+                    // SSM state: f16 intermediate → f32 state
+                    const size_t ssm_elems =
+                        (size_t)cache.ssm_state[il]->ne[0] *
+                        (size_t)cache.ssm_state[il]->ne[1] *
+                        (size_t)cache.ssm_state[il]->ne[2];
+                    const size_t ssm_src_offset =
+                        (size_t)rollback_dfs * cap.ssm_intermediate_states->nb[3];
+                    const void * ssm_src =
+                        (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
+                    dflash27b_launch_f16_to_f32(ssm_src, cache.ssm_state[il]->data,
+                                                ssm_elems, stream);
+
+                    // Conv state rollback
+                    const int K_conv = 4;
+                    const int row_cnt = (int)cap.conv_input->ne[1];
+                    const size_t elt = ggml_element_size(cap.conv_input);
+                    const size_t dpitch = (K_conv - 1) * elt;
+                    const size_t spitch = cap.conv_input->nb[1];
+                    if (!walked_sibling) {
+                        const int conv_off = rollback_dfs + 1;
+                        const void * conv_src =
+                            (const char *)cap.conv_input->data + (size_t)conv_off * elt;
+                        cudaMemcpy2DAsync(cache.conv_state[il]->data, dpitch,
+                                           conv_src, spitch,
+                                           (K_conv - 1) * elt, row_cnt,
+                                           cudaMemcpyDeviceToDevice, stream);
+                    } else {
+                        int virt[K_conv - 1];
+                        virt[K_conv - 2] = rollback_dfs;
+                        for (int k = K_conv - 3; k >= 0; k--) {
+                            const int prev = virt[k + 1];
+                            virt[k] = (prev >= 0) ? (int)tree.parents[prev] : (prev - 1);
+                        }
+                        for (int k = 0; k < K_conv - 1; k++) {
+                            const int sx_slot = (K_conv - 1) + virt[k];
+                            const void * src_col =
+                                (const char *)cap.conv_input->data + (size_t)sx_slot * elt;
+                            char * dst_col =
+                                (char *)cache.conv_state[il]->data + (size_t)k * elt;
+                            cudaMemcpy2DAsync(dst_col, dpitch,
+                                               src_col, spitch,
+                                               elt, row_cnt,
+                                               cudaMemcpyDeviceToDevice, stream);
+                        }
+                    }
+                }
+
+                // KV compaction for full-attention layers
+                const int n_full_attn = (int)cache.attn_k.size();
+                for (int d = 0; d < commit_n; d++) {
+                    const int src_dfs = accepted[d];
+                    if (src_dfs == d) continue;
+                    for (int l = 0; l < n_full_attn; l++) {
+                        ggml_tensor * ck = cache.attn_k[l];
+                        ggml_tensor * cv = cache.attn_v[l];
+                        const size_t slot_bytes = ck->nb[1];
+                        const size_t src_off = (size_t)(committed + src_dfs) * slot_bytes;
+                        const size_t dst_off = (size_t)(committed + d) * slot_bytes;
+                        const int n_kv = (int)ck->ne[2];
+                        for (int h = 0; h < n_kv; h++) {
+                            const size_t head_src = src_off + (size_t)h * ck->nb[2];
+                            const size_t head_dst = dst_off + (size_t)h * ck->nb[2];
+                            cudaMemcpyAsync((char *)ck->data + head_dst,
+                                            (const char *)ck->data + head_src,
+                                            slot_bytes, cudaMemcpyDeviceToDevice, stream);
+                            cudaMemcpyAsync((char *)cv->data + head_dst,
+                                            (const char *)cv->data + head_src,
+                                            slot_bytes, cudaMemcpyDeviceToDevice, stream);
+                        }
+                    }
+                }
+
+                // target_feat compaction
+                if (cache.target_feat) {
+                    const size_t elt = ggml_element_size(cache.target_feat);
+                    const size_t col_stride = cache.target_feat->nb[1];
+                    const int    tcap = cache.target_feat_cap;
+                    const int    fc_in = (int)cache.target_feat->ne[0];
+                    for (int d = 1; d < commit_n; d++) {
+                        const int src_dfs = accepted[d];
+                        if (src_dfs == d) continue;
+                        const int src_slot = (committed + src_dfs) % tcap;
+                        const int dst_slot = (committed + d) % tcap;
+                        const size_t src_off = (size_t)src_slot * col_stride;
+                        const size_t dst_off = (size_t)dst_slot * col_stride;
+                        cudaMemcpyAsync((char *)cache.target_feat->data + dst_off,
+                                        (const char *)cache.target_feat->data + src_off,
+                                        (size_t)fc_in * elt,
+                                        cudaMemcpyDeviceToDevice, stream);
+                    }
+                }
+            }
+
+            committed    += commit_n;
+            n_generated  += commit_n;
+            n_accept_sum += accept_depth;
+            n_draft_steps++;
+
+            std::printf("[step %d] DDTree N=%d accept=%d commit=%d | verify: %.1fms %lld misses | next=%d\n",
+                        n_draft_steps - 1, N_actual, accept_depth, commit_n,
+                        verify_ms, (long long)step_misses, next_token);
+
+            if (hit_eos) { std::printf("[moe] EOS after %d tokens\n", n_generated); break; }
+            continue;  // skip chain path
+        }
+
+        // ─ 2. Snapshot ─ (chain path)
         snapshot_ssm_state(cache);
 
         // ─ 3. Verify ─
@@ -2830,7 +3090,8 @@ int main(int argc, char ** argv) {
     // ── MoE early branch ──
     if (w.is_moe) {
         int rc = run_moe_dflash(target_path, draft_path, prompt_path, n_gen, out_path,
-                                moe_cache_slots, moe_budget, target_backend, w, dw);
+                                moe_cache_slots, moe_budget, target_backend, w, dw,
+                                ddtree_mode, ddtree_budget, ddtree_temp, ddtree_chain_seed);
         free_draft_weights(dw);
         free_target_weights(w);
         if (split_gpus) ggml_backend_free(draft_backend);
