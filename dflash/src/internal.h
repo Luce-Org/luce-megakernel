@@ -541,6 +541,7 @@ bool run_qwen35moe_forward(
     ggml_tensor *          logits_out,   // [vocab, n_tokens] f32 (pre-allocated)
     ggml_tensor *          argmax_out = nullptr,  // [n_tokens] i32 (or nullptr)
     ggml_tensor *          parent_ids = nullptr,  // [n_tokens] i32 for DDTree
-    std::vector<DeltaNetCapture> * delta_captures = nullptr);  // SSM captures
+    std::vector<DeltaNetCapture> * delta_captures = nullptr,  // SSM captures
+    PinnedExperts *        pinned = nullptr);  // pinned expert layers
 
 } // namespace dflash27b

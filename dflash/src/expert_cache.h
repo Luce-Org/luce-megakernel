@@ -148,6 +148,38 @@ private:
     std::vector<int64_t> layer_miss_count_;  // per-layer miss tracking
 };
 
+// ─── Pinned expert layers: all 256 experts resident in VRAM ──────────
+// For specified layers, holds full [cols, rows, 256] tensors so that
+// expert dispatch has zero cache misses (no PCIe transfer at runtime).
+struct PinnedExperts {
+    struct LayerTensors {
+        ggml_tensor * gate = nullptr;  // [hidden, expert_ffn, 256]
+        ggml_tensor * up   = nullptr;  // [hidden, expert_ffn, 256]
+        ggml_tensor * down = nullptr;  // [expert_ffn, hidden, 256]
+    };
+
+    // Initialize pinned layers. Allocates VRAM and bulk-loads all experts.
+    // `pinned_layer_ids` lists which layers to pin (e.g., {0..7, 32..39}).
+    bool init(ggml_backend_t backend, const MoeExpertSource & source,
+              const std::vector<int> & pinned_layer_ids);
+
+    bool is_pinned(int layer) const {
+        return layer < (int)pinned_.size() && pinned_[layer];
+    }
+    const LayerTensors & get(int layer) const { return layers_[layer]; }
+
+    size_t total_bytes() const { return total_bytes_; }
+    void destroy();
+    ~PinnedExperts() { destroy(); }
+
+private:
+    std::vector<bool> pinned_;           // [n_layers] true if pinned
+    std::vector<LayerTensors> layers_;   // [n_layers] tensors (null for unpinned)
+    ggml_context * ctx_ = nullptr;
+    ggml_backend_buffer_t buf_ = nullptr;
+    size_t total_bytes_ = 0;
+};
+
 // Persistent GPU buffers for MoE two-graph-per-layer execution.
 // Transfers intermediate results between Graph A (attention+router) and
 // Graph B (MoE FFN) without CPU round-trip for large tensors.

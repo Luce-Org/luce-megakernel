@@ -2136,7 +2136,8 @@ static int run_moe_dflash(
     bool ddtree_mode = false,
     int  ddtree_budget = 22,
     float ddtree_temp = 1.0f,
-    bool ddtree_chain_seed = true)
+    bool ddtree_chain_seed = true,
+    int  n_pin_layers = 0)   // pin first N/2 + last N/2 layers (0 = disabled)
 {
     using namespace dflash27b;
     const int hidden = w.n_embd;
@@ -2149,16 +2150,33 @@ static int run_moe_dflash(
         ? std::max(q_len + 1, ddtree_budget + 1)
         : q_len + 1;
 
-    std::printf("[moe] hidden=%d vocab=%d n_layer=%d experts=%d active=%d cache_slots=%d budget=%d ddtree=%d(%d)\n",
+    std::printf("[moe] hidden=%d vocab=%d n_layer=%d experts=%d active=%d cache_slots=%d budget=%d ddtree=%d(%d) pin=%d\n",
                 hidden, vocab, w.n_layer, w.n_experts, w.n_experts_active, n_cache_slots, q_len,
-                (int)ddtree_mode, ddtree_budget);
+                (int)ddtree_mode, ddtree_budget, n_pin_layers);
+
+    // ── PinnedExperts (first N/2 + last N/2 layers) ──
+    PinnedExperts pinned;
+    if (n_pin_layers > 0) {
+        std::vector<int> pin_ids;
+        const int half = n_pin_layers / 2;
+        for (int l = 0; l < half && l < w.n_layer; l++) pin_ids.push_back(l);
+        for (int l = std::max(half, w.n_layer - (n_pin_layers - half)); l < w.n_layer; l++)
+            pin_ids.push_back(l);
+        if (!pinned.init(backend, w.expert_source, pin_ids)) {
+            std::fprintf(stderr, "[moe] PinnedExperts init failed\n");
+            return 1;
+        }
+    }
 
     // ── ExpertCache ──
+    // If layers are pinned, check if alt layers are all pinned (no alt pool needed).
     int n_alt_layers = 0;
     const auto & es = w.expert_source;
     for (int l = 0; l < es.n_layers; l++) {
-        if (!es.layer_down_types.empty() && es.layer_down_types[l] != es.down_type)
-            n_alt_layers++;
+        if (!es.layer_down_types.empty() && es.layer_down_types[l] != es.down_type) {
+            if (!(n_pin_layers > 0 && pinned.is_pinned(l)))
+                n_alt_layers++;  // only count alt layers that aren't pinned
+        }
     }
     int n_alt_slots = n_alt_layers > 0 ? n_cache_slots : 0;
     ExpertCache ecache;
@@ -2254,7 +2272,8 @@ static int run_moe_dflash(
         }
 
         if (!run_qwen35moe_forward(backend, w, cache, ecache, moe, w.expert_source,
-                act_a, act_b, 1, positions, mask_ptr, i, true, 0, logits_out, nullptr)) {
+                act_a, act_b, 1, positions, mask_ptr, i, true, 0, logits_out, nullptr,
+                nullptr, nullptr, n_pin_layers > 0 ? &pinned : nullptr)) {
             std::fprintf(stderr, "[moe] prefill failed @%d\n", i);
             return 1;
         }
@@ -2486,7 +2505,7 @@ static int run_moe_dflash(
             if (!run_qwen35moe_forward(backend, w, cache, ecache, moe, w.expert_source,
                     act_a, act_b, N, positions, attn_mask,
                     committed, true, 0, logits_out, argmax_out,
-                    parent_ids_t, &delta_caps)) {
+                    parent_ids_t, &delta_caps, n_pin_layers > 0 ? &pinned : nullptr)) {
                 std::fprintf(stderr, "[moe] DDTree verify failed step %d\n", n_draft_steps);
                 return 1;
             }
@@ -2668,7 +2687,8 @@ static int run_moe_dflash(
         auto t_verify0 = std::chrono::steady_clock::now();
         if (!run_qwen35moe_forward(backend, w, cache, ecache, moe, w.expert_source,
                 act_a, act_b, q_len, positions, attn_mask,
-                committed, true, 0, logits_out, argmax_out)) {
+                committed, true, 0, logits_out, argmax_out,
+                nullptr, nullptr, n_pin_layers > 0 ? &pinned : nullptr)) {
             std::fprintf(stderr, "[moe] verify failed step %d\n", n_draft_steps);
             return 1;
         }
@@ -2722,7 +2742,8 @@ static int run_moe_dflash(
         auto t_replay0 = std::chrono::steady_clock::now();
         if (!run_qwen35moe_forward(backend, w, cache, ecache, moe, w.expert_source,
                 act_a, act_b, commit_n, positions, attn_mask,
-                committed, true, 0, logits_out, nullptr)) {
+                committed, true, 0, logits_out, nullptr,
+                nullptr, nullptr, n_pin_layers > 0 ? &pinned : nullptr)) {
             std::fprintf(stderr, "[moe] replay failed step %d\n", n_draft_steps);
             return 1;
         }
@@ -2858,6 +2879,7 @@ int main(int argc, char ** argv) {
     bool  target_split_dflash = false;
     int   moe_cache_slots = 5000;  // expert cache slots for MoE models
     int   moe_budget = 16;          // draft block size for MoE verify
+    int   moe_pin_layers = 0;       // pin first N/2 + last N/2 layers (all 256 experts in VRAM)
     int   target_gpu = 0;
     int   draft_gpu = 0;
     std::vector<int> target_gpus;
@@ -2980,6 +3002,9 @@ int main(int argc, char ** argv) {
         else if (std::strncmp(argv[i], "--budget=", 9) == 0) {
             moe_budget = std::clamp(std::atoi(argv[i] + 9), 1, 64);
         }
+        else if (std::strncmp(argv[i], "--pin-layers=", 13) == 0) {
+            moe_pin_layers = std::clamp(std::atoi(argv[i] + 13), 0, 40);
+        }
     }
 
     if (!daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
@@ -3091,7 +3116,8 @@ int main(int argc, char ** argv) {
     if (w.is_moe) {
         int rc = run_moe_dflash(target_path, draft_path, prompt_path, n_gen, out_path,
                                 moe_cache_slots, moe_budget, target_backend, w, dw,
-                                ddtree_mode, ddtree_budget, ddtree_temp, ddtree_chain_seed);
+                                ddtree_mode, ddtree_budget, ddtree_temp, ddtree_chain_seed,
+                                moe_pin_layers);
         free_draft_weights(dw);
         free_target_weights(w);
         if (split_gpus) ggml_backend_free(draft_backend);

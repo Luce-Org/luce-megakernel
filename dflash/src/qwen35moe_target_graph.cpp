@@ -136,6 +136,8 @@ static ggml_tensor * build_moe_graph_a(
 
 // Builds Graph B: expert FFN via mul_mat_id + shared expert FFN + residual.
 // Reads from MoeState persistent tensors (post, ffn_residual, weights, slot_ids).
+// If gate_t/up_t/down_t are non-null, uses them instead of ExpertCache tensors
+// (pinned layer path: all 256 experts are resident, slot_ids == expert_ids).
 // Returns the final layer output [hidden, n_tokens].
 static ggml_tensor * build_moe_graph_b(
     ggml_context *        ctx,
@@ -144,7 +146,10 @@ static ggml_tensor * build_moe_graph_b(
     ExpertCache &         ecache,
     MoeState &            moe,
     int                   layer_idx,
-    int                   n_tokens)
+    int                   n_tokens,
+    ggml_tensor *         gate_t = nullptr,
+    ggml_tensor *         up_t   = nullptr,
+    ggml_tensor *         down_t = nullptr)
 {
     const int hidden = w.n_embd;
     const int n_used = w.n_experts_active;
@@ -172,21 +177,26 @@ static ggml_tensor * build_moe_graph_b(
         n_used, n_tokens, moe.down_slot_ids->nb[1], 0);
     ggml_set_input(down_slot_ids);
 
+    // Select weight tensors: pinned or from ExpertCache
+    ggml_tensor * g3d = gate_t ? gate_t : ecache.gate_3d();
+    ggml_tensor * u3d = up_t   ? up_t   : ecache.up_3d();
+    ggml_tensor * d3d = down_t ? down_t : ecache.down_3d_for_layer(layer_idx);
+
     // ── Expert FFN via mul_mat_id ──
     // Input: [hidden, 1, n_tokens] (broadcast across n_used experts)
     ggml_tensor * cur_3d = ggml_reshape_3d(ctx, post, hidden, 1, n_tokens);
 
     // Gate projection: [hidden, expert_ffn, n_slots] × [hidden, 1, n_tokens] → [expert_ffn, n_used, n_tokens]
-    ggml_tensor * gate_out = ggml_mul_mat_id(ctx, ecache.gate_3d(), cur_3d, slot_ids);
+    ggml_tensor * gate_out = ggml_mul_mat_id(ctx, g3d, cur_3d, slot_ids);
 
     // Up projection: same shape
-    ggml_tensor * up_out = ggml_mul_mat_id(ctx, ecache.up_3d(), cur_3d, slot_ids);
+    ggml_tensor * up_out = ggml_mul_mat_id(ctx, u3d, cur_3d, slot_ids);
 
     // SwiGLU activation
     ggml_tensor * swiglu = ggml_swiglu_split(ctx, gate_out, up_out); // [expert_ffn, n_used, n_tokens]
 
     // Down projection: [expert_ffn, hidden, n_slots] × [expert_ffn, n_used, n_tokens] → [hidden, n_used, n_tokens]
-    ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache.down_3d_for_layer(layer_idx), swiglu, down_slot_ids);
+    ggml_tensor * experts = ggml_mul_mat_id(ctx, d3d, swiglu, down_slot_ids);
 
     // Apply gate weights: [hidden, n_used, n_tokens] * [1, n_used, n_tokens]
     experts = ggml_mul(ctx, experts, weights);
@@ -248,7 +258,8 @@ bool run_qwen35moe_layer(
     ggml_gallocr_t         gallocr_a,
     ggml_gallocr_t         gallocr_b,
     ggml_tensor *          parent_ids = nullptr,
-    DeltaNetCapture *      cap = nullptr)
+    DeltaNetCapture *      cap = nullptr,
+    PinnedExperts *        pinned = nullptr)
 {
     const int hidden = w.n_embd;
     const int n_used = w.n_experts_active;
@@ -327,40 +338,56 @@ bool run_qwen35moe_layer(
         }
     }
 
-    // Collect unique experts for this layer, then batch-load all misses.
-    std::unordered_set<int> unique_set(expert_ids.begin(), expert_ids.end());
-    std::vector<int> unique_experts(unique_set.begin(), unique_set.end());
-    ecache.batch_ensure_cached(layer_idx, unique_experts.data(),
-                               (int)unique_experts.size(), source);
+    // Determine if this layer is pinned (all experts resident in VRAM).
+    const bool layer_pinned = pinned && pinned->is_pinned(layer_idx);
+    ggml_tensor * pin_gate = nullptr;
+    ggml_tensor * pin_up   = nullptr;
+    ggml_tensor * pin_down = nullptr;
 
-    // Compute slot_ids (gate/up) and down_slot_ids (down).
-    std::vector<int32_t> slot_ids((size_t)n_used * n_tokens);
-    std::vector<int32_t> down_slot_ids((size_t)n_used * n_tokens);
-    for (size_t i = 0; i < expert_ids.size(); i++) {
-        slot_ids[i]      = ecache.get_slot(layer_idx, expert_ids[i]);
-        down_slot_ids[i] = ecache.get_down_slot(layer_idx, expert_ids[i]);
-    }
+    if (layer_pinned) {
+        // Pinned: slot_ids == expert_ids directly (no cache lookup needed).
+        const auto & lt = pinned->get(layer_idx);
+        pin_gate = lt.gate;
+        pin_up   = lt.up;
+        pin_down = lt.down;
+        ggml_backend_tensor_set(moe.slot_ids, expert_ids.data(), 0,
+            sizeof(int32_t) * expert_ids.size());
+        ggml_backend_tensor_set(moe.down_slot_ids, expert_ids.data(), 0,
+            sizeof(int32_t) * expert_ids.size());
+    } else {
+        // Dynamic cache path: batch-load misses, compute slot_ids.
+        std::unordered_set<int> unique_set(expert_ids.begin(), expert_ids.end());
+        std::vector<int> unique_experts(unique_set.begin(), unique_set.end());
+        ecache.batch_ensure_cached(layer_idx, unique_experts.data(),
+                                   (int)unique_experts.size(), source);
 
-    // Validate slot_ids are in range for the target tensors.
-    if (g_moe_debug_sync) {
-        int max_gu = ecache.n_slots();
-        int max_dn = (int)ecache.down_3d_for_layer(layer_idx)->ne[2];
-        for (size_t i = 0; i < slot_ids.size(); i++) {
-            if (slot_ids[i] < 0 || slot_ids[i] >= max_gu) {
-                std::fprintf(stderr, "[MoE-DBG] OOB gate/up slot[%zu]=%d (max=%d) layer=%d call=%d\n",
-                    i, slot_ids[i], max_gu, layer_idx, g_moe_debug_call);
-            }
-            if (down_slot_ids[i] < 0 || down_slot_ids[i] >= max_dn) {
-                std::fprintf(stderr, "[MoE-DBG] OOB down slot[%zu]=%d (max=%d) layer=%d call=%d\n",
-                    i, down_slot_ids[i], max_dn, layer_idx, g_moe_debug_call);
+        std::vector<int32_t> slot_ids((size_t)n_used * n_tokens);
+        std::vector<int32_t> down_slot_ids((size_t)n_used * n_tokens);
+        for (size_t i = 0; i < expert_ids.size(); i++) {
+            slot_ids[i]      = ecache.get_slot(layer_idx, expert_ids[i]);
+            down_slot_ids[i] = ecache.get_down_slot(layer_idx, expert_ids[i]);
+        }
+
+        if (g_moe_debug_sync) {
+            int max_gu = ecache.n_slots();
+            int max_dn = (int)ecache.down_3d_for_layer(layer_idx)->ne[2];
+            for (size_t i = 0; i < slot_ids.size(); i++) {
+                if (slot_ids[i] < 0 || slot_ids[i] >= max_gu) {
+                    std::fprintf(stderr, "[MoE-DBG] OOB gate/up slot[%zu]=%d (max=%d) layer=%d call=%d\n",
+                        i, slot_ids[i], max_gu, layer_idx, g_moe_debug_call);
+                }
+                if (down_slot_ids[i] < 0 || down_slot_ids[i] >= max_dn) {
+                    std::fprintf(stderr, "[MoE-DBG] OOB down slot[%zu]=%d (max=%d) layer=%d call=%d\n",
+                        i, down_slot_ids[i], max_dn, layer_idx, g_moe_debug_call);
+                }
             }
         }
-    }
 
-    ggml_backend_tensor_set(moe.slot_ids, slot_ids.data(), 0,
-        sizeof(int32_t) * slot_ids.size());
-    ggml_backend_tensor_set(moe.down_slot_ids, down_slot_ids.data(), 0,
-        sizeof(int32_t) * down_slot_ids.size());
+        ggml_backend_tensor_set(moe.slot_ids, slot_ids.data(), 0,
+            sizeof(int32_t) * slot_ids.size());
+        ggml_backend_tensor_set(moe.down_slot_ids, down_slot_ids.data(), 0,
+            sizeof(int32_t) * down_slot_ids.size());
+    }
 
     auto tc1 = std::chrono::steady_clock::now();
     g_time_cache_ms += std::chrono::duration<double,std::milli>(tc1-tc0).count();
@@ -375,7 +402,8 @@ bool run_qwen35moe_layer(
     ggml_cgraph * gf_b = ggml_new_graph_custom(ctx_b, 4096, false);
 
     ggml_tensor * layer_out = build_moe_graph_b(
-        ctx_b, gf_b, w, ecache, moe, layer_idx, n_tokens);
+        ctx_b, gf_b, w, ecache, moe, layer_idx, n_tokens,
+        pin_gate, pin_up, pin_down);
 
     // Copy output to activation buffer
     ggml_tensor * out_view = ggml_view_2d(ctx_b, act_out,
@@ -476,7 +504,8 @@ bool run_qwen35moe_forward(
     ggml_tensor *          logits_out,   // [vocab, n_tokens] f32 (pre-allocated)
     ggml_tensor *          argmax_out,   // [n_tokens] i32 (pre-allocated, or nullptr)
     ggml_tensor *          parent_ids,   // [n_tokens] i32 for DDTree (or nullptr)
-    std::vector<DeltaNetCapture> * delta_captures)  // optional SSM captures for rollback
+    std::vector<DeltaNetCapture> * delta_captures,  // optional SSM captures for rollback
+    PinnedExperts *        pinned)       // optional pinned expert layers
 {
     const int hidden  = w.n_embd;
     const int n_layer = w.n_layer;
@@ -521,7 +550,7 @@ bool run_qwen35moe_forward(
             il, act_in, act_out,
             /*chunk_start=*/0, n_tokens,
             positions, attn_mask, kv_start, capture, fa_window,
-            gallocr_a, gallocr_b, parent_ids, cap_ptr);
+            gallocr_a, gallocr_b, parent_ids, cap_ptr, pinned);
         if (!ok) {
             std::fprintf(stderr, "[MoE] forward failed at layer %d\n", il);
             ggml_gallocr_free(gallocr_a);
