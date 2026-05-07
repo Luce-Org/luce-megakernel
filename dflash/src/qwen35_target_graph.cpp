@@ -670,13 +670,13 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
+ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
                                   ggml_tensor * weight, float eps) {
     ggml_tensor * n = ggml_rms_norm(ctx, x, eps);
     return ggml_mul(ctx, n, weight);
 }
 
-static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
+ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
                                       const TargetLayer & L) {
     ggml_tensor * gate = ggml_mul_mat(ctx, L.w_gate, cur);   // [inter, n_tokens]
     ggml_tensor * up = ggml_mul_mat(ctx, L.w_up, cur);
@@ -690,7 +690,7 @@ static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
 // (shape [head_dim, max_ctx, n_head_kv] f16). We write the new K/V for
 // `n_tokens` new positions starting at `kv_start`, then run causal attention
 // over [0..kv_start + n_tokens).
-static ggml_tensor * build_full_attn_block(
+ggml_tensor * build_full_attn_block(
     ggml_context * ctx,
     ggml_cgraph * gf,
     const TargetWeights & w,
@@ -850,7 +850,7 @@ static ggml_tensor * build_full_attn_block(
 // `cap->conv_input` with the concatenated conv input (old state + new tokens),
 // both of which are marked as graph outputs so the caller can rollback SSM and
 // conv state to any intermediate step commit_n-1 without a replay forward pass.
-static ggml_tensor * build_delta_net_block(
+ggml_tensor * build_delta_net_block(
     ggml_context * ctx,
     ggml_cgraph * gf,
     const TargetWeights & w,

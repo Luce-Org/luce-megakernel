@@ -120,6 +120,8 @@ add_library(dflash27b STATIC
     src/kv_cache.cpp
     src/kv_quant.cpp
     src/delta_net_chunked.cpp
+    src/expert_cache.cpp
+    src/qwen35moe_target_graph.cpp
 )
 # FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+). On Turing (sm_75)
 # the drafter uses ggml's flash_attn_ext instead. Guard added after SM check.
@@ -277,6 +279,7 @@ if(DFLASH27B_TESTS)
         target_include_directories(smoke_load_target PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(smoke_load_target PRIVATE dflash27b ggml ggml-cuda)
     endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_target_forward.cpp")
         add_executable(smoke_target_forward test/smoke_target_forward.cpp)
         target_include_directories(smoke_target_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
