@@ -2137,7 +2137,7 @@ static int run_moe_dflash(
     int  ddtree_budget = 22,
     float ddtree_temp = 1.0f,
     bool ddtree_chain_seed = true,
-    int  n_pin_layers = 0)   // pin first N/2 + last N/2 layers (0 = disabled)
+    int  n_pin_layers = 0)   // pin first+last layer, then fill from layer 1 (0 = disabled)
 {
     using namespace dflash27b;
     const int hidden = w.n_embd;
@@ -2154,14 +2154,17 @@ static int run_moe_dflash(
                 hidden, vocab, w.n_layer, w.n_experts, w.n_experts_active, n_cache_slots, q_len,
                 (int)ddtree_mode, ddtree_budget, n_pin_layers);
 
-    // ── PinnedExperts (first N/2 + last N/2 layers) ──
+    // ── PinnedExperts (always pin first & last layer, fill remaining from layer 1) ──
     PinnedExperts pinned;
     if (n_pin_layers > 0) {
         std::vector<int> pin_ids;
-        const int half = n_pin_layers / 2;
-        for (int l = 0; l < half && l < w.n_layer; l++) pin_ids.push_back(l);
-        for (int l = std::max(half, w.n_layer - (n_pin_layers - half)); l < w.n_layer; l++)
+        // Always pin layer 0 (first) and layer n_layer-1 (last)
+        pin_ids.push_back(0);
+        if (w.n_layer > 1) pin_ids.push_back(w.n_layer - 1);
+        // Fill remaining budget from layer 1 onwards (skip already-pinned last layer)
+        for (int l = 1; l < w.n_layer - 1 && (int)pin_ids.size() < n_pin_layers; l++)
             pin_ids.push_back(l);
+        std::sort(pin_ids.begin(), pin_ids.end());
         if (!pinned.init(backend, w.expert_source, pin_ids)) {
             std::fprintf(stderr, "[moe] PinnedExperts init failed\n");
             return 1;
@@ -2879,7 +2882,7 @@ int main(int argc, char ** argv) {
     bool  target_split_dflash = false;
     int   moe_cache_slots = 5000;  // expert cache slots for MoE models
     int   moe_budget = 16;          // draft block size for MoE verify
-    int   moe_pin_layers = 0;       // pin first N/2 + last N/2 layers (all 256 experts in VRAM)
+    int   moe_pin_layers = 0;       // pin first+last layer, then fill from layer 1 (all 256 experts in VRAM)
     int   target_gpu = 0;
     int   draft_gpu = 0;
     std::vector<int> target_gpus;
